@@ -359,8 +359,8 @@ func (s providerSender) StreamMessagesWithTools(
 
 // Compile-time assertions: providerSender satisfies all agent sender interfaces.
 var (
-	_ agent.Sender               = providerSender{}
-	_ agent.StreamingSender      = providerSender{}
-	_ agent.ToolSender           = providerSender{}
-	_ agent.ToolStreamingSender  = providerSender{}
+	_ agent.Sender              = providerSender{}
+	_ agent.StreamingSender     = providerSender{}
+	_ agent.ToolSender          = providerSender{}
+	_ agent.ToolStreamingSender = providerSender{}
 )

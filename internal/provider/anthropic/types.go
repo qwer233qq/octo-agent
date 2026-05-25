@@ -79,12 +79,12 @@ type apiError struct {
 // content_block_stop, message_delta, message_stop, ping, and error events.
 // We only act on a subset; the rest is ignored.
 type streamEvent struct {
-	Type         string               `json:"type"`
-	Index        int                  `json:"index,omitempty"`        // content_block_*
-	Message      *streamMessage       `json:"message,omitempty"`      // message_start
-	Delta        *streamDelta         `json:"delta,omitempty"`        // content_block_delta, message_delta
-	Usage        *apiUsageBlock       `json:"usage,omitempty"`        // message_delta
-	ContentBlock *streamContentBlock  `json:"content_block,omitempty"` // content_block_start
+	Type         string              `json:"type"`
+	Index        int                 `json:"index,omitempty"`         // content_block_*
+	Message      *streamMessage      `json:"message,omitempty"`       // message_start
+	Delta        *streamDelta        `json:"delta,omitempty"`         // content_block_delta, message_delta
+	Usage        *apiUsageBlock      `json:"usage,omitempty"`         // message_delta
+	ContentBlock *streamContentBlock `json:"content_block,omitempty"` // content_block_start
 }
 
 // streamContentBlock is the block metadata emitted with content_block_start.
