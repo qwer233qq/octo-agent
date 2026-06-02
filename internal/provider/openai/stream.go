@@ -28,11 +28,11 @@ type toolCallState struct {
 // Chat Completions API with `stream: true`.
 //
 // Each non-empty content delta is forwarded to onChunk synchronously. The
-// aggregated Content, Blocks, Model, and FinishReason are returned in the
-// final Response. InputTokens / OutputTokens are typically zero on streaming
-// responses because we don't send `stream_options.include_usage=true` —
-// some third-party OpenAI-compatible servers reject it, and the cost of
-// missing usage on a single turn is much smaller than losing compatibility.
+// aggregated Content, Blocks, Model, FinishReason, and token usage are returned
+// in the final Response. We send `stream_options.include_usage=true` so the
+// server emits a terminal usage chunk: DashScope (and real OpenAI) report no
+// usage at all on a stream without it. Servers that omit the usage chunk anyway
+// just leave the token counts at zero — no error.
 func (c *Client) SendStream(ctx context.Context, req provider.Request, cb provider.StreamCallbacks) (provider.Response, error) {
 	onChunk := cb.OnText
 	onToolDelta := cb.OnToolDelta
@@ -53,6 +53,7 @@ func (c *Client) SendStream(ctx context.Context, req provider.Request, cb provid
 		MaxTokens:      req.MaxTokens,
 		Messages:       msgs,
 		Stream:         true,
+		StreamOptions:  &apiStreamOptions{IncludeUsage: true},
 		Tools:          toAPITools(req.Tools),
 		PromptCacheKey: req.CacheKey,
 	}
@@ -152,7 +153,7 @@ func (c *Client) SendStream(ctx context.Context, req provider.Request, cb provid
 			result.Model = ch.Model
 		}
 		if ch.Usage != nil {
-			result.InputTokens = ch.Usage.PromptTokens
+			result.InputTokens = ch.Usage.nonCachedInput()
 			result.OutputTokens = ch.Usage.CompletionTokens
 			result.CacheReadTokens = ch.Usage.cachedTokens()
 		}
@@ -163,7 +164,7 @@ func (c *Client) SendStream(ctx context.Context, req provider.Request, cb provid
 		// Some compatible backends (Kimi) embed usage inside the choice object
 		// rather than at the chunk level. Prefer chunk-level but fall back.
 		if choice.Usage != nil {
-			result.InputTokens = choice.Usage.PromptTokens
+			result.InputTokens = choice.Usage.nonCachedInput()
 			result.OutputTokens = choice.Usage.CompletionTokens
 			result.CacheReadTokens = choice.Usage.cachedTokens()
 		}

@@ -33,9 +33,18 @@ type apiRequest struct {
 	MaxTokens int          `json:"max_tokens,omitempty"`
 	Stream    bool         `json:"stream,omitempty"`
 	Tools     []apiTool    `json:"tools,omitempty"`
+	// StreamOptions carries stream-only flags. We set include_usage on streaming
+	// requests so the server emits a final usage chunk — DashScope (and real
+	// OpenAI) send no usage at all without it. Omitted on non-streaming requests.
+	StreamOptions *apiStreamOptions `json:"stream_options,omitempty"`
 	// PromptCacheKey routes the request to a consistent prompt cache. Stable
 	// across a conversation's turns → higher cache hit-rate. Omitted when empty.
 	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+}
+
+// apiStreamOptions is the stream_options object on a streaming request.
+type apiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // apiMessage is one element of apiRequest.Messages.
@@ -176,6 +185,20 @@ func (u apiUsage) cachedTokens() int {
 	}
 	if u.PromptTokensDetails != nil {
 		return u.PromptTokensDetails.CachedTokens
+	}
+	return 0
+}
+
+// nonCachedInput returns prompt tokens excluding the cached (read-hit) portion.
+// OpenAI/DeepSeek report prompt_tokens as the WHOLE input (cached + uncached),
+// with cached_tokens as a subset; Anthropic instead reports input_tokens as the
+// uncached remainder with cache_read separate. The agent treats InputTokens and
+// CacheReadTokens as non-overlapping buckets (so context occupancy is their sum
+// and they price independently), so we subtract here to match that convention.
+// Clamped at zero in case a backend ever reports cached > prompt.
+func (u apiUsage) nonCachedInput() int {
+	if n := u.PromptTokens - u.cachedTokens(); n > 0 {
+		return n
 	}
 	return 0
 }

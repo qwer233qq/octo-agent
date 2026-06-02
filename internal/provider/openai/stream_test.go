@@ -79,12 +79,40 @@ func TestSendStream_OpenAI_AggregatesAndCallsBack(t *testing.T) {
 	if resp.StopReason != "stop" {
 		t.Errorf("StopReason = %q", resp.StopReason)
 	}
-	// InputTokens/OutputTokens are expected zero — we don't send
-	// stream_options.include_usage and the canonical transcript carries no
-	// usage block. Document this in the test so a future change doesn't
-	// silently regress the compatibility tradeoff.
+	// We request usage via stream_options.include_usage, but this canonical
+	// transcript carries no usage chunk — a server that omits it just leaves the
+	// counts at zero, no error.
 	if resp.InputTokens != 0 || resp.OutputTokens != 0 {
-		t.Errorf("Usage = (%d, %d), want (0, 0) without stream_options", resp.InputTokens, resp.OutputTokens)
+		t.Errorf("Usage = (%d, %d), want (0, 0) when the server emits no usage chunk", resp.InputTokens, resp.OutputTokens)
+	}
+}
+
+func TestSendStream_SendsIncludeUsage(t *testing.T) {
+	// DashScope / real OpenAI send no usage at all on a stream unless we ask via
+	// stream_options.include_usage. Assert the outgoing body carries it.
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, canonicalOpenAIStream)
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+	if _, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "x",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{}); err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+
+	so, ok := gotBody["stream_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("request body missing stream_options; got %v", gotBody["stream_options"])
+	}
+	if so["include_usage"] != true {
+		t.Errorf("stream_options.include_usage = %v, want true", so["include_usage"])
 	}
 }
 
@@ -142,6 +170,43 @@ func TestSendStream_OpenAI_UsageChunkParsed(t *testing.T) {
 	}
 	if resp.InputTokens != 11 || resp.OutputTokens != 3 {
 		t.Errorf("Usage = (%d, %d), want (11, 3)", resp.InputTokens, resp.OutputTokens)
+	}
+}
+
+// TestSendStream_DeepSeek_CacheSplitNormalised mirrors a real DeepSeek warm-cache
+// usage chunk: prompt_tokens is the WHOLE input and prompt_cache_hit_tokens a
+// subset. The adapter must report InputTokens as the uncached remainder so it
+// doesn't overlap CacheReadTokens (else context occupancy double-counts).
+func TestSendStream_DeepSeek_CacheSplitNormalised(t *testing.T) {
+	withUsage := strings.Replace(canonicalOpenAIStream, "data: [DONE]\n\n",
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":2708,"completion_tokens":16,"total_tokens":2724,"prompt_cache_hit_tokens":2688,"prompt_cache_miss_tokens":20,"prompt_tokens_details":{"cached_tokens":2688}}}`+"\n\n"+
+			"data: [DONE]\n\n", 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, withUsage)
+	}))
+	defer srv.Close()
+
+	c, _ := New("k")
+	c.BaseURL = srv.URL
+
+	resp, err := c.SendStream(context.Background(), provider.Request{
+		Model:    "deepseek-v4-flash",
+		Messages: []agent.Message{agent.NewUserMessage("hi")},
+	}, provider.StreamCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.InputTokens != 20 {
+		t.Errorf("InputTokens = %d, want 20 (uncached remainder, not the full 2708)", resp.InputTokens)
+	}
+	if resp.CacheReadTokens != 2688 {
+		t.Errorf("CacheReadTokens = %d, want 2688", resp.CacheReadTokens)
+	}
+	// Occupancy (input + cache read) reconstructs the full prompt exactly once.
+	if got := resp.InputTokens + resp.CacheReadTokens; got != 2708 {
+		t.Errorf("input + cache_read = %d, want 2708 (no double-count, no loss)", got)
 	}
 }
 
