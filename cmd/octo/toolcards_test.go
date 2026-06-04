@@ -7,15 +7,15 @@ import (
 
 func TestCardVerbFor(t *testing.T) {
 	cases := map[string]string{
-		"edit_file":    "Update",
-		"terminal":     "Run",
-		"grep":         "Grep",
-		"web_search":   "Search",
-		"glob":         "Glob",
-		"read_file":    "Read",
-		"web_fetch":    "Fetch",
-		"launch_agent": "", // not a card tool → one-liner
-		"remember":     "",
+		"edit_file":  "Update",
+		"terminal":   "Run",
+		"grep":       "Grep",
+		"web_search": "Search",
+		"glob":       "Glob",
+		"read_file":  "Read",
+		"web_fetch":  "Fetch",
+		"sub_agent":  "", // not a card tool → one-liner
+		"remember":   "",
 	}
 	for tool, want := range cases {
 		if got := cardVerbFor(tool); got != want {
@@ -59,7 +59,7 @@ func TestRenderToolCard_Dispatch(t *testing.T) {
 	}
 
 	// non-card tool → "".
-	if got := renderToolCard("launch_agent", map[string]any{}, "x", false); got != "" {
+	if got := renderToolCard("sub_agent", map[string]any{}, "x", false); got != "" {
 		t.Errorf("non-card tool should return \"\"; got %q", got)
 	}
 }
@@ -74,7 +74,7 @@ func TestRendersCard_PlainDisablesCards(t *testing.T) {
 		t.Error("with --plain on, no tool should render as a card")
 	}
 	// A non-card tool is never a card regardless of --plain.
-	if plainOff.rendersCard("launch_agent") {
-		t.Error("launch_agent is not a card tool")
+	if plainOff.rendersCard("sub_agent") {
+		t.Error("sub_agent is not a card tool")
 	}
 }
