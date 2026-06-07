@@ -32,28 +32,17 @@
 
 ## P1 — 高影响、低复杂度
 
-### 1. Skill Toggle 状态持久化
+### 1. Skill Toggle 状态持久化 ✅
 
 - **位置**：`internal/server/skill_toggle_handler.go`
-- **现状**：`PATCH /api/skills/{name}/toggle` 是 no-op stub，返回成功但不持久化
-  ```go
-  writeJSON(w, http.StatusOK, map[string]any{
-      "name":    name,
-      "enabled": true,
-      "note":    "skill toggle is not yet persisted in the Go rewrite",
-  })
-  ```
-- **影响**：Web UI 里点 toggle 只是临时 UI 状态，刷新后丢失
-- **建议**：写入 `~/.octo/skills.yml`（或复用 config.yaml 的 tools 节），server 启动时重读。可独立成一个 PR。
+- **现状**：`PATCH /api/skills/{name}/toggle` 之前是 no-op stub
+- **已完成**：`tools.disabled_skills` 写入 `~/.octo/config.yaml`，`skills.Registry` 用 disabled-name set 过滤 `Get`/`List`/`Len`/`RenderManifest`，server 启动时从 config 重读。`GET /api/skills` 返回 `enabled` 字段。
 
-### 2. Web UI Benchmark Panel（后端缺失）
+### 2. Web UI Benchmark API ✅
 
-- **位置**：
-  - 前端：`internal/server/static/index.html:303`、`sessions.js:3981`
-  - 后端：`internal/server/`（无对应 handler）
-- **现状**：前端有完整的 benchmark UI（模型切换器里的延迟测试按钮），调用 `POST /api/sessions/{id}/benchmark`，但后端没有实现该 endpoint
-- **影响**：Web UI 的 latency 信号栏只能看历史缓存，无法跑新的 benchmark
-- **建议**：在 `internal/server/` 里加一个 benchmark handler，跑一个轻量的 provider ping（如发一个空 user message 测 TTFT）。前端代码已就绪，只需补齐后端。
+- **位置**：`internal/server/benchmark_handler.go`
+- **现状**：前端有 benchmark UI 但后端缺失对应 handler
+- **已完成**：新增 `POST /api/sessions/{id}/benchmark`，streaming TTFT 测量（通过 `StreamingSender` 检测首个 token 到达时间），非 streaming fallback，60s 超时。前端无需改动。
 
 ---
 
@@ -95,13 +84,11 @@
   - 面板标题在焦点模式下显示快捷键提示 `[↑/↓ nav · Enter expand · Esc back]`
   - `removeSubAgent` 自动调整焦点索引，避免焦点悬空
 
-### 6. 截断恢复 Layer 2（resume-and-chunk）
+### 6. 截断恢复 Layer 2（resume-and-chunk）✅
 
 - **位置**：`dev-docs/truncation-recovery.md:105`
 - **现状**：Layer 1（escalate-and-retry）已实现——遇到 `max_tokens` 时自动提升 cap 重试一次
-- **尚未做**：Layer 2——保留部分输出，喂回 "you were cut off; resume mid-thought and write in smaller pieces" 提示并继续（Claude Code 式多轮恢复）。需要处理 provider 对不完整 `tool_use` block 的兼容性。
-- **影响**：低——Layer 1 已覆盖绝大多数大文件写入场景
-- **建议**：等有大模型在 escalate 后仍然截断的真实案例时再起工。
+- **已完成**：Layer 2 实装——当 escalate 后仍然截断时，将 partial text 追加到 history，注入 recovery user message，继续 loop 让模型完成剩余内容。限制最多 3 次恢复，防止无限循环。跳过了截断的 tool_use（OpenAI 协议中 partial tool_use 在 history 中不安全）。引入 `escalateExhausted` 标志避免 resume 后重复 escalate。
 
 ### 7. Conductor Phase 2 / Phase 3（渐进交付的后续阶段）
 
