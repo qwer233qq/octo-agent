@@ -1,9 +1,30 @@
 <script lang="ts">
-  import { view, cmdkOpen, sidebar } from '../../lib/stores'
-  import { wsState, ws } from '../../lib/ws'
+  import { view, cmdkOpen, sidebar, showToast } from '../../lib/stores'
 
   function cycleSidebar() {
     sidebar.update(s => s === 'full' ? 'rail' : s === 'rail' ? 'hidden' : 'full')
+  }
+
+  // The bell toggles desktop notifications (browser permission) — the backing
+  // for the "Desktop Notifications" setting. There is no notification feed.
+  async function toggleNotifications() {
+    if (!('Notification' in window)) {
+      showToast('Desktop notifications are not supported in this browser', 'error')
+      return
+    }
+    if (Notification.permission === 'granted') {
+      showToast('Desktop notifications are enabled')
+      return
+    }
+    if (Notification.permission === 'denied') {
+      showToast('Notifications are blocked — enable them in your browser settings', 'error')
+      return
+    }
+    const perm = await Notification.requestPermission()
+    showToast(
+      perm === 'granted' ? 'Desktop notifications enabled' : 'Notifications were not enabled',
+      perm === 'granted' ? 'success' : 'error',
+    )
   }
 </script>
 
@@ -26,13 +47,13 @@
       <span>Search sessions…</span>
       <kbd>⌘K</kbd>
     </button>
-    <button class="icon-btn" title="Notifications">
+    <button class="icon-btn" title="Desktop notifications" onclick={toggleNotifications}>
       <iconify-icon icon="ant-design:bell-outlined" width="16"></iconify-icon>
     </button>
     <button class="icon-btn" title="Settings" onclick={() => view.set('settings')}>
       <iconify-icon icon="ant-design:setting-outlined" width="16"></iconify-icon>
     </button>
-    <div class="avatar">R</div>
+    <button class="avatar" title="Assistant memory & profile" onclick={() => view.set('profile')}>R</button>
   </div>
 </header>
 
@@ -79,9 +100,10 @@ kbd {
   padding: 1px 5px; color: rgba(0,0,0,0.45);
 }
 .avatar {
-  width: 28px; height: 28px; border-radius: 9999px;
-  background: #E6F4FF; color: #1677FF;
+  width: 28px; height: 28px; border-radius: 9999px; border: none; padding: 0;
+  background: #E6F4FF; color: #1677FF; font-family: inherit;
   display: flex; align-items: center; justify-content: center;
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
+.avatar:hover { background: #BAE0FF; }
 </style>
