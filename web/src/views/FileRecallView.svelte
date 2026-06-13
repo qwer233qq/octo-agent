@@ -3,6 +3,7 @@
   import { showToast } from '../lib/stores'
   import StatusTag from '../components/ui/StatusTag.svelte'
   import * as api from '../lib/api'
+  import { t, tr } from '../lib/i18n'
 
   interface TrashEntry {
     id: string
@@ -47,7 +48,7 @@
       await api.restoreTrash(id)
       items = items.filter(i => i.id !== id)
       totalCount = Math.max(0, totalCount - 1)
-      showToast('File restored', 'success')
+      showToast(tr('files.toast_restored'), 'success')
     } catch (e: any) {
       showToast(`Restore failed: ${e.message}`, 'error')
     } finally {
@@ -63,7 +64,7 @@
       if (entry) totalSize = Math.max(0, totalSize - (entry.size ?? 0))
       items = items.filter(i => i.id !== id)
       totalCount = Math.max(0, totalCount - 1)
-      showToast('File permanently deleted', 'success')
+      showToast(tr('files.toast_deleted'), 'success')
     } catch (e: any) {
       showToast(`Delete failed: ${e.message}`, 'error')
     } finally {
@@ -79,7 +80,7 @@
       totalCount = 0
       totalSize  = 0
       orphanCount = 0
-      showToast('Trash emptied', 'success')
+      showToast(tr('files.toast_emptied'), 'success')
     } catch (e: any) {
       showToast(`Empty failed: ${e.message}`, 'error')
     }
@@ -88,7 +89,7 @@
   async function handleEmptyOld() {
     try {
       await api.emptyTrash({ mode: 'old' })
-      showToast('Old files cleared', 'success')
+      showToast(tr('files.toast_old_cleared'), 'success')
       await reload()
     } catch (e: any) {
       showToast(`Failed: ${e.message}`, 'error')
@@ -98,7 +99,7 @@
   async function handleCleanOrphans() {
     try {
       await api.emptyTrash({ mode: 'orphans' })
-      showToast('Orphan files cleared', 'success')
+      showToast(tr('files.toast_orphans_cleared'), 'success')
       await reload()
     } catch (e: any) {
       showToast(`Failed: ${e.message}`, 'error')
@@ -145,8 +146,8 @@
 <div class="page">
   <div class="inner">
     <div class="page-header">
-      <h2>File Recall</h2>
-      <p>Files the agent moved to trash across all projects. Recall them back to where they were, or clear the ones you don't need.</p>
+      <h2>{$t('files.title')}</h2>
+      <p>{$t('files.subtitle')}</p>
     </div>
 
     <!-- Stats + actions -->
@@ -157,29 +158,29 @@
       <div class="bar-actions">
         <button class="btn-outline" onclick={reload} disabled={loading}>
           <iconify-icon icon="ant-design:reload-outlined" width="13"></iconify-icon>
-          {loading ? 'Loading…' : 'Refresh'}
+          {loading ? $t('common.loading') : $t('files.refresh')}
         </button>
         <button class="btn-outline" onclick={handleEmptyOld}>
           <iconify-icon icon="ant-design:clock-circle-outlined" width="13"></iconify-icon>
-          Empty &gt;7 days
+          {$t('files.empty_7d')}
         </button>
-        <button class="btn-outline" onclick={handleCleanOrphans} disabled={orphanCount === 0} title="Permanently delete entries whose original project directory no longer exists">
+        <button class="btn-outline" onclick={handleCleanOrphans} disabled={orphanCount === 0} title={$t('files.clean_orphans_tip')}>
           <iconify-icon icon="ant-design:disconnect-outlined" width="13"></iconify-icon>
-          Clean orphans
+          {$t('files.clean_orphans')}
         </button>
         <button class="btn-danger-ghost" onclick={handleEmptyAll} disabled={items.length === 0}>
           <iconify-icon icon="ant-design:delete-outlined" width="13"></iconify-icon>
-          Empty all
+          {$t('files.empty_all')}
         </button>
       </div>
     </div>
 
     {#if loading}
-      <div class="empty-state">Loading…</div>
+      <div class="empty-state">{$t('common.loading')}</div>
     {:else if items.length === 0}
       <div class="empty-state">
-        <iconify-icon icon="ant-design:delete-outlined" width="32" style="color:rgba(0,0,0,0.2)"></iconify-icon>
-        <span>Trash is empty</span>
+        <iconify-icon icon="ant-design:delete-outlined" width="32" style="color:var(--text-quaternary)"></iconify-icon>
+        <span>{$t('files.empty')}</span>
       </div>
     {:else}
       <div class="file-list">
@@ -192,9 +193,9 @@
               <div class="file-name-row">
                 <span class="file-name mono">{basename(f.original)}</span>
                 {#if f.orphan}
-                  <StatusTag status="error">Orphan</StatusTag>
+                  <StatusTag status="error">{$t('files.orphan')}</StatusTag>
                 {:else if isOld(f.deleted_at)}
-                  <StatusTag status="warning">Old</StatusTag>
+                  <StatusTag status="warning">{$t('files.old')}</StatusTag>
                 {/if}
               </div>
               <span class="file-path mono">{f.original}</span>
@@ -216,11 +217,11 @@
                 onclick={() => handleRestore(f.id)}
               >
                 <iconify-icon icon="ant-design:undo-outlined" width="14"></iconify-icon>
-                {busyId === f.id ? '…' : 'Restore'}
+                {busyId === f.id ? '…' : $t('files.restore')}
               </button>
               <button
                 class="icon-btn del"
-                title="Delete permanently"
+                title={$t('files.delete_perm')}
                 disabled={busyId === f.id}
                 onclick={() => handleDelete(f.id)}
               >
@@ -238,55 +239,55 @@
 .page { flex: 1; overflow-y: auto; min-height: 0; }
 .inner { max-width: 1080px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
 .page-header { display: flex; flex-direction: column; gap: 4px; }
-h2 { margin: 0; font-size: 24px; font-weight: 600; color: #1F1F1F; }
-p { margin: 0; font-size: 14px; color: rgba(0,0,0,0.65); }
+h2 { margin: 0; font-size: 24px; font-weight: 600; color: var(--text-heading); }
+p { margin: 0; font-size: 14px; color: var(--text-secondary); }
 .stats-bar {
-  background: #fff; border-radius: 16px; box-shadow: 0 8px 24px rgba(15,23,42,0.03);
+  background: var(--bg-container); border-radius: 16px; box-shadow: var(--card-shadow);
   padding: 14px 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
 }
-.stats-text { font-size: 13px; color: rgba(0,0,0,0.45); flex: 1; min-width: 0; }
+.stats-text { font-size: 13px; color: var(--text-tertiary); flex: 1; min-width: 0; }
 .bar-actions { display: flex; align-items: center; gap: 8px; }
 .btn-outline {
-  height: 30px; padding: 0 12px; border: 1px solid #D9D9D9; background: #fff; border-radius: 6px;
-  display: flex; align-items: center; gap: 6px; font-size: 13px; color: rgba(0,0,0,0.65);
+  height: 30px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container); border-radius: 6px;
+  display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary);
   cursor: pointer; font-family: inherit;
 }
-.btn-outline:hover:not(:disabled) { border-color: #4096FF; color: #4096FF; }
+.btn-outline:hover:not(:disabled) { border-color: var(--blue-5); color: var(--blue-5); }
 .btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-danger-ghost {
-  height: 30px; padding: 0 12px; border: 1px solid #EEEFF1; background: #fff; border-radius: 6px;
-  display: flex; align-items: center; gap: 6px; font-size: 13px; color: rgba(0,0,0,0.45);
+  height: 30px; padding: 0 12px; border: 1px solid var(--border-secondary); background: var(--bg-container); border-radius: 6px;
+  display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-tertiary);
   cursor: pointer; font-family: inherit;
 }
-.btn-danger-ghost:hover:not(:disabled) { border-color: #FF4D4F; color: #FF4D4F; }
+.btn-danger-ghost:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
 .btn-danger-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 .empty-state {
   padding: 60px; display: flex; flex-direction: column; align-items: center; gap: 12px;
-  color: rgba(0,0,0,0.35); font-size: 14px;
+  color: var(--text-tertiary); font-size: 14px;
 }
 .file-list { display: flex; flex-direction: column; gap: 12px; }
 .file-card {
-  background: #fff; border-radius: 16px; box-shadow: 0 8px 24px rgba(15,23,42,0.03);
+  background: var(--bg-container); border-radius: 16px; box-shadow: var(--card-shadow);
   padding: 16px 24px; display: flex; align-items: center; gap: 16px;
 }
 .file-icon {
   width: 36px; height: 36px; flex: 0 0 36px; border-radius: 10px;
-  background: #F5F5F5; color: rgba(0,0,0,0.45);
+  background: var(--bg-layout); color: var(--text-tertiary);
   display: flex; align-items: center; justify-content: center;
 }
 .file-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .file-name-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.file-name { font-size: 15px; font-weight: 600; color: #1F1F1F; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-path { font-size: 12px; color: rgba(0,0,0,0.45); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: rgba(0,0,0,0.45); padding-top: 1px; }
-.sep { width: 3px; height: 3px; border-radius: 9999px; background: rgba(0,0,0,0.25); }
+.file-name { font-size: 15px; font-weight: 600; color: var(--text-heading); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-path { font-size: 12px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-tertiary); padding-top: 1px; }
+.sep { width: 3px; height: 3px; border-radius: 9999px; background: var(--text-quaternary); }
 .file-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .icon-btn {
-  width: 30px; height: 30px; border: 1px solid #EEEFF1; background: #fff; border-radius: 6px;
+  width: 30px; height: 30px; border: 1px solid var(--border-secondary); background: var(--bg-container); border-radius: 6px;
   display: flex; align-items: center; justify-content: center; cursor: pointer;
-  color: rgba(0,0,0,0.45);
+  color: var(--text-tertiary);
 }
 .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.icon-btn.del:hover:not(:disabled) { border-color: #FF4D4F; color: #FF4D4F; }
+.icon-btn.del:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>

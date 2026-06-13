@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { mcpServers, toolSearchMode, mcpModalOpen, mcpModalState, showToast, sessions, activeSessionId, view } from '../lib/stores'
+  import { t, tr } from '../lib/i18n'
   import * as api from '../lib/api'
   import StatusTag from '../components/ui/StatusTag.svelte'
   import Switch from '../components/ui/Switch.svelte'
@@ -51,11 +52,11 @@
 
   function statusTag(status: string): { tagStatus: TagStatus; tagLabel: string } {
     switch (status) {
-      case 'connected':    return { tagStatus: 'success', tagLabel: 'connected' }
-      case 'error':        return { tagStatus: 'error',   tagLabel: 'error' }
-      case 'invalid':      return { tagStatus: 'error',   tagLabel: 'invalid' }
-      case 'disabled':     return { tagStatus: 'default', tagLabel: 'disabled' }
-      case 'disconnected': return { tagStatus: 'default', tagLabel: 'disconnected' }
+      case 'connected':    return { tagStatus: 'success', tagLabel: tr('status.connected') }
+      case 'error':        return { tagStatus: 'error',   tagLabel: tr('status.error') }
+      case 'invalid':      return { tagStatus: 'error',   tagLabel: tr('mcp.status_invalid') }
+      case 'disabled':     return { tagStatus: 'default', tagLabel: tr('status.disabled') }
+      case 'disconnected': return { tagStatus: 'default', tagLabel: tr('mcp.status_disconnected') }
       default:             return { tagStatus: 'default', tagLabel: status }
     }
   }
@@ -169,25 +170,25 @@
     <!-- Header -->
     <div class="page-header">
       <div class="title-block">
-        <h2>MCP Servers</h2>
-        <p>Connect Model Context Protocol servers to give your assistant extra tools</p>
+        <h2>{$t('mcp.title')}</h2>
+        <p>{$t('mcp.desc')}</p>
       </div>
       <div class="header-actions">
         <button class="btn-secondary" onclick={reload} disabled={loading}>
           <iconify-icon icon="ant-design:reload-outlined" width="14"></iconify-icon>
-          Reload
+          {$t('mcp.reload')}
         </button>
         <button class="btn-secondary" onclick={openImport}>
           <iconify-icon icon="ant-design:code-outlined" width="14"></iconify-icon>
-          Import JSON
+          {$t('mcp.import_json')}
         </button>
         <button class="btn-primary" onclick={openAdd}>
           <iconify-icon icon="ant-design:plus-outlined" width="14"></iconify-icon>
-          Add Server
+          {$t('mcp.add')}
         </button>
         <button class="btn-primary" onclick={aiSetup}>
           <iconify-icon icon="ant-design:thunderbolt-outlined" width="14"></iconify-icon>
-          AI Setup
+          {$t('mcp.ai_setup')}
         </button>
       </div>
     </div>
@@ -195,11 +196,12 @@
     <!-- Tool Search card -->
     <div class="tool-search-card">
       <div class="ts-info">
-        <span class="ts-title">Tool Search</span>
-        <span class="ts-desc">Defers MCP tool schemas behind a search bridge to save context. Auto activates only when tools would occupy too much of the context window.</span>
+        <span class="ts-title">{$t('mcp.tool_search')}</span>
+        <span class="ts-desc">{$t('mcp.tool_search_desc')}</span>
       </div>
       <Segment
         options={['Auto', 'On', 'Off']}
+        labels={{ Auto: $t('mcp.ts_auto'), On: $t('mcp.ts_on'), Off: $t('mcp.ts_off') }}
         value={capitalize($toolSearchMode ?? 'auto')}
         onchange={onToolSearchChange}
       />
@@ -209,13 +211,13 @@
     {#if loading && ($mcpServers as any[]).length === 0}
       <div class="empty-state">
         <iconify-icon icon="ant-design:loading-outlined" width="24" class="spin"></iconify-icon>
-        <span>Loading servers…</span>
+        <span>{$t('mcp.loading')}</span>
       </div>
     {:else if ($mcpServers as any[]).length === 0}
       <div class="empty-state">
         <iconify-icon icon="ant-design:api-outlined" width="32"></iconify-icon>
-        <span>No MCP servers configured yet</span>
-        <button class="btn-primary" onclick={openAdd}>Add your first server</button>
+        <span>{$t('mcp.empty')}</span>
+        <button class="btn-primary" onclick={openAdd}>{$t('mcp.add_first')}</button>
       </div>
     {:else}
       <div class="server-list">
@@ -248,7 +250,7 @@
             <div class="server-actions">
               <button
                 class="srv-btn"
-                title="Edit"
+                title={$t('common.edit')}
                 disabled={srv.source === 'project'}
                 onclick={() => openEdit(srv)}
               >
@@ -256,7 +258,7 @@
               </button>
               <button
                 class="srv-btn"
-                title="Reconnect"
+                title={$t('status.reconnect')}
                 disabled={srv.status === 'connected'}
                 onclick={() => reconnect(srv.name)}
               >
@@ -264,7 +266,7 @@
               </button>
               <button
                 class="srv-btn del"
-                title="Delete"
+                title={$t('common.delete')}
                 disabled={srv.source === 'project'}
                 onclick={() => deleteServer(srv.name)}
               >
@@ -292,41 +294,41 @@
 /* ── page header ─────────────────────────────────────────────────────────── */
 .page-header  { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .title-block  { display: flex; flex-direction: column; gap: 4px; }
-h2 { margin: 0; font-size: 24px; font-weight: 600; color: #1F1F1F; }
-p  { margin: 0; font-size: 14px; color: rgba(0,0,0,0.65); }
+h2 { margin: 0; font-size: 24px; font-weight: 600; color: var(--text-heading); }
+p  { margin: 0; font-size: 14px; color: var(--text-secondary); }
 .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 .btn-primary {
-  height: 32px; padding: 0 14px; border: none; background: #1677FF;
+  height: 32px; padding: 0 14px; border: none; background: var(--blue-6);
   border-radius: 6px; font-size: 14px; color: #fff; cursor: pointer;
   font-family: inherit; display: flex; align-items: center; gap: 8px;
 }
-.btn-primary:hover:not(:disabled) { background: #4096FF; }
+.btn-primary:hover:not(:disabled) { background: var(--blue-5); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-secondary {
-  height: 32px; padding: 0 12px; border: 1px solid #D9D9D9; background: #fff;
-  border-radius: 6px; font-size: 13px; color: rgba(0,0,0,0.65); cursor: pointer;
+  height: 32px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer;
   font-family: inherit; display: flex; align-items: center; gap: 8px;
 }
-.btn-secondary:hover:not(:disabled) { border-color: #4096FF; color: #4096FF; }
+.btn-secondary:hover:not(:disabled) { border-color: var(--blue-5); color: var(--blue-5); }
 .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── tool-search card ────────────────────────────────────────────────────── */
 .tool-search-card {
-  background: #fff; border-radius: 16px; box-shadow: 0 8px 24px rgba(15,23,42,0.03);
+  background: var(--bg-container); border-radius: 16px; box-shadow: var(--card-shadow);
   padding: 20px 24px; display: flex; align-items: center; gap: 24px;
 }
 .ts-info  { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
-.ts-title { font-size: 16px; font-weight: 600; color: #1F1F1F; }
-.ts-desc  { font-size: 13px; line-height: 1.5; color: rgba(0,0,0,0.65); }
+.ts-title { font-size: 16px; font-weight: 600; color: var(--text-heading); }
+.ts-desc  { font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
 
 /* ── server list ─────────────────────────────────────────────────────────── */
 .server-list { display: flex; flex-direction: column; gap: 16px; }
 
 .server-card {
-  background: #fff; border-radius: 16px; box-shadow: 0 8px 24px rgba(15,23,42,0.03);
+  background: var(--bg-container); border-radius: 16px; box-shadow: var(--card-shadow);
   padding: 18px 24px; display: flex; align-items: center; gap: 16px;
   transition: opacity 0.2s;
 }
@@ -334,27 +336,27 @@ p  { margin: 0; font-size: 14px; color: rgba(0,0,0,0.65); }
 
 .server-icon {
   width: 36px; height: 36px; flex: 0 0 36px; border-radius: 10px;
-  background: #E6F4FF; color: #1677FF; display: flex; align-items: center; justify-content: center;
+  background: var(--blue-1); color: var(--blue-6); display: flex; align-items: center; justify-content: center;
 }
 
 .server-info       { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
 .server-title-row  { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.server-name       { font-size: 15px; font-weight: 600; color: #1F1F1F; }
+.server-name       { font-size: 15px; font-weight: 600; color: var(--text-heading); }
 
 .transport-badge {
-  height: 20px; padding: 0 7px; border: 1px solid #EEEFF1; background: #FAFAFA;
-  border-radius: 4px; display: flex; align-items: center; font-size: 11px; color: rgba(0,0,0,0.45);
+  height: 20px; padding: 0 7px; border: 1px solid var(--border-secondary); background: var(--bg-table-header);
+  border-radius: 4px; display: flex; align-items: center; font-size: 11px; color: var(--text-tertiary);
 }
 
-.tool-count  { font-size: 12px; color: rgba(0,0,0,0.45); }
+.tool-count  { font-size: 12px; color: var(--text-tertiary); }
 
 .server-cmd {
-  font-size: 13px; color: rgba(0,0,0,0.45);
+  font-size: 13px; color: var(--text-tertiary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .server-error {
-  font-size: 12px; color: #FF4D4F;
+  font-size: 12px; color: var(--error);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
@@ -362,18 +364,18 @@ p  { margin: 0; font-size: 14px; color: rgba(0,0,0,0.65); }
 .server-actions { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 
 .srv-btn {
-  width: 30px; height: 30px; border: 1px solid #EEEFF1; background: #fff;
+  width: 30px; height: 30px; border: 1px solid var(--border-secondary); background: var(--bg-container);
   border-radius: 6px; display: flex; align-items: center; justify-content: center;
-  cursor: pointer; color: rgba(0,0,0,0.45);
+  cursor: pointer; color: var(--text-tertiary);
 }
-.srv-btn:hover:not(:disabled)      { border-color: #4096FF; color: #4096FF; }
-.srv-btn.del:hover:not(:disabled)  { border-color: #FF4D4F; color: #FF4D4F; }
+.srv-btn:hover:not(:disabled)      { border-color: var(--blue-5); color: var(--blue-5); }
+.srv-btn.del:hover:not(:disabled)  { border-color: var(--error); color: var(--error); }
 .srv-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ── empty state ─────────────────────────────────────────────────────────── */
 .empty-state {
   display: flex; flex-direction: column; align-items: center; gap: 14px;
-  padding: 64px 0; color: rgba(0,0,0,0.45); font-size: 14px;
+  padding: 64px 0; color: var(--text-tertiary); font-size: 14px;
 }
 
 /* ── utilities ───────────────────────────────────────────────────────────── */

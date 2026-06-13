@@ -1,5 +1,6 @@
 <script lang="ts">
   import { mcpModalOpen, mcpModalState, mcpServers, showToast } from '../../lib/stores'
+  import { t } from '../../lib/i18n'
   import * as api from '../../lib/api'
 
   let mode = $derived($mcpModalState.mode)
@@ -29,7 +30,7 @@
     jsonText = ''
   })
 
-  const title = $derived(mode === 'edit' ? 'Edit MCP Server' : mode === 'import' ? 'Import MCP Servers' : 'Add MCP Server')
+  const title = $derived(mode === 'edit' ? $t('mcp.modal_edit') : mode === 'import' ? $t('mcp.modal_import') : $t('mcp.modal_add'))
   const isHttp = $derived(transport === 'http' || transport === 'sse')
   const canSubmit = $derived(
     mode === 'import'
@@ -89,7 +90,7 @@
     <div class="modal-body">
       {#if mode === 'import'}
         <div class="field">
-          <label>Paste MCP config JSON</label>
+          <label>{$t('mcp.paste_json')}</label>
           <textarea
             rows={9}
             class="json-area"
@@ -99,32 +100,32 @@
         </div>
       {:else}
         <div class="field">
-          <label>Name</label>
-          <input placeholder="e.g. github" bind:value={name} disabled={mode === 'edit'} />
+          <label>{$t('mcp.field_name')}</label>
+          <input placeholder={$t('mcp.field_name_ph')} bind:value={name} disabled={mode === 'edit'} />
         </div>
         <div class="field">
-          <label>Transport</label>
+          <label>{$t('mcp.field_transport')}</label>
           <select bind:value={transport}>
             {#each ['stdio', 'http', 'sse'] as opt}<option>{opt}</option>{/each}
           </select>
         </div>
         {#if isHttp}
           <div class="field">
-            <label>Server URL</label>
+            <label>{$t('mcp.field_url')}</label>
             <input placeholder="https://example.com/mcp" bind:value={url} />
           </div>
         {:else}
           <div class="field">
-            <label>Launch command</label>
+            <label>{$t('mcp.field_command')}</label>
             <input placeholder="npx -y @modelcontextprotocol/server-…" bind:value={command} />
           </div>
         {/if}
       {/if}
     </div>
     <div class="modal-footer">
-      <button class="btn-secondary" onclick={close} disabled={submitting}>Cancel</button>
+      <button class="btn-secondary" onclick={close} disabled={submitting}>{$t('common.cancel')}</button>
       <button class="btn-primary" onclick={submit} disabled={submitting || !canSubmit}>
-        {submitting ? 'Saving…' : mode === 'edit' ? 'Save' : mode === 'import' ? 'Import' : 'Add Server'}
+        {submitting ? $t('common.saving') : mode === 'edit' ? $t('common.save') : mode === 'import' ? $t('mcp.import') : $t('mcp.add')}
       </button>
     </div>
   </div>
@@ -133,59 +134,59 @@
 
 <style>
 .backdrop {
-  position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,0.45);
+  position: fixed; inset: 0; z-index: 1000; background: var(--text-tertiary);
   display: flex; align-items: center; justify-content: center; padding: 24px;
 }
 .modal {
-  width: 100%; max-width: 380px; background: #fff;
+  width: 100%; max-width: 380px; background: var(--bg-container);
   border-radius: 12px; overflow: hidden;
   box-shadow: 0 16px 48px rgba(0,0,0,0.18);
   animation: octo-fadein 0.16s ease;
 }
 .modal-header {
   display: flex; align-items: center; gap: 8px;
-  padding: 14px 18px; border-bottom: 1px solid #F0F0F0;
+  padding: 14px 18px; border-bottom: 1px solid var(--border-table);
 }
-.modal-title { font-size: 15px; font-weight: 600; color: #1F1F1F; flex: 1; }
+.modal-title { font-size: 15px; font-weight: 600; color: var(--text-heading); flex: 1; }
 .close-btn {
   width: 28px; height: 28px; border: none; background: transparent;
   border-radius: 6px; display: flex; align-items: center; justify-content: center;
-  cursor: pointer; color: rgba(0,0,0,0.45);
+  cursor: pointer; color: var(--text-tertiary);
 }
-.close-btn:hover { background: rgba(0,0,0,0.04); }
+.close-btn:hover { background: var(--hover-neutral); }
 .modal-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
-label { font-size: 12px; color: rgba(0,0,0,0.65); }
+label { font-size: 12px; color: var(--text-secondary); }
 input, select {
   width: 100%; height: 32px; padding: 0 10px;
-  border: 1px solid #D9D9D9; border-radius: 6px; font-size: 13px;
-  color: rgba(0,0,0,0.88); font-family: inherit; outline: none; background: #fff;
+  border: 1px solid var(--border); border-radius: 6px; font-size: 13px;
+  color: var(--text); font-family: inherit; outline: none; background: var(--bg-container);
   box-sizing: border-box;
 }
-input:focus, select:focus { border-color: #1677FF; box-shadow: 0 0 0 2px rgba(5,145,255,0.1); }
-input:disabled { background: #FAFAFA; color: rgba(0,0,0,0.45); }
+input:focus, select:focus { border-color: var(--blue-6); box-shadow: 0 0 0 2px rgba(5,145,255,0.1); }
+input:disabled { background: var(--bg-table-header); color: var(--text-tertiary); }
 .json-area {
-  width: 100%; padding: 8px 10px; border: 1px solid #D9D9D9; border-radius: 6px;
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
   font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  color: rgba(0,0,0,0.88); outline: none; background: #fff; box-sizing: border-box;
+  color: var(--text); outline: none; background: var(--bg-container); box-sizing: border-box;
   resize: vertical; line-height: 1.6;
 }
-.json-area:focus { border-color: #1677FF; box-shadow: 0 0 0 2px rgba(5,145,255,0.1); }
+.json-area:focus { border-color: var(--blue-6); box-shadow: 0 0 0 2px rgba(5,145,255,0.1); }
 .modal { max-width: 420px; }
 .modal-footer {
-  padding: 12px 18px; border-top: 1px solid #F0F0F0;
+  padding: 12px 18px; border-top: 1px solid var(--border-table);
   display: flex; justify-content: flex-end; gap: 8px;
 }
 .btn-secondary {
-  height: 32px; padding: 0 14px; border: 1px solid #D9D9D9; background: #fff;
-  border-radius: 6px; font-size: 14px; color: rgba(0,0,0,0.65); cursor: pointer; font-family: inherit;
+  height: 32px; padding: 0 14px; border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: 6px; font-size: 14px; color: var(--text-secondary); cursor: pointer; font-family: inherit;
 }
-.btn-secondary:hover:not(:disabled) { border-color: #4096FF; color: #4096FF; }
+.btn-secondary:hover:not(:disabled) { border-color: var(--blue-5); color: var(--blue-5); }
 .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary {
-  height: 32px; padding: 0 14px; border: none; background: #1677FF;
+  height: 32px; padding: 0 14px; border: none; background: var(--blue-6);
   border-radius: 6px; font-size: 14px; color: #fff; cursor: pointer; font-family: inherit;
 }
-.btn-primary:hover:not(:disabled) { background: #4096FF; }
+.btn-primary:hover:not(:disabled) { background: var(--blue-5); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

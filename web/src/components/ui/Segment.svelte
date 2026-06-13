@@ -1,8 +1,12 @@
 <script lang="ts">
-  let { options = [], value = $bindable(''), onchange }: {
+  let { options = [], value = $bindable(''), onchange, labels }: {
     options?: string[]
     value?: string
     onchange?: (v: string) => void
+    // Optional display labels keyed by option value. The bound `value` stays
+    // the stable English option (handlers depend on it); only the rendered
+    // text is localized when a label is provided.
+    labels?: Record<string, string>
   } = $props()
 </script>
 
@@ -12,7 +16,7 @@
       class="opt"
       class:active={value === opt}
       onclick={() => { value = opt; onchange?.(opt) }}
-    >{opt}</button>
+    >{labels?.[opt] ?? opt}</button>
   {/each}
 </div>
 
@@ -20,7 +24,7 @@
 .segment {
   display: inline-flex;
   padding: 2px;
-  background: #F0F2F5;
+  background: var(--control-track);
   border-radius: 8px;
   gap: 2px;
 }
@@ -32,10 +36,10 @@
   font-size: 13px;
   cursor: pointer;
   background: transparent;
-  color: rgba(0,0,0,0.65);
+  color: var(--text-secondary);
   transition: background 0.15s, color 0.15s;
   font-family: inherit;
 }
-.opt:hover { background: rgba(0,0,0,0.04); }
-.opt.active { background: #FFFFFF; color: #1677FF; }
+.opt:hover { background: var(--hover-neutral); }
+.opt.active { background: var(--bg-container); color: var(--blue-6); }
 </style>
