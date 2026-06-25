@@ -40,7 +40,7 @@ type SenderOptions struct {
 	// ThinkingBudget > 0 enables Anthropic extended thinking with this trace
 	// budget; ignored by OpenAI-protocol vendors.
 	ThinkingBudget int
-	// ReasoningEffort ("low"|"medium"|"high") is forwarded to OpenAI-protocol
+	// ReasoningEffort ("low"|"medium"|"high"|"max") is forwarded to OpenAI-protocol
 	// vendors as reasoning_effort; ignored by Anthropic-protocol vendors
 	// (which use ThinkingBudget).
 	ReasoningEffort string
@@ -111,6 +111,10 @@ func buildClient(name, apiKey, baseURL string) (provider.Provider, error) {
 		if baseURL != "" {
 			client.BaseURL = baseURL
 		}
+		// Pass the vendor id as the dialect so the client can apply
+		// vendor-specific quirks (DeepSeek's thinking-mode toggle); names the
+		// client doesn't recognise leave the request in its generic shape.
+		client.Dialect = name
 		return client, nil
 	default:
 		return nil, fmt.Errorf("unknown protocol %q for provider %q", v.Protocol, name)
