@@ -14,6 +14,7 @@
     chatWorkingDir,
     chatPermMode,
     chatReasoningEffort,
+    chatShowReasoning,
     chatSuggestion,
     chatThinking,
     chatSubAgents,
@@ -298,12 +299,23 @@
     }))
 
     // A background process finished (the badge updates via
-    // background_tasks_update); surface the outcome as a toast.
+    // background_tasks_update); render the outcome as an inline scrollback
+    // notice in the message stream, mirroring the TUI's bgDoneStyle line.
     cleanups.push(ws.on('background_task_notice', (ev) => {
       if ((ev as any).session_id && (ev as any).session_id !== sid) return
       const status = (ev as any).status ?? ''
       const level = status === 'success' ? 'success' : status === 'cancelled' ? 'info' : 'error'
-      showToast(`${tr('bgtask.notice')}: ${(ev as any).command ?? ''}`, level)
+      const command = (ev as any).command ?? ''
+      addChatMsg(sid, {
+        id: uid('note'),
+        type: 'notice',
+        content: `Background \`${command}\` ${status}`,
+        level,
+        createdAt: Date.now(),
+        streaming: false,
+        tools: [],
+        todos: [],
+      })
     }))
 
     cleanups.push(ws.on('text_delta', (ev) => {
@@ -333,16 +345,54 @@
       )
     }))
 
+    cleanups.push(ws.on('sub_agent_notice', (ev) => {
+      if ((ev as any).session_id && (ev as any).session_id !== sid) return
+      const status = (ev as any).status ?? ''
+      const level = status === 'success' ? 'success' : 'error'
+      const description = (ev as any).description ?? ''
+      const agentId = (ev as any).agent_id ?? ''
+      const label = description || agentId || 'sub-agent'
+      const text = status === 'success'
+        ? `Sub-agent \`${label}\` completed`
+        : `Sub-agent \`${label}\` failed`
+      addChatMsg(sid, {
+        id: uid('note'),
+        type: 'notice',
+        content: text,
+        level,
+        createdAt: Date.now(),
+        streaming: false,
+        tools: [],
+        todos: [],
+      })
+    }))
+
     cleanups.push(ws.on('workflow_event', (ev) => {
       if ((ev as any).session_id && (ev as any).session_id !== sid) return
-      applyWorkflowEvent(
-        sid,
-        (ev as any).run_id ?? '',
-        (ev as any).description ?? '',
-        (ev as any).kind ?? '',
-        (ev as any).line ?? '',
-        (ev as any).status ?? '',
-      )
+      const kind = (ev as any).kind ?? ''
+      const runId = (ev as any).run_id ?? ''
+      const description = (ev as any).description ?? ''
+      const status = (ev as any).status ?? ''
+      applyWorkflowEvent(sid, runId, description, kind, (ev as any).line ?? '', status)
+      // When a background workflow finishes, mirror the TUI scrollback notice
+      // so the completion is visible in the message stream.
+      if (kind === 'done') {
+        const level = status === 'error' ? 'error' : 'success'
+        const label = description || runId || 'workflow'
+        const text = status === 'error'
+          ? `Workflow \`${label}\` failed`
+          : `Workflow \`${label}\` completed`
+        addChatMsg(sid, {
+          id: uid('note'),
+          type: 'notice',
+          content: text,
+          level,
+          createdAt: Date.now(),
+          streaming: false,
+          tools: [],
+          todos: [],
+        })
+      }
     }))
 
     cleanups.push(ws.on('assistant_message', (ev) => {
@@ -482,6 +532,9 @@
       }
       chatPermMode.update(mm => ({ ...mm, [sid]: (ev as any).permission_mode }))
       chatReasoningEffort.update(r => ({ ...r, [sid]: (ev as any).reasoning_effort }))
+      if (typeof (ev as any).show_reasoning === 'boolean') {
+        chatShowReasoning.update(r => ({ ...r, [sid]: (ev as any).show_reasoning }))
+      }
       chatWorkingDir.update(w => ({ ...w, [sid]: (ev as any).working_dir }))
       // An idle snapshot from the server clears a stale thinking indicator.
       if ((ev as any).status === 'idle') {
@@ -887,6 +940,17 @@
                   <span>{msg.content || $t('chat.thinking')}</span>
                 </div>
               </div>
+
+            {:else if msg.type === 'notice'}
+              <!-- Inline scrollback notice (background process completion, etc.) -->
+              <div class="msg-agent fadein">
+                <div class="agent-avatar notice-avatar" data-level={msg.level}>
+                  <iconify-icon icon="lucide:info" width="14"></iconify-icon>
+                </div>
+                <div class="agent-content">
+                  <div class="notice-line" data-level={msg.level}>{@html renderMarkdown(msg.content)}</div>
+                </div>
+              </div>
             {/if}
           {/each}
 
@@ -1186,6 +1250,28 @@
   text-align: left; line-height: 1.5;
 }
 .suggestion-chip:hover { border-color: var(--blue-6); color: var(--blue-6); }
+
+/* ── Inline scrollback notice ─────────────────────────────────────────────── */
+.notice-avatar {
+  background: transparent;
+  color: var(--text-tertiary);
+}
+.notice-avatar[data-level="success"] { color: var(--success); }
+.notice-avatar[data-level="error"] { color: var(--error); }
+.notice-avatar[data-level="info"] { color: var(--text-secondary); }
+.notice-line {
+  display: flex; align-items: center; gap: 8px; min-height: 28px;
+  font-size: 13px; color: var(--text-secondary);
+}
+.notice-line[data-level="success"] { color: var(--success); }
+.notice-line[data-level="error"] { color: var(--error); }
+.notice-line[data-level="info"] { color: var(--text-secondary); }
+.notice-line :global(p) { margin: 0; }
+.notice-line :global(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; background: var(--bg-table-header); border: 1px solid var(--border-table);
+  border-radius: 4px; padding: 1px 4px;
+}
 
 /* ── Fade-in ─────────────────────────────────────────────────────────────── */
 .fadein { animation: octo-fadein 0.25s ease; }
