@@ -70,14 +70,15 @@ func superviseLoop(spawn func() (func() int, func(os.Signal), error), sigCh <-ch
 
 // spawnServeWorker returns the production spawn function for superviseLoop:
 // re-exec the current binary with `serve <args>` and the worker marker env.
-// The binary path is resolved once at supervisor start and re-opened by the
-// OS on every spawn, so a binary replaced on disk takes effect on the next
-// restart without the supervisor itself changing.
+// The binary path is re-resolved on every spawn, so a binary replaced on disk
+// (e.g. by the web upgrade flow) takes effect on the next restart without the
+// supervisor itself changing. Resolving once at startup can leave a stale path
+// on platforms where the running image's filesystem identity is cached.
 func spawnServeWorker(args []string, stdout, stderr io.Writer) func() (func() int, func(os.Signal), error) {
-	exe, exeErr := os.Executable()
 	return func() (func() int, func(os.Signal), error) {
-		if exeErr != nil {
-			return nil, nil, exeErr
+		exe, err := os.Executable()
+		if err != nil {
+			return nil, nil, err
 		}
 		cmd := exec.Command(exe, append([]string{"serve"}, args...)...)
 		cmd.Stdout = stdout
