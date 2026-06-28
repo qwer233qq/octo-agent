@@ -719,7 +719,7 @@
     composer?.setText(content)
   }
 
-  // ── export the visible transcript as a markdown file ─────────────────────────
+  // ── export the visible transcript as a markdown file ────────────────────────
   async function exportTranscript() {
     const sid = get(activeSessionId)
     if (!sid) return
@@ -727,12 +727,22 @@
     // Fetch complete history from server instead of relying on the local
     // chatMessages store, which may only contain a partial view of the session.
     let events: any[] = []
+    let hasMore = false
     try {
       const data = await api.getSessionMessages(sid)
-      events = (data as any).events ?? []
+      const resp = data as { events?: any[]; has_more?: boolean }
+      events = resp.events ?? []
+      hasMore = resp.has_more ?? false
     } catch (e) {
+      console.error('Export failed:', e)
       showToast(tr('chat.export_failed'), 'error')
       return
+    }
+
+    if (hasMore) {
+      // The server may paginate for very long sessions. For now, warn the user
+      // that the exported transcript may be incomplete.
+      console.warn('Export: server returned has_more=true, transcript may be incomplete')
     }
 
     if (!events.length) { showToast(tr('chat.nothing_to_export'), 'error'); return }
