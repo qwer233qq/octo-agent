@@ -178,21 +178,24 @@
   <!-- Model -->
   <label class="field">
     <span class="field-label">{$t('models.model')}</span>
-    <input
-      class="field-input mono"
-      type="text"
-      list="mcf-models"
-      placeholder={$t('models.model.placeholder')}
-      bind:value={model}
-      disabled={saving}
-    />
-    <!-- Always render the datalist when a provider is selected, so the dropdown
-         shows all available models. The condition checks for the array explicitly
-         to avoid rendering an empty list during initial load or with unknown providers. -->
+    <!-- Use a real <select> dropdown when the provider has a model catalogue,
+         so users can see and pick from all available options. Fall back to a
+         free-text input for custom providers (e.g. openai_compatible) with no
+         preset model list. -->
     {#if preset && preset.models && preset.models.length > 0}
-      <datalist id="mcf-models">
-        {#each preset.models as m}<option value={m}></option>{/each}
-      </datalist>
+      <select class="field-input mono" bind:value={model} disabled={saving}>
+        {#each preset.models as m}
+          <option value={m}>{m}</option>
+        {/each}
+      </select>
+    {:else}
+      <input
+        class="field-input mono"
+        type="text"
+        placeholder={$t('models.model.placeholder')}
+        bind:value={model}
+        disabled={saving}
+      />
     {/if}
   </label>
 
