@@ -7,6 +7,25 @@
 
   let runningCount = $derived(agents.filter(a => a.status === 'running').length)
 
+  // Track expanded state per agent. Done agents start expanded.
+  let expanded = $state<Record<string, boolean>>({})
+  $effect(() => {
+    // Initialize expanded state for new agents
+    const newExpanded: Record<string, boolean> = { ...expanded }
+    let changed = false
+    for (const a of agents) {
+      if (!(a.id in newExpanded)) {
+        newExpanded[a.id] = a.status === 'done'
+        changed = true
+      }
+    }
+    if (changed) expanded = newExpanded
+  })
+
+  function toggleExpand(id: string) {
+    expanded = { ...expanded, [id]: !expanded[id] }
+  }
+
   // Avatar initials: first letters of the description words, capped at 2 chars.
   function initials(a: SubAgentState): string {
     const words = (a.description || a.id).split(/[\s_-]+/).filter(Boolean)
@@ -43,8 +62,8 @@
   </div>
 
   {#each agents as a (a.id)}
-    <details class="agent-row" open={a.status === 'done'} let:open>
-      <summary class="agent-summary">
+    <details class="agent-row" open={expanded[a.id] ?? (a.status === 'done')}>
+      <summary class="agent-summary" onclick={() => toggleExpand(a.id)}>
         <span class="agent-avatar" class:blue={a.status === 'running'} class:green-av={a.status === 'done'}>
           {initials(a)}
           <span class="dot green" class:pulse={a.status === 'running'}></span>
@@ -64,7 +83,7 @@
             done · {a.tools.length} tool{a.tools.length === 1 ? '' : 's'}
           </span>
         {/if}
-        <iconify-icon icon={open ? 'lucide:chevron-down' : 'lucide:chevron-right'} width="13" style="color:var(--text-tertiary);flex:0 0 auto"></iconify-icon>
+        <iconify-icon icon={(expanded[a.id] ?? (a.status === 'done')) ? 'lucide:chevron-down' : 'lucide:chevron-right'} width="13" style="color:var(--text-tertiary);flex:0 0 auto"></iconify-icon>
       </summary>
       <div class="agent-body">
         {#if a.tools.length === 0}
