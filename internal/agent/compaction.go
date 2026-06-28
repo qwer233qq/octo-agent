@@ -45,7 +45,9 @@ func contextWindow(model string) int {
 	// ── Anthropic Claude ──
 	case strings.Contains(m, "claude-opus-4.8") || strings.Contains(m, "claude-opus-4"):
 		return 1_000_000
-	case strings.Contains(m, "claude-sonnet-4") || strings.Contains(m, "claude-haiku-4"):
+	case strings.Contains(m, "claude-sonnet-4-5") || strings.Contains(m, "claude-sonnet-4"):
+		return 256_000
+	case strings.Contains(m, "claude-haiku-4") || strings.Contains(m, "claude-haiku-4-5"):
 		return 256_000
 	case strings.Contains(m, "claude-4"):
 		return 256_000
@@ -61,6 +63,8 @@ func contextWindow(model string) int {
 		return 1_000_000
 	case strings.Contains(m, "gpt-5") || strings.Contains(m, "gpt5"):
 		return 256_000
+	case strings.Contains(m, "gpt-4.1") || strings.Contains(m, "gpt4.1"):
+		return 128_000
 	case strings.Contains(m, "gpt-4o"):
 		return 128_000
 	case strings.Contains(m, "gpt-4"):
@@ -69,6 +73,8 @@ func contextWindow(model string) int {
 		return 200_000
 
 	// ── Google Gemini ──
+	case strings.Contains(m, "gemini-pro-2.5") || strings.Contains(m, "gemini-pro-2-5"):
+		return 1_000_000
 	case strings.Contains(m, "gemini-3.5") || strings.Contains(m, "gemini3.5"):
 		return 1_000_000
 	case strings.Contains(m, "gemini-3.1") || strings.Contains(m, "gemini3.1"):
@@ -97,17 +103,29 @@ func contextWindow(model string) int {
 		return 64_000
 
 	// ── Moonshot Kimi ──
+	case strings.Contains(m, "kimi-k2.7") || strings.Contains(m, "kimik2.7") || strings.Contains(m, "k2.7"):
+		return 256_000
 	case strings.Contains(m, "kimi-k2.6") || strings.Contains(m, "kimik2.6") || strings.Contains(m, "k2.6"):
 		return 256_000
 	case strings.Contains(m, "kimi-k2") || strings.Contains(m, "kimik2") || strings.Contains(m, "k2"):
 		return 256_000
+	case strings.Contains(m, "kimi-math"):
+		return 128_000
 	case strings.Contains(m, "kimi"):
 		return 200_000
 
 	// ── Alibaba Qwen ──
-	case strings.Contains(m, "qwen-3.7") || strings.Contains(m, "qwen3.7"):
+	case strings.Contains(m, "qwen3.7") || strings.Contains(m, "qwen-3.7"):
 		return 1_000_000
-	case strings.Contains(m, "qwen-3") || strings.Contains(m, "qwen3"):
+	case strings.Contains(m, "qwen3-max") || strings.Contains(m, "qwen-3-max"):
+		return 256_000
+	case strings.Contains(m, "qwen3.5") || strings.Contains(m, "qwen-3.5"):
+		return 128_000
+	case strings.Contains(m, "qwen-plus") || strings.Contains(m, "qwen3-plus"):
+		return 128_000
+	case strings.Contains(m, "qwen-turbo") || strings.Contains(m, "qwen3-turbo"):
+		return 128_000
+	case strings.Contains(m, "qwen3") || strings.Contains(m, "qwen-3"):
 		return 128_000
 	case strings.Contains(m, "qwen2.5") || strings.Contains(m, "qwen-2.5"):
 		return 128_000
@@ -129,10 +147,42 @@ func contextWindow(model string) int {
 		return 4_000
 
 	// ── Mistral ──
-	case strings.Contains(m, "mistral-large") || strings.Contains(m, "mistral-small"):
+	case strings.Contains(m, "mistral-large") || strings.Contains(m, "mistral-small") || strings.Contains(m, "pixtral-large"):
 		return 128_000
 	case strings.Contains(m, "mistral"):
 		return 32_000
+
+	// ── MiniMax ──
+	case strings.Contains(m, "minimax-m3") || strings.Contains(m, "minimax-v1") || strings.Contains(m, "minimax-speech"):
+		return 256_000
+	case strings.Contains(m, "minimax-m2"):
+		return 256_000
+	case strings.Contains(m, "minimax"):
+		return 128_000
+
+	// ── GLM (Zhipu) ──
+	case strings.Contains(m, "glm-4-air") || strings.Contains(m, "glm-4.5-air"):
+		return 128_000
+	case strings.Contains(m, "glm-4-flash") || strings.Contains(m, "glm-4.5-flash"):
+		return 128_000
+	case strings.Contains(m, "glm-4.5") || strings.Contains(m, "glm4.5"):
+		return 128_000
+	case strings.Contains(m, "glm-4") || strings.Contains(m, "glm4"):
+		return 128_000
+	case strings.Contains(m, "glm"):
+		return 64_000
+
+	// ── XAI Grok ──
+	case strings.Contains(m, "grok-3") || strings.Contains(m, "grok3"):
+		return 128_000
+	case strings.Contains(m, "grok"):
+		return 64_000
+
+	// ── MiMo (Xiaomi) ──
+	case strings.Contains(m, "mimo-v2.5") || strings.Contains(m, "mimov2.5"):
+		return 256_000
+	case strings.Contains(m, "mimo"):
+		return 128_000
 
 	// ── Cohere ──
 	case strings.Contains(m, "command-r-plus") || strings.Contains(m, "command-r"):
