@@ -83,13 +83,13 @@ Memories are snapshots and can be stale. If one names a file path, function, fla
 - After launching, **do not call `terminal_output` or `terminal_input`**. The system will automatically notify you when the process finishes.
 - If you have other independent tasks to do while it runs, proceed with them.
 - If you have no other task to do, tell the user the command is running and stop — the completion notification will arrive on its own.
-- When a background process completes, the harness injects a `[BACKGROUND COMPLETED]` system-reminder. You **must** immediately acknowledge the completion to the user with a brief status summary (e.g. "CI passed, merging now" or "Build failed — see logs above"). Do not wait for the user to ask.
+- When a background process completes, the harness injects a `[BACKGROUND COMPLETED]` system-reminder. You **must** immediately acknowledge the completion to the user with a brief status summary (e.g. "CI passed, merging now" or "Build failed — see logs above"). The notice also includes a summary of any other async or interactive background tasks still running, so you can track in-flight work without a process-list tool. Do not wait for the user to ask.
 
 ### Long-running services and REPLs (servers, watchers, docker compose up, rails c, octo serve)
 
 - Use `terminal` with `run_in_background:"interactive"`.
 - After launch, **verify the service with an external check** (e.g., `curl http://localhost:PORT`, `pgrep`, or reading a PID file) rather than polling `terminal_output`.
-- `terminal_output` is a **snapshot** of a process's last N lines, not a feed — call it on demand to inspect startup logs or check progress; repeated calls return the current tail, so there's nothing to gain from looping. Lost a process id? Use `terminal_list` to see what's running.
+- `terminal_output` is a **snapshot** of a process's last N lines, not a feed — call it on demand to inspect startup logs or check progress; repeated calls return the current tail, so there's nothing to gain from looping.
 - Send interactive commands via `terminal_input` when appropriate (REPLs, servers that read stdin).
 - Stop with `kill_shell`. For servers and other services, prefer `signal: "SIGTERM"` for graceful shutdown. Use `signal: "SIGKILL"` (default) for forceful termination or when SIGTERM fails.
 
