@@ -62,6 +62,21 @@ func offerOnboarding(reader lineReader, out io.Writer) bool {
 	}
 }
 
+// wireSessionHooks completes the agent's hook identity once the session exists:
+// the SessionID/transcript/transport the payload envelope carries, the durable
+// SessionStarted seed, and the persist callback the engine invokes when
+// SessionStart first fires (startup). Persistence rides the session layer's
+// existing post-turn Save — MarkHookStarted only marks the meta dirty.
+func wireSessionHooks(a *agent.Agent, sess *agent.Session, transport string) {
+	a.HookMeta.SessionID = sess.ID
+	a.HookMeta.Transport = transport
+	if p, err := sess.SavePath(); err == nil {
+		a.HookMeta.TranscriptPath = p
+	}
+	a.SessionStarted = sess.HookStarted
+	a.OnSessionStart = func() { sess.MarkHookStarted() }
+}
+
 // errMissingAPIKey is returned by resolveAPIKey when no API key is available.
 // The caller (runChat) can detect this and auto-launch the config wizard on an
 // interactive terminal instead of failing silently.
@@ -740,15 +755,21 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// result when a milestone-shaped command (gh pr create/merge) lands, so the
 	// injector is wired even when MEMORY.md has no structured rules — Reminder
 	// is silent then.
+	// Hook engine: shell hooks (from the OCTO_HOOK_* env shim) plus the memory
+	// injector's reminder & save-nudge as in-process hooks, unified on one
+	// dispatch path that the agent core drives for every transport. Shares the
+	// process seen-set so SessionStart resume fires once per OS process.
+	hookEngine := hooks.EngineFromEnv(hooks.SharedSeen())
+	hookEngine.Notify = func(m string) { fmt.Fprintln(stderr, "↳ hook: "+m) }
 	if memDir != "" {
 		rules := memory.ParseRules(memDir)
 		if homeMemDir != "" {
 			rules.Merge(memory.ParseRules(homeMemDir))
 		}
-		inj := memory.NewInjector(rules)
-		a.UserInputHook = inj.Reminder
-		a.ToolResultHook = inj.SaveNudge
+		memory.NewInjector(rules).RegisterHooks(hookEngine)
 	}
+	a.Hooks = hookEngine
+	a.HookMeta = hooks.Meta{Cwd: cwd}
 
 	// Permission engine — gates every tool call; shared by both paths. The
 	// memory directory (outside CWD) is whitelisted for writes so the agent can
@@ -790,6 +811,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			sess = agent.NewSession(resolvedModel, *system)
 			sess.Bind(agent.EntryTUI, false)
 		}
+		wireSessionHooks(a, sess, agent.EntryTUI)
 		// Persisted (non-ephemeral) sessions archive folded turns so the model
 		// can recall them with the read tool after a compaction.
 		if !*noSave {
@@ -810,9 +832,8 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			stderr:          stderr,
 			skillReg:        skillReg,
 			memDir:          memDir,
-			reader:          replReader,          // shared with the asker / permission gate
-			view:            replView,            // same surface for turn render + Ask prompts
-			hooks:           hooks.LoadFromEnv(), // C9 Phase 3: external retrieval layer hooks
+			reader:          replReader, // shared with the asker / permission gate
+			view:            replView,   // same surface for turn render + Ask prompts
 			permEngine:      permEngine,
 			mcpBoot:         mcpBoot, // nil unless tools on with servers configured
 			modelName:       resolvedModel,
@@ -844,9 +865,11 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// ── Headless one-shot (claude -p) ─────────────────────────────────────────
 	// One agentic turn, then exit. The session is ephemeral — one-shot runs are
 	// not persisted (resuming with -c stays a TUI affordance).
+	oneShotSess := agent.NewSession(resolvedModel, *system)
+	wireSessionHooks(a, oneShotSess, agent.EntryCLI)
 	replCfg := replConfig{
 		a:               a,
-		session:         agent.NewSession(resolvedModel, *system),
+		session:         oneShotSess,
 		noSave:          true,
 		plain:           *plain,
 		verbosity:       resolveVerbosity(*quietFlag, *verboseFlag),
@@ -857,7 +880,6 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		memDir:          memDir,
 		reader:          replReader,
 		view:            replView,
-		hooks:           hooks.LoadFromEnv(),
 		permEngine:      permEngine,
 		modelName:       resolvedModel,
 		reasoningEffort: resolvedEffort,
