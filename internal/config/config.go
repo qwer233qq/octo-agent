@@ -33,6 +33,9 @@ import (
 type ModelEntry struct {
 	Provider string `yaml:"provider,omitempty"`
 	Model    string `yaml:"model,omitempty"`
+	// Protocol ("anthropic" | "openai") is the wire format for the Custom
+	// vendor, which has no registry-pinned protocol. Ignored for named vendors.
+	Protocol string `yaml:"protocol,omitempty"`
 	// BaseURL is an optional endpoint override; empty uses the vendor default.
 	BaseURL string `yaml:"base_url,omitempty"`
 	// APIKey, when set, is a plaintext fallback used only if the provider's
@@ -290,21 +293,44 @@ type fileConfig struct {
 func (f fileConfig) normalize() Config {
 	c := f.Config
 	if len(c.Models) > 0 {
+		for i := range c.Models {
+			migrateEntryProvider(&c.Models[i])
+		}
 		return c
 	}
 	if f.LegacyProvider == "" && f.LegacyModel == "" && f.LegacyBaseURL == "" && f.LegacyAPIKey == "" {
 		return c
 	}
-	c.Models = []ModelEntry{{
+	e := ModelEntry{
 		Provider:        f.LegacyProvider,
 		Model:           f.LegacyModel,
 		BaseURL:         f.LegacyBaseURL,
 		APIKey:          f.LegacyAPIKey,
 		ReasoningEffort: f.LegacyReasoningEffort,
 		ShowReasoning:   c.ShowReasoning,
-	}}
+	}
+	migrateEntryProvider(&e)
+	c.Models = []ModelEntry{e}
 	c.DefaultModel = f.LegacyModel
 	return c
+}
+
+// migrateEntryProvider folds the retired openai_compatible / anthropic_compatible
+// catch-all vendors into the unified "custom" vendor, recovering the wire format
+// into the new per-entry Protocol field so existing configs keep working.
+func migrateEntryProvider(e *ModelEntry) {
+	switch e.Provider {
+	case "openai_compatible":
+		e.Provider = "custom"
+		if e.Protocol == "" {
+			e.Protocol = "openai"
+		}
+	case "anthropic_compatible":
+		e.Provider = "custom"
+		if e.Protocol == "" {
+			e.Protocol = "anthropic"
+		}
+	}
 }
 
 // Load reads ~/.octo/config.yml, falling back to the legacy
