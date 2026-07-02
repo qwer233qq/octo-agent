@@ -858,6 +858,16 @@ func (s *Server) runAgentTurnLoop(sess *agent.Session, initialContent string, bl
 			}
 			break
 		}
+		// An active goal continues unprompted: enqueue the hidden continuation
+		// prompt so the chain below starts the follow-up turn. User steers
+		// queued meanwhile take priority — GoalContinuation is only consulted
+		// when the queue is empty, and its own guards (status, zero-progress
+		// suppression) decide whether the loop keeps going.
+		if s.goalsEnabled && !s.steerPending(sess.ID) {
+			if prompt, ok := sess.GoalContinuation(); ok {
+				s.enqueueSteer(sess.ID, agent.InboxItem{Text: prompt})
+			}
+		}
 		steerItems := s.drainSteer(sess.ID)
 		if len(steerItems) == 0 {
 			break
@@ -1063,7 +1073,7 @@ func (s *Server) doAgentTurn(sess *agent.Session, content string, blocks []agent
 		var perr error
 		// prepareToolTurn wires the session-scoped sub-agent manager's hooks
 		// (live-panel events + completion notes to the model).
-		runCtx, executor, _, perr = s.prepareToolTurn(runCtx, a)
+		runCtx, executor, _, perr = s.prepareToolTurn(runCtx, a, sess)
 		if perr != nil {
 			sw.error(perr.Error())
 			return
@@ -1094,6 +1104,9 @@ func (s *Server) doAgentTurn(sess *agent.Session, content string, blocks []agent
 	}
 
 	reply, err := a.RunStream(runCtx, content, toolDefs, executor, handler)
+	// Whether this turn was goal-continuation-kicked, read before the error
+	// handling below consumes the pending mark via SuppressGoalContinuation.
+	goalContWasPending := s.goalsEnabled && sess.GoalContinuationPending()
 
 	// Save history even on interrupt — finishInterrupted repairs it so the
 	// session stays well-formed for the next turn.
@@ -1111,11 +1124,34 @@ func (s *Server) doAgentTurn(sess *agent.Session, content string, blocks []agent
 	s.liveStateMu.Unlock()
 
 	if err != nil {
+		// Any aborted or errored turn parks the continuation loop: an
+		// interrupt means the user said stop (continuing immediately would
+		// make the loop interrupt-proof), and chaining fresh turns onto a
+		// persistent error is unbounded paid retries. The zero-progress audit
+		// can't catch either — partial replies were already billed. A later
+		// user turn's token progress (or any goal mutation) re-arms.
+		if s.goalsEnabled {
+			sess.SuppressGoalContinuation()
+		}
 		if errors.Is(err, context.Canceled) {
 			// Interrupted — finishInterrupted already emitted EventTurnDone,
 			// so turn_done + assistant_message were broadcast by the handler.
 			// Nothing more for the reply itself.
 		} else {
+			// A goal-continuation turn failing on provider rate limits parks
+			// the goal harder: usage_limited persists and stops continuation
+			// until /goal resume. goalContWasPending was captured before the
+			// suppression above consumed the pending mark. A rate-limited
+			// plain user turn is not parked — the user deserves the bare
+			// error first. (A user steer chained onto a not-yet-audited
+			// continuation still parks: pending is stale there, but the next
+			// continuation would hit the same limit, so parking early is the
+			// cheaper outcome.)
+			if s.goalsEnabled && goalContWasPending && isRateLimitErr(err) {
+				if g, gerr := sess.SetGoalStatus(agent.GoalUsageLimited); gerr == nil {
+					s.broadcastGoalUpdated(sess.ID, g)
+				}
+			}
 			// Surface the error, then fall through to the common complete +
 			// session_update tail. Returning here would skip `complete`, leaving
 			// the web UI's streaming flag (and its caret) stuck on forever; the
@@ -1483,6 +1519,11 @@ func (w *wsStreamWriter) handleEvent(ev agent.AgentEvent) {
 			// Steer messages persist only at turn end like everything else
 			// in the turn — buffer them so a refresh keeps the bubble.
 			w.bufferTurnEvent(evt)
+		}
+
+	case agent.EventGoalUpdated:
+		if ev.Goal != nil {
+			w.server.broadcastGoalUpdated(w.sessionID, *ev.Goal)
 		}
 
 	case agent.EventTurnDone:
