@@ -36,11 +36,10 @@ func TestDetectToolchain_PresentAndMissing(t *testing.T) {
 	fakeExe(t, dir, "git")
 	fakeExe(t, dir, "node")
 	fakeExe(t, dir, "python3") // satisfies the "python" probe via its variant
-	fakeExe(t, dir, "bun")
 
 	present, missing := DetectToolchain()
 
-	wantPresent := map[string]bool{"git": true, "node": true, "python": true, "bun": true}
+	wantPresent := map[string]bool{"git": true, "node": true, "python": true}
 	for _, p := range present {
 		if !wantPresent[p] {
 			t.Errorf("unexpected present tool %q", p)
@@ -52,7 +51,7 @@ func TestDetectToolchain_PresentAndMissing(t *testing.T) {
 	}
 
 	for _, m := range missing {
-		if m == "git" || m == "node" || m == "python" || m == "bun" {
+		if m == "git" || m == "node" || m == "python" {
 			t.Errorf("%q reported missing but was planted", m)
 		}
 	}
@@ -71,6 +70,66 @@ func TestDetectToolchain_PythonVariantCollapses(t *testing.T) {
 	}
 	if !found {
 		t.Error("bare `python` on PATH did not satisfy the python probe")
+	}
+}
+
+// withFakeHome points $HOME (and %USERPROFILE% for Windows's os.UserHomeDir)
+// at a fresh temp dir for the duration of the test, isolated from the real
+// user's home.
+func withFakeHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	return dir
+}
+
+// TestDetectToolchain_BundledFallback confirms uv resolves via octo's
+// bundled ~/.octo/bin even when it's not on the real PATH — the
+// scenario the Windows/macOS installers create by staging it there instead
+// of polluting the system PATH.
+func TestDetectToolchain_BundledFallback(t *testing.T) {
+	withIsolatedPath(t) // PATH points at an empty temp dir — no uv there
+	home := withFakeHome(t)
+
+	binDir := filepath.Join(home, ".octo", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin dir: %v", err)
+	}
+	fakeExe(t, binDir, "uv")
+
+	present, missing := DetectToolchain()
+
+	wantPresent := map[string]bool{"uv": true}
+	for _, p := range present {
+		delete(wantPresent, p)
+	}
+	if len(wantPresent) != 0 {
+		t.Errorf("bundled ~/.octo/bin tool not detected as present: %v", wantPresent)
+	}
+	for _, m := range missing {
+		if m == "uv" {
+			t.Errorf("%q reported missing despite being in the bundled ~/.octo/bin fallback", m)
+		}
+	}
+}
+
+// TestDetectToolchain_NoBundledDirIsGracefulMiss confirms that when
+// ~/.octo/bin simply doesn't exist (go install / build-from-source / Linux
+// without an installer), uv is reported missing with no error — the
+// non-installer install path must not regress.
+func TestDetectToolchain_NoBundledDirIsGracefulMiss(t *testing.T) {
+	withIsolatedPath(t)
+	withFakeHome(t) // fresh temp home with no .octo/bin at all
+
+	_, missing := DetectToolchain()
+
+	wantMissing := map[string]bool{"uv": true}
+	for _, m := range missing {
+		delete(wantMissing, m)
+	}
+	if len(wantMissing) != 0 {
+		t.Errorf("expected uv reported missing with no bundled dir, got remaining: %v", wantMissing)
 	}
 }
 
