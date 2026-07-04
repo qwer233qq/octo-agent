@@ -262,6 +262,41 @@ type Server struct {
 	channelCtx     context.Context
 	adapterCancels map[string]context.CancelFunc
 
+	// channelGen bumps every time startOneChannelLocked (re)starts a platform
+	// from scratch, and is handed to that start's runChannelWithRestart
+	// goroutine as a snapshot. A crashed adapter's restart loop rebuilds a
+	// fresh instance via ctor(pc) — a call that does not observe ctx
+	// cancellation — so a concurrent stop/reload/restart of the SAME
+	// platform (e.g. an operator reacting to the crash-loop this fix makes
+	// visible in the Channels view) can advance the generation while that
+	// ctor(pc) call is still in flight. Before writing anything back to
+	// runningAdapters/adapterCancels, the restart loop re-checks its
+	// snapshot against the current generation under channelMu; a mismatch
+	// means another goroutine now owns this platform name, so it discards
+	// its work instead of clobbering the new owner's bookkeeping.
+	channelGen map[string]uint64
+
+	// channelIssues records, per platform, why its adapter isn't healthy: a
+	// startup skip reason (unregistered/construction failed/invalid config)
+	// or the latest crash-and-restart status (#1121 — these used to be
+	// logged, if at all, with no queryable record, so a misconfigured or
+	// crashing platform's only visible symptom was "the bot never replies").
+	// Absent (or "") means healthy. Guarded by its own mutex rather than
+	// channelMu since it's read from the REST handlers on any goroutine,
+	// independent of the (re)start bookkeeping channelMu protects.
+	channelIssuesMu sync.Mutex
+	channelIssues   map[string]string
+
+	// channelWG tracks every runChannelWithRestart goroutine currently in
+	// flight. Nothing in production Waits on it — stopChannels/reloadChannel
+	// only cancel the relevant context(s) and return, which is enough for
+	// correct shutdown behavior. It exists so tests can deterministically
+	// block until a stopped adapter's goroutine has actually returned before
+	// tearing down state that goroutine still reads (e.g. restoring a
+	// package-level test override), instead of racing a fire-and-forget
+	// background goroutine against test cleanup.
+	channelWG sync.WaitGroup
+
 	// weixinLogin tracks the in-flight web QR login flow (one at a time).
 	weixinLogin weixinLoginFlow
 
@@ -1902,17 +1937,20 @@ func (s *Server) startOneChannelLocked(name string) {
 	ctor, err := channel.Find(name)
 	if err != nil {
 		slog.Error("channel start failed", "channel", name, "err", err)
+		s.recordChannelIssue(name, "adapter not registered: "+err.Error())
 		return
 	}
 	ad, err := ctor(pc)
 	if err != nil {
 		slog.Error("channel adapter failed", "channel", name, "err", err)
+		s.recordChannelIssue(name, "construction failed: "+err.Error())
 		return
 	}
 	if errs := ad.ValidateConfig(pc); len(errs) > 0 {
 		for _, e := range errs {
 			slog.Warn("channel config issue", "channel", name, "detail", e)
 		}
+		s.recordChannelIssue(name, "invalid config: "+strings.Join(errs, "; "))
 		return
 	}
 
@@ -1920,14 +1958,137 @@ func (s *Server) startOneChannelLocked(name string) {
 	if s.adapterCancels == nil {
 		s.adapterCancels = make(map[string]context.CancelFunc)
 	}
+	if s.channelGen == nil {
+		s.channelGen = make(map[string]uint64)
+	}
+	s.channelGen[name]++
+	gen := s.channelGen[name]
 	s.adapterCancels[name] = cancel
 	s.runningAdapters.Store(name, ad)
-	go func(a channel.Adapter, platform string) {
-		_ = a.Start(ctx, func(ev channel.InboundEvent) {
-			ev.Platform = platform
-			s.routeChannelEvent(ctx, a, ev)
+	s.clearChannelIssue(name)
+	s.channelWG.Add(1)
+	go s.runChannelWithRestart(ctx, name, gen, pc, ctor, ad)
+}
+
+// channelRestartDelays bounds how aggressively a crashed adapter retries: a
+// short delay for the first attempt (a transient network blip recovers
+// fast), backing off so a persistently broken platform (revoked auth, a dead
+// endpoint) doesn't hot-loop.
+var channelRestartDelays = []time.Duration{
+	2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute,
+}
+
+// maxChannelRestarts caps how many times a crashing adapter is restarted
+// before giving up — still crashing after this many attempts means something
+// structurally broken (revoked credentials, a permanently unreachable
+// endpoint), not a transient blip, and endless retries would just spam logs
+// forever with nothing for the user to act on differently.
+const maxChannelRestarts = 10
+
+// runChannelWithRestart runs ad to completion, then — unless ctx was
+// cancelled deliberately (Stop()/reloadChannel) — logs the crash, records it
+// where the Channels web view and the channel-manager skill's doctor flow
+// can see it (recordChannelIssue), and retries with backoff instead of
+// leaving the platform silently dead (#1121: previously `_ = a.Start(...)`
+// discarded the error entirely and nothing ever ran again). Each retry
+// rebuilds a fresh adapter instance via ctor rather than reusing the crashed
+// one — Start isn't guaranteed reentrant (each adapter owns its own
+// connections, goroutines, and internal queues), so a clean instance is the
+// only safe way to retry, matching what a full server restart would do
+// anyway. Config is not re-validated on retries: ValidateConfig failures are
+// a permanent skip (startOneChannelLocked never reaches this function for
+// those), not something a backoff loop should keep re-attempting.
+//
+// gen is the generation snapshot startOneChannelLocked captured when it
+// launched this goroutine (see channelGen's doc comment) — every write back
+// to runningAdapters/adapterCancels re-checks it first, since a concurrent
+// stop/reload/restart of this same platform can slip in during the ctor(pc)
+// call below, which does not observe ctx cancellation.
+func (s *Server) runChannelWithRestart(ctx context.Context, name string, gen uint64, pc channel.PlatformConfig, ctor func(channel.PlatformConfig) (channel.Adapter, error), ad channel.Adapter) {
+	defer s.channelWG.Done()
+	restarts := 0
+	for {
+		err := ad.Start(ctx, func(ev channel.InboundEvent) {
+			ev.Platform = name
+			s.routeChannelEvent(ctx, ad, ev)
 		})
-	}(ad, name)
+		if ctx.Err() != nil {
+			return // deliberate stop, not a crash
+		}
+
+		restarts++
+		slog.Error("channel adapter exited unexpectedly", "channel", name, "err", err, "restart_attempt", restarts)
+		if restarts > maxChannelRestarts {
+			slog.Error("channel adapter exceeded restart limit — giving up", "channel", name, "restarts", restarts)
+			s.recordChannelIssue(name, fmt.Sprintf("gave up after %d crashes: %v", restarts, err))
+			s.channelMu.Lock()
+			if s.channelGen[name] == gen {
+				s.runningAdapters.Delete(name)
+				delete(s.adapterCancels, name)
+			}
+			s.channelMu.Unlock()
+			return
+		}
+		s.recordChannelIssue(name, fmt.Sprintf("restarting (%d/%d) after crash: %v", restarts, maxChannelRestarts, err))
+
+		delay := channelRestartDelays[len(channelRestartDelays)-1]
+		if restarts-1 < len(channelRestartDelays) {
+			delay = channelRestartDelays[restarts-1]
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		newAd, cerr := ctor(pc)
+		if cerr != nil {
+			slog.Error("channel restart: rebuild failed", "channel", name, "err", cerr, "restart_attempt", restarts)
+			s.recordChannelIssue(name, fmt.Sprintf("restart %d/%d rebuild failed: %v", restarts, maxChannelRestarts, cerr))
+			continue // try again next loop, same restart budget and backoff schedule
+		}
+		ad = newAd
+		s.channelMu.Lock()
+		if s.channelGen[name] != gen {
+			// Superseded while ctor(pc) was in flight — a concurrent
+			// stop/reload/restart now owns this platform name. ad was never
+			// Start()-ed, so there's nothing to Stop(); just discard it and
+			// let this goroutine end without touching the new owner's state.
+			s.channelMu.Unlock()
+			slog.Warn("channel restart: superseded during rebuild, discarding stale instance", "channel", name)
+			return
+		}
+		s.runningAdapters.Store(name, ad)
+		s.channelMu.Unlock()
+		s.clearChannelIssue(name)
+	}
+}
+
+// recordChannelIssue notes why a platform's adapter isn't healthy (a startup
+// skip reason, or a crash/restart status), queryable via GET /api/channels
+// and the channel-manager skill's doctor flow.
+func (s *Server) recordChannelIssue(name, reason string) {
+	s.channelIssuesMu.Lock()
+	if s.channelIssues == nil {
+		s.channelIssues = make(map[string]string)
+	}
+	s.channelIssues[name] = reason
+	s.channelIssuesMu.Unlock()
+}
+
+// clearChannelIssue marks a platform healthy again (a (re)start succeeded).
+func (s *Server) clearChannelIssue(name string) {
+	s.channelIssuesMu.Lock()
+	delete(s.channelIssues, name)
+	s.channelIssuesMu.Unlock()
+}
+
+// channelIssue returns the recorded reason a platform isn't healthy, or ""
+// when it's never had one recorded (running fine, or never started).
+func (s *Server) channelIssue(name string) string {
+	s.channelIssuesMu.Lock()
+	defer s.channelIssuesMu.Unlock()
+	return s.channelIssues[name]
 }
 
 // stopOneChannelLocked stops a single running adapter (cancel its context and
@@ -1941,6 +2102,10 @@ func (s *Server) stopOneChannelLocked(name string) {
 		_ = v.(channel.Adapter).Stop()
 		s.runningAdapters.Delete(name)
 	}
+	// A deliberate stop (disable/delete/reload) isn't a health problem — clear
+	// any crash/restart status left over from before it, so re-enabling later
+	// starts from a clean slate instead of showing a stale crash reason.
+	s.clearChannelIssue(name)
 }
 
 // reloadChannel applies a saved config change for one platform without a full
