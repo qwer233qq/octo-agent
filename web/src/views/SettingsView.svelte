@@ -15,25 +15,28 @@
   let language      = $state('en')
   let fontSize      = $state('Medium')
   let theme         = $state('Light')
-  let model         = $state('')
-  let modelOptions  = $state<string[]>([])
   let reasoning     = $state('Medium')
   let permMode      = $state('Ask')
   let workdir       = $state('')
   let showReasoning = $state(true)
   let coauthor      = $state(true)
-  let desktopNotif  = $state(true)
-  let failureNotif  = $state(true)
   let versionStr    = $state('')
   let saving        = $state(false)
   let loading       = $state(true)
   let providersLoaded = $state(false)
 
   // Original values for dirty-checking
-  let origModel        = ''
   let origWorkdir      = ''
+  let origReasoning    = 'Medium'
   let origShowReasoning = true
   let origCoauthor = true
+  let origPermMode     = 'Ask'
+  // Index into `models` for the current default entry — Reasoning Effort and
+  // Permission Mode below are that entry's own settings, saved via
+  // api.updateModel (PATCH /api/config/models/{id}), same as everything in
+  // the Models section below. No session is involved: "Agent Defaults" edits
+  // global config, not whichever chat session happens to be open.
+  let defaultModelIdx = 0
 
   // ── Models section (config-level entries: add/edit/delete/default/lite) ──────
   let models       = $state<ModelEntry[]>([])
@@ -141,18 +144,17 @@
       // models list
       const ms: any[] = cfg.models ?? []
       models = ms as ModelEntry[]
-      modelOptions = ms.map((m: any) => m.model ?? m.id)
-      const defaultIdx = cfg.default_model_idx ?? 0
-      const def = ms[defaultIdx]
+      defaultModelIdx = cfg.default_model_idx ?? 0
+      const def = ms[defaultModelIdx]
       if (def) {
-        model = def.model ?? def.id ?? ''
         reasoning = capitalize(def.reasoning_effort ?? 'medium')
-        permMode  = capitalize(def.permission_mode ?? 'ask')
+        permMode  = permissionModeToLabel(def.permission_mode ?? 'interactive')
       }
       showReasoning = cfg.show_reasoning ?? true
       coauthor = cfg.coauthor ?? true
-      origModel = model
+      origReasoning = reasoning
       origShowReasoning = showReasoning
+      origPermMode = permMode
       origCoauthor = coauthor
       // Font size is a client-only preference (persisted in localStorage); the
       // server only hardcodes a placeholder, so don't let it clobber the saved
@@ -177,6 +179,24 @@
     return s[0].toUpperCase() + s.slice(1).toLowerCase()
   }
 
+  function permissionModeToLabel(mode: string): string {
+    const map: Record<string, string> = {
+      interactive: 'Ask',
+      auto: 'Auto',
+      strict: 'Strict',
+    }
+    return map[mode.toLowerCase()] ?? 'Ask'
+  }
+
+  function labelToPermissionMode(label: string): string {
+    const map: Record<string, string> = {
+      Ask: 'interactive',
+      Auto: 'auto',
+      Strict: 'strict',
+    }
+    return map[label] ?? 'interactive'
+  }
+
   $effect(() => {
     // Apply font size via zoom and remember it across reloads.
     ;(document.documentElement.style as any).zoom = fontZoomMap[fontSize] ?? '1'
@@ -194,24 +214,47 @@
     setLocale(language === 'zh' || language === 'zh-TW' ? 'zh' : 'en')
   })
 
+  const effortMap: Record<string, string> = { Low: 'low', Medium: 'medium', High: 'high', Xhigh: 'xhigh', Max: 'max' }
+
+  // Working directory is the only field left on this page that's genuinely
+  // per-session (there's no such thing as a "default" working directory) —
+  // everything else here is global config. Drives the "start a session"
+  // hint, shown only when it's actually relevant.
+  let needsSession = $derived(!$activeSessionId && workdir !== origWorkdir)
+
   async function handleSave() {
     saving = true
     const sid = $activeSessionId
     try {
-      if (sid) {
-        const promises: Promise<unknown>[] = []
-        if (model !== origModel) {
-          promises.push(api.updateSessionModel(sid, model))
+      // Agent Defaults (Reasoning Effort + Permission Mode) — the default
+      // model entry's own settings, saved the same way the Models section
+      // below saves any entry: api.updateModel(id, ...the full entry...).
+      // No session is involved; this is config, not session state. update-
+      // Model isn't a partial PATCH, so the rest of the entry's fields (base
+      // URL, key, provider, vision) are resent unchanged alongside the two
+      // that actually changed — dropping them would blank those fields out.
+      if (reasoning !== origReasoning || permMode !== origPermMode) {
+        const def = models[defaultModelIdx]
+        if (def) {
+          await api.updateModel(def.id, {
+            model: def.model,
+            base_url: def.base_url ?? '',
+            api_key: def.api_key_masked ?? '',
+            provider: def.provider,
+            anthropic_format: def.anthropic_format,
+            vision: def.vision,
+            reasoning_effort: effortMap[reasoning] ?? 'medium',
+            permission_mode: labelToPermissionMode(permMode),
+          })
+          origReasoning = reasoning
+          origPermMode = permMode
         }
-        if (workdir !== origWorkdir) {
-          promises.push(api.updateSessionWorkingDir(sid, workdir))
-        }
-        const effortMap: Record<string, string> = { Low: 'low', Medium: 'medium', High: 'high', Xhigh: 'xhigh', Max: 'max' }
-        promises.push(api.updateSessionReasoningEffort(sid, effortMap[reasoning] ?? 'medium'))
-        await Promise.all(promises)
-        origModel   = model
-        origWorkdir = workdir
       }
+
+      // Show Reasoning is a separate global fallback (PUT
+      // /api/config/show_reasoning) that entries without their own override
+      // inherit from — see settings.show_reasoning_desc — so it's saved on
+      // its own, not folded into the entry update above.
       if (showReasoning !== origShowReasoning) {
         await api.updateShowReasoning(showReasoning)
         origShowReasoning = showReasoning
@@ -220,6 +263,18 @@
         await api.updateCoauthor(coauthor)
         origCoauthor = coauthor
       }
+
+      // Working directory: the one field that actually needs an active
+      // session, since it's inherently per-session state.
+      if (workdir !== origWorkdir) {
+        if (!sid) {
+          showToast(tr('settings.no_session_tooltip'), 'warning')
+          return
+        }
+        await api.updateSessionWorkingDir(sid, workdir)
+        origWorkdir = workdir
+      }
+
       showToast(tr('settings.toast_saved'), 'success')
     } catch (e: any) {
       showToast(`Save failed: ${e.message}`, 'error')
@@ -313,19 +368,9 @@
       <!-- Agent defaults -->
       <div class="section-card">
         <div class="section-title">{$t('settings.agent')}</div>
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">{$t('settings.default_model')}</span>
-            <span class="setting-desc">{$t('settings.default_model_desc')}</span>
-          </div>
-          {#if modelOptions.length > 0}
-            <select class="sel" bind:value={model}>
-              {#each modelOptions as o}<option value={o}>{o}</option>{/each}
-            </select>
-          {:else}
-            <input class="input" bind:value={model} placeholder="e.g. claude-sonnet-4-5" />
-          {/if}
-        </div>
+        <!-- Default Model itself is set from the Models list below (the
+             "Set as default" action on a model card) — no separate control
+             needed here. -->
         <div class="setting-row">
           <div class="setting-info">
             <span class="setting-label">{$t('settings.reasoning')}</span>
@@ -338,7 +383,7 @@
             <span class="setting-label">{$t('settings.perm_mode')}</span>
             <span class="setting-desc">{$t('settings.perm_mode_desc')}</span>
           </div>
-          <Segment options={['Ask', 'Auto']} labels={{ Ask: $t('settings.pm_ask'), Auto: $t('settings.pm_auto') }} bind:value={permMode} />
+          <Segment options={['Ask', 'Auto', 'Strict']} labels={{ Ask: $t('settings.pm_ask'), Auto: $t('settings.pm_auto'), Strict: $t('settings.pm_strict') ?? 'Strict' }} bind:value={permMode} />
         </div>
         <div class="setting-row">
           <div class="setting-info">
@@ -363,30 +408,19 @@
         </div>
       </div>
 
-      <!-- Notifications -->
-      <div class="section-card">
-        <div class="section-title">{$t('settings.notifications')}</div>
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">{$t('settings.desktop_notif')}</span>
-            <span class="setting-desc">{$t('settings.desktop_notif_desc')}</span>
-          </div>
-          <Switch bind:checked={desktopNotif} />
-        </div>
-        <div class="setting-row last">
-          <div class="setting-info">
-            <span class="setting-label">{$t('settings.failure_notif')}</span>
-            <span class="setting-desc">{$t('settings.failure_notif_desc')}</span>
-          </div>
-          <Switch bind:checked={failureNotif} />
-        </div>
-      </div>
-
       <!-- Save -->
       <div class="save-row">
-        <button class="btn-primary" onclick={handleSave} disabled={saving}>
+        <button
+          class="btn-primary"
+          onclick={handleSave}
+          disabled={saving}
+          title={needsSession ? tr('settings.no_session_tooltip') : ''}
+        >
           {saving ? $t('settings.saving') : $t('settings.save_changes')}
         </button>
+        {#if needsSession}
+          <span class="session-hint">{tr('settings.no_session_tooltip')}</span>
+        {/if}
         {#if versionStr}
           <span class="version-badge">{$t('common.version')} {versionStr}</span>
         {/if}
@@ -454,6 +488,7 @@ p { margin: 0; font-size: 14px; color: var(--text-secondary); }
 .btn-primary:hover:not(:disabled) { background: var(--blue-5); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 .version-badge { font-size: 12px; color: var(--text-tertiary); }
+.session-hint { font-size: 12px; color: var(--text-tertiary); }
 
 /* ── Models section ─────────────────────────────────────────────────────────── */
 .section-head {
