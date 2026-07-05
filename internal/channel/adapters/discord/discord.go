@@ -57,6 +57,14 @@ const (
 	// smaller than its UTF-16 code-unit count, so this can only split a
 	// little earlier than the real limit requires, never later.
 	maxMessageBytes = 2000
+
+	// #1118: a 429 used to fail the REST call outright — with SendText's
+	// per-chunk loop, that meant "chunk 1 arrives, chunk 3 silently missing"
+	// partial delivery on any burst. Discord reports how long to back off in
+	// the response body's retry_after (seconds, fractional), so honor it with
+	// a small bounded retry instead of dropping the chunk.
+	maxRateLimitRetries = 3
+	maxRateLimitWait    = 30 * time.Second
 )
 
 // fatalCloseCodes are gateway close codes that mean reconnecting cannot help
@@ -142,7 +150,7 @@ func (a *Adapter) Platform() string { return platformName }
 func (a *Adapter) Start(ctx context.Context, onMessage func(channel.InboundEvent)) error {
 	ctx, a.cancel = context.WithCancel(ctx)
 
-	me, err := a.usersMe()
+	me, err := a.usersMe(ctx)
 	if err != nil {
 		return fmt.Errorf("discord: /users/@me: %w", err)
 	}
@@ -206,7 +214,7 @@ func (a *Adapter) SendText(chatID, text, replyTo string) channel.SendResult {
 		var msg struct {
 			ID string `json:"id"`
 		}
-		if err := a.rest(http.MethodPost, fmt.Sprintf("/channels/%s/messages", chatID), payload, &msg); err != nil {
+		if err := a.rest(context.Background(), http.MethodPost, fmt.Sprintf("/channels/%s/messages", chatID), payload, &msg); err != nil {
 			return channel.SendResult{OK: false, Error: err.Error()}
 		}
 		lastID = msg.ID
@@ -298,7 +306,7 @@ func (a *Adapter) SendFile(chatID, path, name, replyTo string) channel.SendResul
 
 // UpdateMessage edits an existing message.
 func (a *Adapter) UpdateMessage(chatID, messageID, text string) bool {
-	err := a.rest(http.MethodPatch, fmt.Sprintf("/channels/%s/messages/%s", chatID, messageID),
+	err := a.rest(context.Background(), http.MethodPatch, fmt.Sprintf("/channels/%s/messages/%s", chatID, messageID),
 		map[string]any{"content": text}, nil)
 	if err != nil {
 		log.Printf("[discord] update_message failed: %v", err)
@@ -312,7 +320,7 @@ func (a *Adapter) SupportsMessageUpdates() bool { return true }
 
 // SendTyping triggers the "is typing…" indicator (expires after ~10s).
 func (a *Adapter) SendTyping(chatID, contextToken string) error {
-	return a.rest(http.MethodPost, fmt.Sprintf("/channels/%s/typing", chatID), nil, nil)
+	return a.rest(context.Background(), http.MethodPost, fmt.Sprintf("/channels/%s/typing", chatID), nil, nil)
 }
 
 // StopTyping — Discord's typing indicator expires automatically; nothing to cancel.
@@ -336,46 +344,85 @@ func userAgent() string {
 	return "DiscordBot (https://github.com/open-octo/octo-agent, " + version.String() + ")"
 }
 
-func (a *Adapter) rest(method, path string, payload, out any) error {
-	var body io.Reader
-	if payload != nil {
-		b, _ := json.Marshal(payload)
-		body = bytes.NewReader(b)
+// waitForRetry sleeps for d (capped and floored by the caller), honoring ctx
+// cancellation. Returns false if ctx was cancelled first. Mirrors the
+// telegram adapter's helper of the same name — kept as a per-package copy
+// since the two callers differ (Discord's retry_after is a fractional-second
+// float already converted to a Duration by the caller; Telegram's is a bare
+// integer of seconds), not shared plumbing worth a common package for two
+// call sites.
+func waitForRetry(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	req, err := http.NewRequest(method, a.apiBase+path, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bot "+a.token)
-	req.Header.Set("User-Agent", userAgent())
+}
+
+func (a *Adapter) rest(ctx context.Context, method, path string, payload, out any) error {
+	var bodyBytes []byte
 	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
+		bodyBytes, _ = json.Marshal(payload)
 	}
 
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	for attempt := 0; ; attempt++ {
+		var body io.Reader
+		if bodyBytes != nil {
+			body = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, a.apiBase+path, body)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bot "+a.token)
+		req.Header.Set("User-Agent", userAgent())
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var e struct {
-			Message string `json:"message"`
+		resp, err := a.http.Do(req)
+		if err != nil {
+			return err
 		}
-		_ = json.Unmarshal(data, &e)
-		if e.Message == "" {
-			e.Message = strings.TrimSpace(string(data))
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("discord API %d: %s", resp.StatusCode, e.Message)
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRateLimitRetries {
+			var e struct {
+				RetryAfter float64 `json:"retry_after"`
+			}
+			_ = json.Unmarshal(data, &e)
+			wait := time.Duration(e.RetryAfter * float64(time.Second))
+			if wait <= 0 {
+				wait = time.Second
+			}
+			if wait > maxRateLimitWait {
+				wait = maxRateLimitWait
+			}
+			if !waitForRetry(ctx, wait) {
+				return ctx.Err()
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			var e struct {
+				Message string `json:"message"`
+			}
+			_ = json.Unmarshal(data, &e)
+			if e.Message == "" {
+				e.Message = strings.TrimSpace(string(data))
+			}
+			return fmt.Errorf("discord API %d: %s", resp.StatusCode, e.Message)
+		}
+		if out != nil && len(data) > 0 {
+			return json.Unmarshal(data, out)
+		}
+		return nil
 	}
-	if out != nil && len(data) > 0 {
-		return json.Unmarshal(data, out)
-	}
-	return nil
 }
 
 type dcUser struct {
@@ -384,9 +431,9 @@ type dcUser struct {
 	Bot      bool   `json:"bot"`
 }
 
-func (a *Adapter) usersMe() (*dcUser, error) {
+func (a *Adapter) usersMe(ctx context.Context) (*dcUser, error) {
 	var me dcUser
-	if err := a.rest(http.MethodGet, "/users/@me", nil, &me); err != nil {
+	if err := a.rest(ctx, http.MethodGet, "/users/@me", nil, &me); err != nil {
 		return nil, err
 	}
 	if me.ID == "" {
