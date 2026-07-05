@@ -308,7 +308,11 @@ func (a *Adapter) SendFile(chatID, path, name, replyTo string) channel.SendResul
 	connected := a.conn != nil
 	a.connMu.Unlock()
 	if !connected {
-		return channel.SendResult{OK: false, Error: "wecom: SendFile requires an active WebSocket connection"}
+		msg := "wecom: SendFile requires an active WebSocket connection (webhook-only config supports text but not file uploads)"
+		if a.webhookURL != "" {
+			msg += "; ask the user to message the bot so a WebSocket session is created"
+		}
+		return channel.SendResult{OK: false, Error: msg}
 	}
 
 	data, err := os.ReadFile(path)

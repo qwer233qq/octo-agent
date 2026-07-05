@@ -414,7 +414,7 @@ func (a *Adapter) SendText(chatID, text, replyTo string) channel.SendResult {
 		token = loadContextTokens(contextStorePath(a.credPath))[chatID]
 	}
 	if token == "" {
-		return channel.SendResult{OK: false, Error: "no context_token for user " + chatID}
+		return channel.SendResult{OK: false, Error: "no context_token for " + chatID + " — have the user message the bot to set up a WebSocket session"}
 	}
 
 	plain := markdownToPlain(text)

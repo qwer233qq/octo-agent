@@ -42,7 +42,7 @@ const (
 	gatewayHost     = "wss://wss.dingtalk.com"
 	msgTopic        = "/v1.0/im/bot/messages/get"
 	reconnectDelay  = 5 * time.Second
-	webhookSafetyMs = 5 * 60 * 1000 // 5 min in ms
+	webhookSafetyMs = 1000 // 1 s safety margin — let DingTalk's server handle expiry instead of discarding webhooks early
 
 	// maxMessageBytes: DingTalk's custom-robot markdown message content is
 	// commonly documented at ~20000 bytes; SendText previously posted content
