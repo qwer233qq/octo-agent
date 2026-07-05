@@ -90,6 +90,7 @@
   }
 
   async function handleDelete(t: api.TaskResponse) {
+    if (!confirm(tr('tasks.confirm_delete').replace('{name}', t.name))) return
     try {
       await api.deleteTask(t.id)
       rawTasks = rawTasks.filter(r => r.id !== t.id)
