@@ -82,6 +82,15 @@ const (
 	cfgWebhookKey = "webhook_key"
 	// cfgWSURL is a test seam, not user-facing config.
 	cfgWSURL = "ws_url"
+	// cfgBotNickname is the bot's display name as it appears in a group
+	// chat's roster — #1122: WeCom's aibot_msg_callback carries no
+	// structured "was the bot mentioned" field for group messages (unlike
+	// Telegram/Discord/Feishu entity metadata or DingTalk's atUsers); per
+	// WeCom's own docs example ("@RobotA hello robot"), the only signal is
+	// the literal "@<nickname>" text in the message. Without this configured
+	// there is nothing to match against, so group gating stays off (matches
+	// pre-#1122 behavior) rather than silently blocking every group message.
+	cfgBotNickname = "bot_nickname"
 )
 
 // defaultWebhookBase is the group-robot webhook endpoint webhook_key expands to.
@@ -94,6 +103,10 @@ type Adapter struct {
 	wsURL        string
 	webhookURL   string
 	allowedUsers map[string]bool
+	// botNickname is the bot's group-chat display name, used to detect a
+	// literal "@<nickname>" mention in group message text (see cfgBotNickname
+	// for why). Empty means group gating stays off.
+	botNickname string
 
 	conn   *websocket.Conn
 	connMu sync.Mutex // guards conn pointer and writes
@@ -139,12 +152,15 @@ func New(cfg channel.PlatformConfig) (channel.Adapter, error) {
 		}
 	}
 
+	botNickname, _ := cfg[cfgBotNickname].(string)
+
 	return &Adapter{
 		botID:        botID,
 		secret:       secret,
 		wsURL:        wsURL,
 		webhookURL:   webhookURL,
 		allowedUsers: allowed,
+		botNickname:  botNickname,
 		pendingAcks:  make(map[string]chan *wsFrame),
 		http:         &http.Client{Timeout: 30 * time.Second},
 	}, nil
@@ -827,6 +843,28 @@ func (a *Adapter) handleInbound(body json.RawMessage, onMessage func(channel.Inb
 
 	if len(a.allowedUsers) > 0 && !a.allowedUsers[msg.From.UserID] {
 		return
+	}
+
+	// #1122: group chats had no @-mention gate at all — every message from an
+	// allowlisted user was processed regardless of chat type. WeCom's
+	// aibot_msg_callback carries no structured "was the bot mentioned" field
+	// (see cfgBotNickname), so this only engages when bot_nickname is
+	// configured; without it, behavior is unchanged from before this fix.
+	if msg.ChatType == "group" && a.botNickname != "" {
+		mention := "@" + a.botNickname
+		// Case-insensitive, matching Telegram's own text-based mention
+		// comparison (strings.EqualFold on @username) — a user typing
+		// "@Octo" instead of "@octo" shouldn't silently fail to reach the bot.
+		idx := strings.Index(strings.ToLower(msg.Text.Content), strings.ToLower(mention))
+		if idx < 0 {
+			return
+		}
+		// Strip the literal mention from the text that reaches the agent,
+		// same as Telegram/Feishu/DingTalk already do for their own mention
+		// syntax — it's UI-level addressing, not part of the query. Slicing
+		// by byte offset (not strings.Replace) preserves the original
+		// casing of whatever text remains.
+		msg.Text.Content = strings.TrimSpace(msg.Text.Content[:idx] + msg.Text.Content[idx+len(mention):])
 	}
 
 	switch msg.MsgType {
