@@ -90,6 +90,7 @@
   // The six platforms are fixed — "unconfigure" clears the saved credentials
   // and returns the card to the "Not configured" state rather than removing it.
   async function handleUnconfigure(platform: string) {
+    if (!confirm(tr('channels.confirm_unconfigure').replace('{platform}', labelFor(platform)))) return
     busyPlatform = platform
     try {
       await api.deleteChannel(platform)

@@ -104,6 +104,7 @@
   // ─── delete server ──────────────────────────────────────────────────────────
 
   async function deleteServer(name: string) {
+    if (!confirm(tr('mcp.confirm_delete').replace('{name}', name))) return
     try {
       await api.deleteMcpServer(name)
       mcpServers.update(list => (list as any[]).filter((s: any) => s.name !== name))

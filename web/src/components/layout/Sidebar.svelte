@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { view, sidebar, sessions, activeSession, activeSessionId, selMode, sel, menuFor, editId, editDraft, showToast, mcpServers } from '../../lib/stores'
   import * as api from '../../lib/api'
-  import { t } from '../../lib/i18n'
+  import { t, tr } from '../../lib/i18n'
   import VersionBadge from './VersionBadge.svelte'
 
   // Seed the shared MCP-server store before the user ever opens the MCP panel;
@@ -50,6 +50,7 @@
   }
 
   async function delSelected() {
+    if (!confirm(tr('sidebar.confirm_delete_selected').replace('{n}', String(Object.keys($sel).length)))) return
     const ids = Object.keys($sel)
     try {
       await api.deleteSessions(ids)
@@ -63,6 +64,7 @@
   }
 
   async function delSession(id: string) {
+    if (!confirm(tr('sidebar.confirm_delete'))) return
     try {
       await api.deleteSession(id)
       sessions.update(ss => ss.filter(s => s.id !== id))

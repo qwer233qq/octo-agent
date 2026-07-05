@@ -130,6 +130,7 @@ export const en: Record<string, string> = {
   "tools.n_more_lines": "{n} more lines",
   // MCP view (McpView.svelte)
   "mcp.toast_removed": "Server removed",
+  "mcp.confirm_delete": "Delete MCP server \"{name}\"?",
   "mcp.toast_reconnecting": "Reconnecting {name}…",
   "mcp.badge_project": "project",
   "mcp.tool_count": "{n} tool(s)",
@@ -140,6 +141,7 @@ export const en: Record<string, string> = {
   // Tasks view
   "tasks.toast_started": "Task started",
   "tasks.toast_deleted": "Task deleted",
+  "tasks.confirm_delete": "Delete scheduled task \"{name}\"?",
   // Channels view
   "channels.not_configured": "Not configured",
   "status.stopped": "Stopped",
@@ -158,6 +160,8 @@ export const en: Record<string, string> = {
   "files.count_orphan": "{n} orphan",
   // Sidebar
   "sidebar.n_selected": "{n} selected",
+  "sidebar.confirm_delete": "Delete this session? This cannot be undone.",
+  "sidebar.confirm_delete_selected": "Delete {n} selected sessions? This cannot be undone.",
   // Sub-agents card
   "agent.n_running": "{n} running",
   "agent.n_tools": "{n} tools",
@@ -275,6 +279,7 @@ export const en: Record<string, string> = {
   "channels.setup": "Set Up with Agent",
   "channels.reconfigure": "Reconfigure",
   "channels.unconfigure": "Unconfigure",
+  "channels.confirm_unconfigure": "Unconfigure {platform}? This will clear saved credentials.",
   "settings.title": "Settings",
   "settings.general": "General",
   "settings.agent": "Agent Defaults",
@@ -616,6 +621,7 @@ export const zh: Record<string, string> = {
   "tools.n_more_lines": "剩余 {n} 行",
   // MCP 视图 (McpView.svelte)
   "mcp.toast_removed": "服务器已移除",
+  "mcp.confirm_delete": "确认删除 MCP 服务器 \"{name}\"？",
   "mcp.toast_reconnecting": "正在重新连接 {name}…",
   "mcp.badge_project": "项目",
   "mcp.tool_count": "{n} 个工具",
@@ -644,6 +650,8 @@ export const zh: Record<string, string> = {
   "files.count_orphan": "{n} 个孤立文件",
   // 侧边栏
   "sidebar.n_selected": "已选择 {n} 项",
+  "sidebar.confirm_delete": "确认删除此会话？此操作不可撤销。",
+  "sidebar.confirm_delete_selected": "确认删除已选择的 {n} 个会话？此操作不可撤销。",
   // 子 Agent 卡片
   "agent.n_running": "{n} 个运行中",
   "agent.n_tools": "{n} 个工具",
@@ -716,6 +724,7 @@ export const zh: Record<string, string> = {
   "tasks.resume": "恢复",
   "tasks.paused_toast": "任务已暂停",
   "tasks.resumed": "任务已恢复",
+  "tasks.confirm_delete": "确认删除定时任务 \"{name}\"？",
   "tasks.modal_edit": "编辑定时任务",
   "tasks.modal_new": "新建定时任务",
   "tasks.field_name": "名称",
@@ -761,6 +770,7 @@ export const zh: Record<string, string> = {
   "channels.setup": "通过助手配置",
   "channels.reconfigure": "重新配置",
   "channels.unconfigure": "取消配置",
+  "channels.confirm_unconfigure": "确认取消 {platform} 配置？这将清除已保存的凭证。",
   "settings.title": "设置",
   "settings.general": "常规",
   "settings.agent": "助手默认值",
