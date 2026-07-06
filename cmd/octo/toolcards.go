@@ -94,6 +94,27 @@ func renderToolCard(toolName string, input map[string]any, output string, isErr 
 		newS, _ := input["new_string"].(string)
 		return tui.RenderEditCard(path, oldS, newS, width)
 	}
+	if toolName == "read_file" && !isErr {
+		// A content preview here is usually the file's package/import
+		// boilerplate — near-zero information for the screen space it costs.
+		// A one-liner with the line count (and a click-to-open link to the
+		// full content, matching the #1093 fold-link pattern) is cheaper and
+		// no less useful (#1097).
+		n := readFileLineCount(output)
+		link := ""
+		// Only spill to disk when there's actually folded content behind the
+		// link — same threshold the generic card path uses to decide whether
+		// to fold at all. Spilling every read unconditionally, even a 1-line
+		// read, would widen every file the agent touches into a plaintext
+		// copy under ~/.octo/tmp for no reason: nothing is hidden when the
+		// whole thing already fits in the one-liner.
+		if n > outputCardMaxLines {
+			if path, err := tools.WriteCardSpill(toolName, output); err == nil {
+				link = tui.FileURI(path)
+			}
+		}
+		return tui.RenderReadFileStatus(cardTargetFor(toolName, input), n, formatElapsed(elapsed), link, width)
+	}
 	opts := tui.OutputCardOpts{
 		MaxLines: outputCardMaxLines,
 		Width:    width,
@@ -145,6 +166,22 @@ func nonBlankLineCount(s string) int {
 		if strings.TrimSpace(l) != "" {
 			n++
 		}
+	}
+	return n
+}
+
+// readFileLineCount counts the numbered content lines in a read_file result
+// ("%6d\t<line>", per internal/tools/read_file.go), excluding the bracketed
+// footer markers ("[end of file: …]", "[truncated: …]", "[empty file]") the
+// tool appends — those aren't file content and would otherwise inflate the
+// count by one.
+func readFileLineCount(output string) int {
+	n := 0
+	for _, l := range strings.Split(output, "\n") {
+		if l == "" || strings.HasPrefix(strings.TrimLeft(l, " "), "[") {
+			continue
+		}
+		n++
 	}
 	return n
 }
