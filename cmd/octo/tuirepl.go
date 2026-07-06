@@ -1581,6 +1581,81 @@ func pluraliseLineCount(n int) string {
 	return fmt.Sprintf("%d lines", n)
 }
 
+// renderToolOutcomeFull is renderToolOutcome's uncapped counterpart, used by
+// /transcript to re-print a past tool call in full. Non-card tools already
+// render their complete result (inline or hyperlinked, see renderToolOutcome)
+// so only card tools need the dedicated uncapped path.
+func (m *tuiModel) renderToolOutcomeFull(toolName string, input map[string]any, resultText string, isErr bool) string {
+	if m.rendersCard(toolName) {
+		if full := renderToolFull(toolName, input, resultText, isErr, m.width); full != "" {
+			return full
+		}
+	}
+	if isErr {
+		// renderToolOutcome truncates a non-card tool's error to one 100-rune
+		// line for the status row (errText) — fine live, but it would defeat
+		// /transcript's whole point of showing the full text uncapped.
+		status := tui.RenderToolStatus(toolName, summariseInput(input), true, "")
+		if trimmed := strings.TrimSpace(sanitizeForPrompt(resultText)); trimmed != "" {
+			for _, line := range strings.Split(trimmed, "\n") {
+				status += "\n" + hintStyle.Render("  "+line)
+			}
+		}
+		return status
+	}
+	return m.renderToolOutcome(toolName, input, resultText, isErr, 0)
+}
+
+// toolCallRecord is one completed tool_use/tool_result pair pulled from
+// history for /transcript's re-print.
+type toolCallRecord struct {
+	name   string
+	input  map[string]any
+	result string
+	isErr  bool
+}
+
+// recentToolCalls returns the last n completed tool calls from history in
+// chronological order, pairing each tool_use with its tool_result the same
+// way replayHistoryLines does. Calls still awaiting a result (mid-flight) are
+// skipped. Returns fewer than n if history doesn't have that many.
+func (m *tuiModel) recentToolCalls(n int) []toolCallRecord {
+	msgs := m.a.History.Snapshot()
+	results := map[string]agent.ContentBlock{}
+	for _, msg := range msgs {
+		for _, b := range msg.Blocks {
+			if b.Type == "tool_result" {
+				results[b.ToolUseID] = b
+			}
+		}
+	}
+	var all []toolCallRecord
+	for _, msg := range msgs {
+		if msg.Role != agent.RoleAssistant {
+			continue
+		}
+		for _, b := range msg.Blocks {
+			if b.Type != "tool_use" {
+				continue
+			}
+			res, ok := results[b.ID]
+			if !ok {
+				continue
+			}
+			all = append(all, toolCallRecord{
+				name:   b.Name,
+				input:  b.Input,
+				result: agent.StripRemindersForDisplay(res.Result),
+				isErr:  res.IsError,
+			})
+		}
+	}
+	if len(all) > n {
+		all = all[len(all)-n:]
+	}
+	return all
+}
+
 // replayMaxTurns caps how many of a resumed session's most recent turns are
 // replayed into scrollback; older turns collapse into a single omission line.
 // Without a cap a few-hundred-turn session floods the terminal on resume,
