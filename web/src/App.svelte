@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { view, sessions, activeSessionId, showToast, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode } from './lib/stores'
   import { ws, wsState } from './lib/ws'
-  import { locale, t, setLocale } from './lib/i18n'
+  import { locale, t, tr, setLocale } from './lib/i18n'
   import { checkAuth } from './lib/auth'
   import { get } from 'svelte/store'
   import * as api from './lib/api'
@@ -183,6 +183,24 @@
       }).catch(() => { /* non-critical: fast-path store update already ran */ })
     })
 
+    // session_activity is a lightweight global signal (unlike
+    // request_user_question/session_update/complete, which only reach tabs
+    // subscribed to that exact session) — it's how a tab looking at session B
+    // learns that session A got a question or finished replying. Drives both
+    // the sidebar's pending-question badge and the desktop notification.
+    ws.on('session_activity', (ev: any) => {
+      const sid = ev.session_id
+      if (!sid) return
+      if (ev.kind === 'question_pending' || ev.kind === 'question_resolved') {
+        sessions.update(list => list.map(s =>
+          s.id === sid ? { ...s, pending_question: ev.kind === 'question_pending' } : s
+        ))
+      }
+      if (ev.kind === 'question_pending' || ev.kind === 'turn_complete') {
+        notifyForSessionActivity(sid, ev.kind)
+      }
+    })
+
     // REST fallback (WS session_list may be delayed)
     api.listSessions().then((data: any) => {
       const list = data.sessions ?? []
@@ -205,6 +223,44 @@
     applyHash()
     routeReady = true
     window.addEventListener('hashchange', applyHash)
+  }
+
+  // Cooldown per (session, kind) — a session with a tight /loop interval
+  // completes turns every 60s+ with no new user input each time, which would
+  // otherwise fire a notification every single iteration. Keyed separately
+  // per kind so a burst of turn_complete pings can't suppress a genuinely
+  // distinct question_pending, or vice versa.
+  const NOTIFY_COOLDOWN_MS = 5 * 60 * 1000
+  const lastNotifiedAt: Record<string, number> = {}
+
+  // Desktop notification for a session_activity the user isn't already
+  // looking at in a focused tab — if they are, they'd see it happen live and
+  // a notification would just be noise. Requires the bell in Header having
+  // already been granted browser permission; otherwise a no-op.
+  function notifyForSessionActivity(sid: string, kind: 'question_pending' | 'turn_complete') {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return
+    const viewingThisSession = document.hasFocus() && get(view) === 'chat' && get(activeSessionId) === sid
+    if (viewingThisSession) return
+    const cooldownKey = `${sid}:${kind}`
+    const now = Date.now()
+    if (now - (lastNotifiedAt[cooldownKey] ?? 0) < NOTIFY_COOLDOWN_MS) return
+    lastNotifiedAt[cooldownKey] = now
+    const sess = get(sessions).find(s => s.id === sid)
+    const name = sess?.title || sess?.name || sid
+    const titleKey = kind === 'question_pending' ? 'header.notif_question_title' : 'header.notif_turn_complete_title'
+    const bodyKey = kind === 'question_pending' ? 'header.notif_question_body' : 'header.notif_turn_complete_body'
+    // String.replace() treats $&, $`, $', $$ specially in the REPLACEMENT
+    // argument even for a plain-string search — and name is a user-editable
+    // session title, so escape its literal $ first or a title like "A&B $$
+    // Corp" mangles the notification body.
+    const escapedName = name.replace(/\$/g, '$$$$')
+    const n = new Notification(tr(titleKey), { body: tr(bodyKey).replace('{name}', escapedName) })
+    n.onclick = () => {
+      window.focus()
+      activeSessionId.set(sid)
+      view.set('chat')
+      n.close()
+    }
   }
 
   // soul_setup: key present, soul.md missing → auto-launch one /onboard chat.
