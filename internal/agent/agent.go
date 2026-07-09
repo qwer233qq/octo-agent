@@ -1808,14 +1808,23 @@ func (a *Agent) resetContextTrigger() {
 }
 
 // ContextUsage reports how full the model's context window is: used is the
-// most recently sent context size in tokens (reported by the provider), and
-// window is the model's approximate context-window size. Lets the TUI status
-// bar render a "ctx N%" gauge. window is always > 0.
+// most recently sent context size in tokens (reported by the provider), or,
+// before any turn has run in this process (e.g. right after resuming a
+// session), a heuristic estimate over the restored history — see
+// historyTokens. window is the model's approximate context-window size. Lets
+// the TUI status bar and the web UI render a "ctx N%" gauge. window is always
+// > 0.
 func (a *Agent) ContextUsage() (used, window int) {
 	a.usageMu.Lock()
-	used = a.lastInputTokens
+	real := a.lastInputTokens
 	a.usageMu.Unlock()
-	return used, contextWindow(a.Model)
+	if real > 0 {
+		return real, contextWindow(a.Model)
+	}
+	// Only pay for the History snapshot + heuristic estimate when there's no
+	// real count yet (cold start) — this is called at TUI render-tick rate,
+	// where a real count is the common case.
+	return estimateMessages(a.History.Snapshot()), contextWindow(a.Model)
 }
 
 // SessionCacheTokens returns the cumulative cache read/write token counts.
