@@ -132,6 +132,52 @@ export async function updateSessionPermissionMode(id: string, mode: string): Pro
   })
 }
 
+export interface NativePickResult {
+  path: string
+  cancelled: boolean
+}
+
+// Desktop shell only: open the OS file dialog and return the chosen path. The
+// caller attaches it by real path (no upload); the agent reads it in place.
+export async function nativePickFile(startDir?: string): Promise<NativePickResult> {
+  return request<NativePickResult>('/api/native/pick-file', {
+    method: 'POST',
+    ...json({ start_dir: startDir ?? '' }),
+  })
+}
+
+// Desktop shell only: open the OS folder dialog and return the chosen path.
+// Available only when /api/version reports native:true (a NativeBridge is
+// wired); calling it under plain `octo serve` 404s. The caller then sets the
+// path via updateSessionWorkingDir, same as the in-app picker.
+export async function nativePickFolder(startDir?: string): Promise<NativePickResult> {
+  return request<NativePickResult>('/api/native/pick-folder', {
+    method: 'POST',
+    ...json({ start_dir: startDir ?? '' }),
+  })
+}
+
+// Desktop shell only: raise an OS-native notification. Used in place of the
+// browser Notification API, which native webviews don't implement. Best-effort.
+export async function nativeNotify(title: string, body: string): Promise<void> {
+  await request<{ ok: boolean }>('/api/native/notify', {
+    method: 'POST',
+    ...json({ title, body }),
+  })
+}
+
+// Desktop shell only: launch-at-login state.
+export async function getAutostart(): Promise<boolean> {
+  const r = await request<{ enabled: boolean }>('/api/native/autostart')
+  return r.enabled
+}
+export async function setAutostart(enabled: boolean): Promise<void> {
+  await request<{ enabled: boolean }>('/api/native/autostart', {
+    method: 'PUT',
+    ...json({ enabled }),
+  })
+}
+
 export interface FsEntry {
   name: string
   is_dir: boolean

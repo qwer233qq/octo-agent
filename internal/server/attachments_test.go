@@ -26,7 +26,7 @@ func TestParseUserFiles_ImageDataURL(t *testing.T) {
 	payload := []byte{0xFF, 0xD8, 0xFF, 1, 2, 3}
 	att := parseUserFiles([]wsUserFile{
 		{Name: "shot.png", MimeType: "image/jpeg", DataURL: jpegDataURL(payload)},
-	})
+	}, false)
 
 	if len(att.blocks) != 1 || len(att.images) != 1 || len(att.notes) != 0 {
 		t.Fatalf("blocks/images/notes = %d/%d/%d, want 1/1/0",
@@ -75,7 +75,7 @@ func TestParseUserFiles_DocPath(t *testing.T) {
 
 	att := parseUserFiles([]wsUserFile{
 		{Name: "report.pdf", MimeType: "application/pdf", Path: "/api/uploads/123_report.pdf"},
-	})
+	}, false)
 
 	// A document produces no block and no image ref — only a note. Its display
 	// chip is derived from that note (see docChipRefs / the replay test).
@@ -111,7 +111,7 @@ func TestParseUserFiles_SkipsBadEntries(t *testing.T) {
 		{Name: "bad.jpg", DataURL: "not-a-data-url"},
 		{Name: "evil.pdf", Path: "/api/uploads/does-not-exist.pdf"},
 		{Name: "text.txt", DataURL: "data:text/plain;base64,aGk="}, // non-image data URL
-	})
+	}, false)
 	if len(att.blocks) != 0 || len(att.images) != 0 || len(att.notes) != 0 {
 		t.Errorf("bad entries not skipped: %+v", att)
 	}
@@ -366,5 +366,26 @@ drain:
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestParseUserFilesLocalPath: a real local path is referenced in place only
+// for a loopback (same-machine) client; for a remote client it's ignored so it
+// can't make the agent read arbitrary server files.
+func TestParseUserFilesLocalPath(t *testing.T) {
+	tmp := t.TempDir()
+	f := filepath.Join(tmp, "notes.md")
+	if err := os.WriteFile(f, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	att := parseUserFiles([]wsUserFile{{Name: "notes.md", LocalPath: f}}, true)
+	if len(att.notes) != 1 || !strings.Contains(att.notes[0], f) {
+		t.Errorf("local path should be referenced in place for loopback, got notes=%+v", att.notes)
+	}
+
+	att2 := parseUserFiles([]wsUserFile{{Name: "notes.md", LocalPath: f}}, false)
+	if len(att2.notes) != 0 {
+		t.Errorf("local path must be ignored for a non-loopback client, got notes=%+v", att2.notes)
 	}
 }

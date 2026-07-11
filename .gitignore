@@ -6,6 +6,12 @@
 # Go build artefacts
 /octo
 /octo.exe
+/octo-desktop
+/octo-desktop.exe
+/Octo.app
+/Octo.AppDir/
+/Octo-x86_64.AppImage
+/appimagetool.AppImage
 /octo-eval
 /dist/
 *.test

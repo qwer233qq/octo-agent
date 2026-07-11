@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { view, sessions, activeSessionId, showToast, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode } from './lib/stores'
+  import { view, sessions, activeSessionId, showToast, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode, nativeShell } from './lib/stores'
   import { ws, wsState } from './lib/ws'
   import { notificationsEnabled } from './lib/notifications'
   import { locale, t, tr, setLocale } from './lib/i18n'
@@ -24,6 +24,7 @@
   import CommandPalette from './components/overlays/CommandPalette.svelte'
   import McpModal from './components/overlays/McpModal.svelte'
   import ConfirmModal from './components/overlays/ConfirmModal.svelte'
+  import ConfirmDialog from './components/overlays/ConfirmDialog.svelte'
   import QuestionModal from './components/overlays/QuestionModal.svelte'
   import FeedbackModal from './components/overlays/FeedbackModal.svelte'
   import Toast from './components/overlays/Toast.svelte'
@@ -240,7 +241,11 @@
   // Desktop Notifications preference on AND has granted browser permission.
   function notifyForSessionActivity(sid: string, kind: 'question_pending' | 'turn_complete') {
     if (!get(notificationsEnabled)) return
-    if (!('Notification' in window) || Notification.permission !== 'granted') return
+    const native = get(nativeShell)
+    // The browser Notification API doesn't work in the desktop webview; native
+    // mode routes to the OS via the bridge, so only gate on browser permission
+    // for the browser path.
+    if (!native && (!('Notification' in window) || Notification.permission !== 'granted')) return
     const viewingThisSession = document.hasFocus() && get(view) === 'chat' && get(activeSessionId) === sid
     if (viewingThisSession) return
     const cooldownKey = `${sid}:${kind}`
@@ -256,7 +261,15 @@
     // session title, so escape its literal $ first or a title like "A&B $$
     // Corp" mangles the notification body.
     const escapedName = name.replace(/\$/g, '$$$$')
-    const n = new Notification(tr(titleKey), { body: tr(bodyKey).replace('{name}', escapedName) })
+    const title = tr(titleKey)
+    const body = tr(bodyKey).replace('{name}', escapedName)
+    if (native) {
+      // No click-to-focus yet (would need a native notification callback); the
+      // tray/dock and single-instance focus cover raising the window.
+      api.nativeNotify(title, body).catch(() => {})
+      return
+    }
+    const n = new Notification(title, { body })
     n.onclick = () => {
       window.focus()
       activeSessionId.set(sid)
@@ -317,6 +330,7 @@
 <CommandPalette />
 <McpModal />
 <ConfirmModal />
+<ConfirmDialog />
 <QuestionModal />
 <FeedbackModal />
 <Toast />

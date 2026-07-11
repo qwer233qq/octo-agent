@@ -34,8 +34,14 @@ type wsUserFile struct {
 	DataURL string `json:"data_url,omitempty"`
 	// Path references a document already uploaded via POST /api/upload
 	// (an /api/uploads/<name> URL).
-	Path     string `json:"path,omitempty"`
-	MimeType string `json:"mime_type,omitempty"`
+	Path string `json:"path,omitempty"`
+	// LocalPath is a real absolute path on this machine — from the desktop
+	// native file dialog or the localhost web in-app file picker. No upload:
+	// the agent reads it in place. Honored only when the peer is loopback (the
+	// browser and agent share a filesystem); a remote client can't set it, so
+	// it can't make the agent read arbitrary server files.
+	LocalPath string `json:"local_path,omitempty"`
+	MimeType  string `json:"mime_type,omitempty"`
 }
 
 type wsMsgInterrupt struct {

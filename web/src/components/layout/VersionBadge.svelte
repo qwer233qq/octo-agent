@@ -14,6 +14,7 @@
   import * as api from '../../lib/api'
   import { ws } from '../../lib/ws'
   import { t } from '../../lib/i18n'
+  import { nativeShell, localAccess } from '../../lib/stores'
 
   type Phase = 'idle' | 'upgrading' | 'needs_restart' | 'reconnecting' | 'restart_failed' | 'done'
 
@@ -40,6 +41,8 @@
       latest = d.latest ?? ''
       needsUpdate = !!d.needs_update
       if (d.cli_command) cliCommand = d.cli_command
+      nativeShell.set(d.native === true)
+      localAccess.set(d.local === true)
     } catch { /* badge stays minimal */ }
   }
 

@@ -4,7 +4,7 @@
   import {
     running, activeSessionId, chatStreaming, sessions,
     chatContextUsage, chatWorkingDir, chatPermMode, chatReasoningEffort, chatShowReasoning, showToast, chatGoal, chatModel,
-    globalPermissionMode,
+    globalPermissionMode, nativeShell, localAccess,
   } from '../../lib/stores'
   import { ws } from '../../lib/ws'
   import * as api from '../../lib/api'
@@ -23,7 +23,10 @@
   // filesystem. Exactly one of data_url / path is set once ready. `uploading`
   // marks a placeholder whose upload is still in flight; `id` keys that
   // placeholder so its async result lands on the right entry (see addAttachment).
-  type Attachment = { id?: string; name: string; mime_type?: string; data_url?: string; path?: string; uploading?: boolean }
+  // local_path is a real local path (native dialog on desktop, or the in-app
+  // file picker on localhost web) — the agent reads it in place, no upload
+  // (mirrors the folder picker). Set instead of data_url/path when same-machine.
+  type Attachment = { id?: string; name: string; mime_type?: string; data_url?: string; path?: string; local_path?: string; uploading?: boolean }
 
   // Reject oversized attachments client-side with a clear message rather than
   // letting the upload fail late (or bloating a WS message with a huge inline
@@ -66,8 +69,33 @@
     autoResize()
   })
 
-  function openAttach() {
+  async function openAttach() {
+    // Same machine as the agent: attach a file by real path (no upload).
+    //  - desktop shell → native OS file dialog
+    //  - localhost web → in-app file picker (server-side fs browse)
+    // Remote web → browser upload (front and back aren't co-located).
+    if (get(nativeShell)) {
+      try {
+        const res = await api.nativePickFile(workingDir)
+        if (!res.cancelled && res.path) attachLocalFile(res.path)
+      } catch (e: any) {
+        showToast(e.message ?? 'Failed to open file dialog', 'error')
+      }
+      return
+    }
+    if (get(localAccess)) {
+      pickerMode = 'file'
+      pickerOpen = true
+      return
+    }
     fileInputEl?.click()
+  }
+
+  // Attach a real local file by its absolute path — the agent reads it in place
+  // (see server parseUserFiles' local_path handling), no upload round-trip.
+  function attachLocalFile(path: string) {
+    const name = path.split(/[/\\]/).pop() || path
+    attachTo(sid, { name, local_path: path })
   }
 
   // Attachment reads (image FileReader, non-image upload) resolve asynchronously.
@@ -415,6 +443,7 @@
   let dirDraft = $state('')
   let dirSaving = $state(false)
   let pickerOpen = $state(false)
+  let pickerMode = $state<'folder' | 'file'>('folder')
   const reasoningLevels = ['off', 'low', 'medium', 'high', 'xhigh', 'max']
   const showReasoningIcon = $derived(showReasoning ? 'ant-design:eye-outlined' : 'ant-design:eye-invisible-outlined')
 
@@ -519,13 +548,31 @@
     }
   }
 
-  function openPicker() {
+  async function openPicker() {
     dirMenu = false
+    // Desktop shell: use the OS folder dialog. Plain web: open the in-app tree.
+    if (get(nativeShell)) {
+      try {
+        const res = await api.nativePickFolder(workingDir)
+        if (!res.cancelled && res.path) await applyWorkingDir(res.path)
+      } catch (e: any) {
+        showToast(e.message ?? 'Failed to open folder dialog', 'error')
+      }
+      return
+    }
+    pickerMode = 'folder'
     pickerOpen = true
   }
 
-  async function onPickerSelect(dir: string) {
-    if (await applyWorkingDir(dir)) pickerOpen = false
+  // The in-app picker returns a path: a directory (folder mode → working dir) or
+  // a file (file mode → attach by local path). Same modal, two modes.
+  async function onPickerSelect(path: string) {
+    if (pickerMode === 'file') {
+      attachLocalFile(path)
+      pickerOpen = false
+      return
+    }
+    if (await applyWorkingDir(path)) pickerOpen = false
   }
 
   // Show only the last two path segments so a long working dir doesn't push
@@ -870,6 +917,7 @@
 {#if pickerOpen}
   <FolderPickerModal
     initialPath={workingDir}
+    mode={pickerMode}
     onSelect={onPickerSelect}
     onClose={() => (pickerOpen = false)}
   />
