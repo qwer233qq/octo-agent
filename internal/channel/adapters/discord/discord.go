@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
@@ -952,7 +953,9 @@ func (a *Adapter) handleMessage(msg *dcMessage, onMessage func(channel.InboundEv
 		return
 	}
 
-	log.Printf("[discord] msg from %s in %s (%s): %.80s", msg.Author.ID, msg.ChannelID, chatType, text)
+	// Content-free reception line: message text is never logged (only metadata),
+	// so this stays a safe per-message signal in serve.log at the default level.
+	slog.Info("channel message received", "platform", platformName, "chat", msg.ChannelID, "user", msg.Author.ID, "chat_type", chatType, "bytes", len(text))
 	onMessage(channel.InboundEvent{
 		Type:      "message",
 		Platform:  platformName,

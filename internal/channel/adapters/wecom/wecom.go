@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -971,7 +972,9 @@ func (a *Adapter) handleInbound(body json.RawMessage, onMessage func(channel.Inb
 		chatType = "group"
 	}
 
-	log.Printf("[wecom] msg from %s in %s (%s) type=%s", msg.From.UserID, chatID, chatType, msg.MsgType)
+	// Content-free reception line: message text is never logged (only metadata),
+	// so this stays a safe per-message signal in serve.log at the default level.
+	slog.Info("channel message received", "platform", platformName, "chat", chatID, "user", msg.From.UserID, "chat_type", chatType, "msgtype", msg.MsgType)
 	onMessage(channel.InboundEvent{
 		Type:      "message",
 		Platform:  platformName,

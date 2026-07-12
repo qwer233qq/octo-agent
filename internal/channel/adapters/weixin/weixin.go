@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -749,7 +750,9 @@ func (a *Adapter) handleInbound(wire *ilink.WireMessage, onMessage func(channel.
 		return
 	}
 
-	log.Printf("[weixin] message from %s: %s", userID, truncate(text, 80))
+	// Content-free reception line: message text is never logged (only metadata),
+	// so this stays a safe per-message signal in serve.log at the default level.
+	slog.Info("channel message received", "platform", platformName, "chat", userID, "user", userID, "bytes", len(strings.TrimSpace(text)))
 
 	ev := channel.InboundEvent{
 		Type:         "message",
@@ -970,11 +973,3 @@ func markdownToPlain(text string) string {
 // from strings.LastIndex directly into a rune-slice index, which could
 // panic ("slice bounds out of range") on CJK text with a separator late in
 // the chunk window; SplitForSend cuts on byte offsets throughout instead.
-
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max]) + "…"
-}

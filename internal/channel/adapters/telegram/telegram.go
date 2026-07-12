@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -836,7 +837,9 @@ func (a *Adapter) processUpdate(upd tgUpdate, onMessage func(channel.InboundEven
 		chatType = "group"
 	}
 
-	log.Printf("[telegram] msg from %s in %d (%s): %.80s", userID, msg.Chat.ID, msg.Chat.Type, text)
+	// Content-free reception line: message text is never logged (only metadata),
+	// so this stays a safe per-message signal in serve.log at the default level.
+	slog.Info("channel message received", "platform", platformName, "chat", msg.Chat.ID, "user", userID, "chat_type", chatType, "bytes", len(text))
 	onMessage(channel.InboundEvent{
 		Type:      "message",
 		Platform:  platformName,
