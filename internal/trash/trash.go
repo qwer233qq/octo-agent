@@ -188,7 +188,7 @@ func Move(originalPath, projectDir string, opts ...Options) error {
 // conflict policy. It never silently overwrites a file already at the original
 // path — see ConflictPolicy.
 func Restore(id string, policy ConflictPolicy) (RestoreResult, error) {
-	entries, err := List()
+	entries, err := list(false)
 	if err != nil {
 		return RestoreResult{}, err
 	}
@@ -217,7 +217,9 @@ func Restore(id string, policy ConflictPolicy) (RestoreResult, error) {
 			}
 			res.BackedUpExisting = true
 		case ConflictRename:
-			dest = dest + ".restored-" + time.Now().Format("20060102-150405")
+			// A random token keeps the sibling name unique so a second
+			// same-second rename-restore can't silently overwrite the first.
+			dest = dest + ".restored-" + time.Now().Format("20060102-150405") + "-" + randToken()
 		}
 	} else if !os.IsNotExist(err) {
 		return RestoreResult{}, err
@@ -236,7 +238,7 @@ func Restore(id string, policy ConflictPolicy) (RestoreResult, error) {
 
 // Delete permanently removes one entry by ID and returns the bytes freed.
 func Delete(id string) (int64, error) {
-	entries, err := List()
+	entries, err := list(false)
 	if err != nil {
 		return 0, err
 	}
@@ -251,8 +253,17 @@ func Delete(id string) (int64, error) {
 	return 0, fmt.Errorf("trash entry not found: %s", id)
 }
 
-// List returns all trashed files sorted by deletion time (newest first).
+// List returns all trashed files sorted by deletion time (newest first), each
+// with its display Label derived.
 func List() ([]Entry, error) {
+	return list(true)
+}
+
+// list is List with a switch for the (potentially expensive) Label derivation:
+// callers that only match by ID or iterate for removal — Restore, Delete,
+// Empty, Enforce — pass false so they don't read every trashed session
+// transcript just to compute titles they never use.
+func list(withLabel bool) ([]Entry, error) {
 	root := Dir()
 	var entries []Entry
 
@@ -276,6 +287,12 @@ func List() ([]Entry, error) {
 		}
 		for _, f := range files {
 			if strings.HasSuffix(f.Name(), ".meta.json") {
+				// A sidecar whose bytes are gone is a phantom (e.g. a restore or
+				// eviction that raced and left the meta behind): un-restorable,
+				// and it would linger on disk forever. Reap it.
+				if _, err := os.Stat(strings.TrimSuffix(filepath.Join(projDir, f.Name()), ".meta.json")); os.IsNotExist(err) {
+					os.Remove(filepath.Join(projDir, f.Name()))
+				}
 				continue
 			}
 			trashPath := filepath.Join(projDir, f.Name())
@@ -298,17 +315,23 @@ func List() ([]Entry, error) {
 					orphan = true
 				}
 			}
+			label := ""
+			if withLabel {
+				label = deriveLabel(m.Original, trashPath)
+			}
 			entries = append(entries, Entry{
-				// <project_hash>.<trash_name> — a single URL-safe segment that
-				// pins the exact file, so restore/delete never cross-project
-				// first-match the wrong entry.
+				// <project_hash>.<trash_name>. Unique per file and stable, so
+				// restore/delete address the exact entry. Note the trash_name
+				// ends in the original basename, so an id can contain characters
+				// (#, ?, spaces) a URL path must escape — HTTP callers
+				// encodeURIComponent it.
 				ID:        projHash + "." + f.Name(),
 				Original:  m.Original,
 				TrashPath: trashPath,
 				DeletedAt: m.DeletedAt,
 				Project:   m.Project,
 				Size:      size,
-				Label:     deriveLabel(m.Original, trashPath),
+				Label:     label,
 				DeletedBy: m.DeletedBy,
 				Kind:      m.Kind,
 				Orphan:    orphan,
@@ -324,7 +347,7 @@ func List() ([]Entry, error) {
 // (project directory no longer exists).
 // Returns (deleted count, freed bytes, error).
 func Empty(mode string) (int, int64, error) {
-	entries, err := List()
+	entries, err := list(false)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -365,7 +388,7 @@ func Empty(mode string) (int, int64, error) {
 // repo — but remain eligible for hard-cap eviction, since the size cap is a
 // firm limit. Returns (entries removed, bytes freed).
 func Enforce(maxBytes int64, retention time.Duration) (int, int64, error) {
-	entries, err := List()
+	entries, err := list(false)
 	if err != nil {
 		return 0, 0, err
 	}

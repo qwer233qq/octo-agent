@@ -55,6 +55,32 @@ func TestBackup_ReturnsMatchingID(t *testing.T) {
 	}
 }
 
+// TestList_SkipsPhantomEntry: a sidecar whose bytes are gone (e.g. a restore
+// that raced with eviction) is neither listed nor left on disk to reappear
+// forever.
+func TestList_SkipsPhantomEntry(t *testing.T) {
+	isolateHome(t)
+	project := t.TempDir()
+	f := filepath.Join(project, "notes.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Move(f, project); err != nil {
+		t.Fatal(err)
+	}
+	e := find(t, f)
+	// Simulate the race: bytes removed, sidecar left behind.
+	os.Remove(e.TrashPath)
+
+	entries, _ := List()
+	if len(entries) != 0 {
+		t.Fatalf("phantom entry should not be listed, got %d", len(entries))
+	}
+	if _, err := os.Stat(e.TrashPath + ".meta.json"); !os.IsNotExist(err) {
+		t.Error("stale sidecar should have been cleaned up")
+	}
+}
+
 // TestProvenance_MissingIsEmpty: an entry trashed without options (older
 // sidecars) reads back with empty provenance, not an error.
 func TestProvenance_MissingIsEmpty(t *testing.T) {

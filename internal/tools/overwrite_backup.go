@@ -47,7 +47,9 @@ func backupBeforeOverwrite(ctx context.Context, abs, tool string) string {
 }
 
 func overwriteBackupEnabled() bool {
-	cfg, err := config.Load()
+	// LoadCached (not Load): this runs on every overwrite of an existing file,
+	// so avoid re-parsing config.yml each time — matches how serve reads config.
+	cfg, err := config.LoadCached()
 	if err != nil {
 		return true // default on
 	}
