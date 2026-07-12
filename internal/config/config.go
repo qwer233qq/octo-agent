@@ -18,6 +18,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -304,6 +305,41 @@ func (c Config) DefaultEntry() ModelEntry {
 		return c.Models[0]
 	}
 	return ModelEntry{}
+}
+
+// Validate reports semantic problems in a config that already parsed cleanly —
+// issues Load tolerates by falling back silently (a mistyped default_model, a
+// duplicated or half-filled entry) but which usually mean a hand edit went
+// wrong. It returns a human-readable list; empty means the config is usable. A
+// config with no models (the valid pre-onboarding state) reports nothing.
+func (c Config) Validate() []string {
+	if len(c.Models) == 0 {
+		return nil
+	}
+	var problems []string
+	// Keyed by the raw model string (EntryByModel matches exactly), so the
+	// default_model/lite_model checks below agree with runtime resolution.
+	seen := make(map[string]bool, len(c.Models))
+	for i, m := range c.Models {
+		if strings.TrimSpace(m.Model) == "" {
+			problems = append(problems, fmt.Sprintf("models[%d] has no model name", i))
+			continue
+		}
+		if strings.TrimSpace(m.Provider) == "" {
+			problems = append(problems, fmt.Sprintf("model %q has no provider", m.Model))
+		}
+		if seen[m.Model] {
+			problems = append(problems, fmt.Sprintf("duplicate model %q (only the first entry is used)", m.Model))
+		}
+		seen[m.Model] = true
+	}
+	if c.DefaultModel != "" && !seen[c.DefaultModel] {
+		problems = append(problems, fmt.Sprintf("default_model %q matches no entry (the first model is used instead)", c.DefaultModel))
+	}
+	if c.LiteModel != "" && !seen[c.LiteModel] {
+		problems = append(problems, fmt.Sprintf("lite_model %q matches no entry", c.LiteModel))
+	}
+	return problems
 }
 
 // EntryByModel returns the entry with the given model string. An empty model
