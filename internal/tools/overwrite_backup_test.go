@@ -70,9 +70,14 @@ func TestOverwriteBackup_Untracked(t *testing.T) {
 	if err := os.WriteFile(f, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	backupBeforeOverwrite(context.Background(), f)
+	backupBeforeOverwrite(context.Background(), f, "write_file")
 	if got := countBackups(t, f); got != 1 {
 		t.Errorf("untracked overwrite should stage 1 backup, got %d", got)
+	}
+	// Provenance is recorded so the UI can show what happened.
+	entries, _ := trash.List()
+	if len(entries) != 1 || entries[0].DeletedBy != "write_file" || entries[0].Kind != "overwrite" {
+		t.Errorf("expected write_file/overwrite provenance, got %+v", entries)
 	}
 }
 
@@ -88,7 +93,7 @@ func TestOverwriteBackup_TrackedClean(t *testing.T) {
 	}
 	gitCommitAll(t, dir)
 
-	backupBeforeOverwrite(context.Background(), f)
+	backupBeforeOverwrite(context.Background(), f, "write_file")
 	if got := countBackups(t, f); got != 0 {
 		t.Errorf("clean tracked file should NOT be staged (git recovers it), got %d", got)
 	}
@@ -109,7 +114,7 @@ func TestOverwriteBackup_TrackedDirty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backupBeforeOverwrite(context.Background(), f)
+	backupBeforeOverwrite(context.Background(), f, "write_file")
 	if got := countBackups(t, f); got != 1 {
 		t.Errorf("dirty tracked file should be staged, got %d", got)
 	}
@@ -120,7 +125,7 @@ func TestOverwriteBackup_CreateIsNoOp(t *testing.T) {
 	setHome(t)
 	dir := t.TempDir()
 	f := filepath.Join(dir, "new.txt")
-	backupBeforeOverwrite(context.Background(), f)
+	backupBeforeOverwrite(context.Background(), f, "write_file")
 	if got := countBackups(t, f); got != 0 {
 		t.Errorf("creating a new file should stage nothing, got %d", got)
 	}
@@ -144,7 +149,7 @@ func TestOverwriteBackup_ToggleOff(t *testing.T) {
 	if err := os.WriteFile(f, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	backupBeforeOverwrite(context.Background(), f)
+	backupBeforeOverwrite(context.Background(), f, "write_file")
 	if got := countBackups(t, f); got != 0 {
 		t.Errorf("toggle off should stage nothing, got %d", got)
 	}

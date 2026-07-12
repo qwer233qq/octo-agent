@@ -67,7 +67,7 @@ const safeRmWrapper = `__octo_safe_rm() {
       _dest="$_trash_dir/${_ts}_$$_${_n}_${_base}"
       mkdir -p "$_trash_dir"
       cp -al "$_orig" "$_dest" 2>/dev/null || cp -R "$_orig" "$_dest" 2>/dev/null || continue
-      printf '{"original":"%%s","deleted_at":"%%s","project":"%%s"}\n' \
+      printf '{"original":"%%s","deleted_at":"%%s","project":"%%s","deleted_by":"rm","kind":"delete"}\n' \
         "$(printf '%%s' "$_orig" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
         "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)" \
         "$(printf '%%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')" \

@@ -40,6 +40,16 @@ const (
 	ConflictRename
 )
 
+// Options carries provenance recorded in an entry's sidecar so the UI can show
+// what removed a file. All fields are optional; the zero value is fine.
+type Options struct {
+	// DeletedBy names the surface that removed the file: "rm", "write_file",
+	// "edit_file", "session", "skill", "workflow", "scheduler", "memory".
+	DeletedBy string
+	// Kind is "delete" or "overwrite".
+	Kind string
+}
+
 // Entry describes a single trashed file.
 type Entry struct {
 	ID        string `json:"id"`
@@ -52,6 +62,10 @@ type Entry struct {
 	// (e.g. a session transcript's title). Empty means the UI should fall back
 	// to the basename.
 	Label string `json:"label,omitempty"`
+	// DeletedBy / Kind carry provenance from the sidecar (empty for entries
+	// trashed before provenance was recorded).
+	DeletedBy string `json:"deleted_by,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 	// Orphan is true when the original project directory no longer exists
 	// (e.g. a test temp dir) — such entries are safe to permanently delete.
 	Orphan bool `json:"orphan"`
@@ -71,6 +85,16 @@ type meta struct {
 	Original  string `json:"original"`
 	DeletedAt string `json:"deleted_at"`
 	Project   string `json:"project"`
+	DeletedBy string `json:"deleted_by,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+}
+
+// firstOpts returns the first Options in opts, or the zero value.
+func firstOpts(opts []Options) Options {
+	if len(opts) > 0 {
+		return opts[0]
+	}
+	return Options{}
 }
 
 // Dir returns the trash root directory.
@@ -89,35 +113,35 @@ func ProjectDir(projectDir string) string {
 // original. It's the copy-only half of Move: the Windows safe-delete wrapper
 // and the overwrite-protection path use it to make a delete/overwrite
 // recoverable while the caller performs the actual removal.
-func Backup(originalPath, projectDir string) error {
+func Backup(originalPath, projectDir string, opts ...Options) (string, error) {
 	fi, err := os.Stat(originalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", originalPath)
+			return "", fmt.Errorf("file not found: %s", originalPath)
 		}
-		return err
+		return "", err
 	}
 
 	trashPath, err := stageName(originalPath, projectDir)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if fi.IsDir() {
 		if err := copyDir(originalPath, trashPath); err != nil {
-			return err
+			return "", err
 		}
 	} else {
 		if err := copyFile(originalPath, trashPath); err != nil {
-			return err
+			return "", err
 		}
 	}
 
-	if err := writeMeta(trashPath, originalPath, projectDir); err != nil {
+	if err := writeMeta(trashPath, originalPath, projectDir, firstOpts(opts)); err != nil {
 		removePath(trashPath)
-		return err
+		return "", err
 	}
-	return nil
+	return entryID(projectDir, trashPath), nil
 }
 
 // Move backs a file or directory up to the trash and then removes the original.
@@ -127,7 +151,7 @@ func Backup(originalPath, projectDir string) error {
 // live under ~/.octo, or a project on the same volume as $HOME) the move is a
 // single atomic rename — instant, and space-free even for large trees. Across
 // filesystems it falls back to copy-then-remove.
-func Move(originalPath, projectDir string) error {
+func Move(originalPath, projectDir string, opts ...Options) error {
 	if _, err := os.Stat(originalPath); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("file not found: %s", originalPath)
@@ -144,7 +168,7 @@ func Move(originalPath, projectDir string) error {
 		// Renamed in; record meta. If meta can't be written, put the file back
 		// so nothing is lost in a metadata-less limbo (List skips meta-less
 		// entries, so they'd be invisible and unrecoverable).
-		if err := writeMeta(trashPath, originalPath, projectDir); err != nil {
+		if err := writeMeta(trashPath, originalPath, projectDir, firstOpts(opts)); err != nil {
 			_ = os.Rename(trashPath, originalPath)
 			return err
 		}
@@ -154,7 +178,7 @@ func Move(originalPath, projectDir string) error {
 	// Cross-device (or any rename failure): copy, then remove. Backup writes
 	// meta before returning, so the original is only removed once a recoverable
 	// copy exists.
-	if err := Backup(originalPath, projectDir); err != nil {
+	if _, err := Backup(originalPath, projectDir, opts...); err != nil {
 		return err
 	}
 	return os.RemoveAll(originalPath)
@@ -285,6 +309,8 @@ func List() ([]Entry, error) {
 				Project:   m.Project,
 				Size:      size,
 				Label:     deriveLabel(m.Original, trashPath),
+				DeletedBy: m.DeletedBy,
+				Kind:      m.Kind,
 				Orphan:    orphan,
 			})
 		}
@@ -409,14 +435,23 @@ func stageName(originalPath, projectDir string) (string, error) {
 	return filepath.Join(targetDir, name), nil
 }
 
-func writeMeta(trashPath, originalPath, projectDir string) error {
+func writeMeta(trashPath, originalPath, projectDir string, opts Options) error {
 	m := meta{
 		Original:  originalPath,
 		DeletedAt: time.Now().UTC().Format(time.RFC3339),
 		Project:   projectDir,
+		DeletedBy: opts.DeletedBy,
+		Kind:      opts.Kind,
 	}
 	data, _ := json.MarshalIndent(m, "", "  ")
 	return os.WriteFile(trashPath+".meta.json", data, 0600)
+}
+
+// entryID is the stable, URL-safe identity for a staged file: the project hash
+// and the trash-name joined by a dot (see List). Kept in one place so Backup's
+// returned id and List's computed id can never drift.
+func entryID(projectDir, trashPath string) string {
+	return hashProject(projectDir) + "." + filepath.Base(trashPath)
 }
 
 // randToken returns 4 hex chars of entropy.

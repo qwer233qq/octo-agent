@@ -147,10 +147,17 @@ func (s *Server) handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing file id")
 		return
 	}
-	// Default to the safe policy: never silently overwrite a file already at
-	// the original path. On a conflict, reply 409 with the details so the UI
-	// can ask the user how to resolve it.
-	res, err := trash.Restore(id, trash.ConflictAbort)
+	// on_conflict selects how to handle an occupied original path. Default is
+	// the safe "abort": reply 409 so the UI can ask the user how to resolve it
+	// (the inline overwrite-undo and the recall view pass "backup"/"rename").
+	policy := trash.ConflictAbort
+	switch r.URL.Query().Get("on_conflict") {
+	case "backup":
+		policy = trash.ConflictBackupExisting
+	case "rename":
+		policy = trash.ConflictRename
+	}
+	res, err := trash.Restore(id, policy)
 	if err != nil {
 		if errors.Is(err, trash.ErrRestoreConflict) {
 			writeJSON(w, http.StatusConflict, map[string]any{
@@ -162,9 +169,10 @@ func (s *Server) handleRestoreTrash(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":      "restored",
-		"restored_to": res.RestoredTo,
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":             "restored",
+		"restored_to":        res.RestoredTo,
+		"backed_up_existing": res.BackedUpExisting,
 	})
 }
 

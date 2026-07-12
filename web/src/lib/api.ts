@@ -615,8 +615,20 @@ export async function listTrash(): Promise<RecallFile[]> {
   return request<RecallFile[]>('/api/trash')
 }
 
-export async function restoreTrash(id: string): Promise<void> {
-  await request<unknown>(`/api/trash/${id}/restore`, { method: 'POST' })
+export type RestoreResult =
+  | { ok: true; restoredTo: string; backedUpExisting: boolean }
+  | { ok: false; conflict: true }
+
+// restoreTrash restores an entry. onConflict picks how an occupied original
+// path is handled: undefined → abort (server replies 409 → { conflict:true });
+// 'backup' → trash the current file first; 'rename' → restore as a sibling.
+export async function restoreTrash(id: string, onConflict?: 'backup' | 'rename'): Promise<RestoreResult> {
+  const q = onConflict ? `?on_conflict=${onConflict}` : ''
+  const res = await fetch(`/api/trash/${id}/restore${q}`, { method: 'POST' })
+  if (res.status === 409) return { ok: false, conflict: true }
+  if (!res.ok) throw new Error(await readErrorMessage(res, `${res.status} ${res.statusText}`))
+  const d = await res.json()
+  return { ok: true, restoredTo: d.restored_to ?? '', backedUpExisting: !!d.backed_up_existing }
 }
 
 export async function deleteTrashItem(id: string): Promise<void> {

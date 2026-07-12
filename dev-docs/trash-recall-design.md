@@ -45,16 +45,14 @@ the scheme can evolve without migration.
   "deleted_at":  "2026-07-12T15:30:00Z",
   "project":     "/abs/path/to/project",
   "deleted_by":  "write_file",
-  "kind":        "overwrite",
-  "session_id":  "3f9c…"
+  "kind":        "overwrite"
 }
 ```
 
 `deleted_by` records which surface removed the file (`rm`, `write_file`,
-`edit_file`, `session`, `skill`, `workflow`, `scheduler`, `memory`), `kind` is
-`delete` or `overwrite`, and `session_id` (best-effort, empty when unknown) ties
-the entry back to the conversation that caused it. Older sidecars that predate
-these fields read back as zero values — every reader treats them as optional.
+`edit_file`, `session`, `skill`, `workflow`, `scheduler`, `memory`) and `kind`
+is `delete` or `overwrite`. Older sidecars that predate these fields read back
+as zero values — every reader treats them as optional.
 
 ### Human-readable labels
 
@@ -69,10 +67,8 @@ demote the id to a dim secondary line.
   trashed copy is the complete transcript, so the title is parsed straight from
   it: the first line is the `meta` record (its `title` field is authoritative
   after any rewrite); failing that, a bounded scan picks up a later
-  `type:"title"` record. This recovers titles for entries already sitting in the
-  trash, not just future deletions. The `session` delete path also stamps the
-  title into the sidecar `label` at delete time, so the common case needs no
-  parse.
+  `type:"title"` record. Parsing straight from the trashed transcript recovers
+  titles for entries already sitting in the trash, not just future deletions.
 - **Other entries** → `Label` is empty and the UI falls back to the basename.
 
 Parsing is bounded (only session-path entries, first line plus a short scan,
@@ -228,10 +224,11 @@ restore-as-copy) and shows each entry's provenance (`deleted_by`, `kind`) and a
 
 ### Inline undo
 
-When a destructive tool call stages bytes it knows the id of — `write_file` /
-`edit_file` overwrites and the programmatic delete tools — the `ToolResult.UI`
-carries an `undo_id`. The TUI and Web transcripts render a one-step "↩ undo"
-affordance next to that result, so the moment of maximum regret has the fastest
-possible recovery. Shell `rm` deletions do not surface an inline id (the
-terminal tool cannot know what the wrapper staged); those are recovered from the
-trash view / `octo trash`.
+When `write_file` / `edit_file` overwrites an existing file, its `ToolResult.UI`
+carries an `undo_id` — the id of the staged pre-write copy. The Web transcript
+renders a one-step "↩ undo" next to that result; clicking it restores the old
+bytes with the `backup` conflict policy (the just-written file goes to the trash
+first, so the undo is itself reversible). In the TUI the same recovery is one
+command away — `/trash restore <id>`. Shell `rm` deletions don't surface an
+inline id (the terminal tool can't know what the wrapper staged); those are
+recovered from the recall view or `octo trash`.

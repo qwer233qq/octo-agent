@@ -24,18 +24,26 @@ import (
 //
 // The git check runs only for an *existing* file, so creating a brand-new file
 // pays nothing.
-func backupBeforeOverwrite(ctx context.Context, abs string) {
+//
+// tool names the caller ("write_file" / "edit_file"), recorded as provenance.
+// Returns the staged trash entry's id (empty when nothing was staged) so the
+// tool can offer a one-click "undo" against it.
+func backupBeforeOverwrite(ctx context.Context, abs, tool string) string {
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
-		return
+		return ""
 	}
 	if !overwriteBackupEnabled() {
-		return
+		return ""
 	}
 	if gitTrackedClean(abs) {
-		return
+		return ""
 	}
-	_ = trash.Backup(abs, WorkingDirOrCWD(ctx))
+	id, err := trash.Backup(abs, WorkingDirOrCWD(ctx), trash.Options{DeletedBy: tool, Kind: "overwrite"})
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 func overwriteBackupEnabled() bool {

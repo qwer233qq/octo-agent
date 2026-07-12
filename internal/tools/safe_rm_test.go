@@ -93,6 +93,11 @@ func TestSafeRm_AbsolutePathBackedUp(t *testing.T) {
 	if !sawAbs {
 		t.Errorf("absolute delete not backed up (the bug); metas=%v", metas)
 	}
+	for _, m := range metas {
+		if !strings.Contains(m, `"deleted_by":"rm"`) {
+			t.Errorf("rm-staged meta should record deleted_by=rm; got %s", m)
+		}
+	}
 }
 
 // TestSafeRm_NoTrashDirIsNoOp: with $OCTO_TRASH_DIR unset the wrapper must not
