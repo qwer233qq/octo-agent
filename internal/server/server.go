@@ -2452,16 +2452,13 @@ func (s *Server) channelBaseCtxLocked() context.Context {
 	return s.channelCtx
 }
 
-// startOneChannelLocked builds and launches a single platform adapter from the
-// current channelCfg, tracking its own cancel so it can be stopped
-// independently. No-op if it is already running or its config is missing/
-// invalid. Caller holds channelMu.
+// startOneChannelLocked builds and launches adapters for every enabled instance
+// of the named platform. For multi-instance platforms, each instance gets its
+// own adapter and adapterID so InboundEvent.AdapterID disambiguates them.
+// Caller holds channelMu.
 func (s *Server) startOneChannelLocked(name string) {
-	if _, ok := s.runningAdapters.Load(name); ok {
-		return // already running
-	}
-	pc := s.channelCfg.Platform(name)
-	if pc == nil {
+	instances := s.channelCfg.Platform(name)
+	if len(instances) == 0 {
 		return
 	}
 	ctor, err := channel.Find(name)
@@ -2470,34 +2467,44 @@ func (s *Server) startOneChannelLocked(name string) {
 		s.recordChannelIssue(name, "adapter not registered: "+err.Error())
 		return
 	}
-	ad, err := ctor(pc)
-	if err != nil {
-		slog.Error("channel adapter failed", "channel", name, "err", err)
-		s.recordChannelIssue(name, "construction failed: "+err.Error())
-		return
-	}
-	if errs := ad.ValidateConfig(pc); len(errs) > 0 {
-		for _, e := range errs {
-			slog.Warn("channel config issue", "channel", name, "detail", e)
+	for i, ic := range instances {
+		if !ic.Enabled {
+			continue
 		}
-		s.recordChannelIssue(name, "invalid config: "+strings.Join(errs, "; "))
-		return
-	}
+		ir := channel.InstanceRef{Platform: name, Instance: ic, Index: i}
+		adapterID := ir.AdapterID()
+		if _, ok := s.runningAdapters.Load(adapterID); ok {
+			continue // already running
+		}
+		ad, err := ctor(ic.Config)
+		if err != nil {
+			slog.Error("channel adapter failed", "channel", adapterID, "err", err)
+			s.recordChannelIssue(adapterID, "construction failed: "+err.Error())
+			continue
+		}
+		if errs := ad.ValidateConfig(ic.Config); len(errs) > 0 {
+			for _, e := range errs {
+				slog.Warn("channel config issue", "channel", adapterID, "detail", e)
+			}
+			s.recordChannelIssue(adapterID, "invalid config: "+strings.Join(errs, "; "))
+			continue
+		}
 
-	ctx, cancel := context.WithCancel(s.channelBaseCtxLocked())
-	if s.adapterCancels == nil {
-		s.adapterCancels = make(map[string]context.CancelFunc)
+		ctx, cancel := context.WithCancel(s.channelBaseCtxLocked())
+		if s.adapterCancels == nil {
+			s.adapterCancels = make(map[string]context.CancelFunc)
+		}
+		if s.channelGen == nil {
+			s.channelGen = make(map[string]uint64)
+		}
+		s.channelGen[adapterID]++
+		gen := s.channelGen[adapterID]
+		s.adapterCancels[adapterID] = cancel
+		s.runningAdapters.Store(adapterID, ad)
+		s.clearChannelIssue(adapterID)
+		s.channelWG.Add(1)
+		go s.runChannelWithRestart(ctx, adapterID, ir.Platform, gen, ic.Config, ctor, ad)
 	}
-	if s.channelGen == nil {
-		s.channelGen = make(map[string]uint64)
-	}
-	s.channelGen[name]++
-	gen := s.channelGen[name]
-	s.adapterCancels[name] = cancel
-	s.runningAdapters.Store(name, ad)
-	s.clearChannelIssue(name)
-	s.channelWG.Add(1)
-	go s.runChannelWithRestart(ctx, name, gen, pc, ctor, ad)
 }
 
 // channelRestartDelays bounds how aggressively a crashed adapter retries: a
@@ -2534,12 +2541,13 @@ const maxChannelRestarts = 10
 // to runningAdapters/adapterCancels re-checks it first, since a concurrent
 // stop/reload/restart of this same platform can slip in during the ctor(pc)
 // call below, which does not observe ctx cancellation.
-func (s *Server) runChannelWithRestart(ctx context.Context, name string, gen uint64, pc channel.PlatformConfig, ctor func(channel.PlatformConfig) (channel.Adapter, error), ad channel.Adapter) {
+func (s *Server) runChannelWithRestart(ctx context.Context, adapterID, platform string, gen uint64, pc channel.PlatformConfig, ctor func(channel.PlatformConfig) (channel.Adapter, error), ad channel.Adapter) {
 	defer s.channelWG.Done()
 	restarts := 0
 	for {
 		err := ad.Start(ctx, func(ev channel.InboundEvent) {
-			ev.Platform = name
+			ev.Platform = platform
+			ev.AdapterID = adapterID
 			s.routeChannelEvent(ctx, ad, ev)
 		})
 		if ctx.Err() != nil {
@@ -2547,19 +2555,19 @@ func (s *Server) runChannelWithRestart(ctx context.Context, name string, gen uin
 		}
 
 		restarts++
-		slog.Error("channel adapter exited unexpectedly", "channel", name, "err", err, "restart_attempt", restarts)
+		slog.Error("channel adapter exited unexpectedly", "channel", adapterID, "err", err, "restart_attempt", restarts)
 		if restarts > maxChannelRestarts {
-			slog.Error("channel adapter exceeded restart limit — giving up", "channel", name, "restarts", restarts)
-			s.recordChannelIssue(name, fmt.Sprintf("gave up after %d crashes: %v", restarts, err))
+			slog.Error("channel adapter exceeded restart limit — giving up", "channel", adapterID, "restarts", restarts)
+			s.recordChannelIssue(adapterID, fmt.Sprintf("gave up after %d crashes: %v", restarts, err))
 			s.channelMu.Lock()
-			if s.channelGen[name] == gen {
-				s.runningAdapters.Delete(name)
-				delete(s.adapterCancels, name)
+			if s.channelGen[adapterID] == gen {
+				s.runningAdapters.Delete(adapterID)
+				delete(s.adapterCancels, adapterID)
 			}
 			s.channelMu.Unlock()
 			return
 		}
-		s.recordChannelIssue(name, fmt.Sprintf("restarting (%d/%d) after crash: %v", restarts, maxChannelRestarts, err))
+		s.recordChannelIssue(adapterID, fmt.Sprintf("restarting (%d/%d) after crash: %v", restarts, maxChannelRestarts, err))
 
 		delay := channelRestartDelays[len(channelRestartDelays)-1]
 		if restarts-1 < len(channelRestartDelays) {
@@ -2573,24 +2581,24 @@ func (s *Server) runChannelWithRestart(ctx context.Context, name string, gen uin
 
 		newAd, cerr := ctor(pc)
 		if cerr != nil {
-			slog.Error("channel restart: rebuild failed", "channel", name, "err", cerr, "restart_attempt", restarts)
-			s.recordChannelIssue(name, fmt.Sprintf("restart %d/%d rebuild failed: %v", restarts, maxChannelRestarts, cerr))
+			slog.Error("channel restart: rebuild failed", "channel", adapterID, "err", cerr, "restart_attempt", restarts)
+			s.recordChannelIssue(adapterID, fmt.Sprintf("restart %d/%d rebuild failed: %v", restarts, maxChannelRestarts, cerr))
 			continue // try again next loop, same restart budget and backoff schedule
 		}
 		ad = newAd
 		s.channelMu.Lock()
-		if s.channelGen[name] != gen {
+		if s.channelGen[adapterID] != gen {
 			// Superseded while ctor(pc) was in flight — a concurrent
-			// stop/reload/restart now owns this platform name. ad was never
+			// stop/reload/restart now owns this platform adapterID. ad was never
 			// Start()-ed, so there's nothing to Stop(); just discard it and
 			// let this goroutine end without touching the new owner's state.
 			s.channelMu.Unlock()
-			slog.Warn("channel restart: superseded during rebuild, discarding stale instance", "channel", name)
+			slog.Warn("channel restart: superseded during rebuild, discarding stale instance", "channel", adapterID)
 			return
 		}
-		s.runningAdapters.Store(name, ad)
+		s.runningAdapters.Store(adapterID, ad)
 		s.channelMu.Unlock()
-		s.clearChannelIssue(name)
+		s.clearChannelIssue(adapterID)
 	}
 }
 
@@ -2632,18 +2640,32 @@ func (s *Server) stopOneChannelLocked(name string) {
 		_ = v.(channel.Adapter).Stop()
 		s.runningAdapters.Delete(name)
 	}
-	// A deliberate stop (disable/delete/reload) isn't a health problem — clear
-	// any crash/restart status left over from before it, so re-enabling later
-	// starts from a clean slate instead of showing a stale crash reason.
 	s.clearChannelIssue(name)
 }
 
+// stopPlatformLocked stops every running instance of a platform by adapterID.
+// Finds all runningAdapters whose key starts with the platform name (for
+// single-instance legacy, the key equals the platform; for multi-instance,
+// the key is the instance name — but single-instance names default to the
+// platform name so both cases are covered by the prefix match).
+func (s *Server) stopPlatformLocked(platform string) {
+	s.runningAdapters.Range(func(key, _ any) bool {
+		k := key.(string)
+		// Multi-instance: adapterID is the instance name (e.g. "code-review-bot").
+		// Single-instance: adapterID defaults to the platform name via AdapterID().
+		// The platform name alone can't identify which adapter belongs to it —
+		// stop anything that the next startOneChannelLocked will re-create.
+		if k == platform || strings.HasPrefix(k, platform+"-") {
+			s.stopOneChannelLocked(k)
+		}
+		return true
+	})
+}
+
 // reloadChannel applies a saved config change for one platform without a full
-// server restart: it re-reads channels.yml, stops the platform's adapter if
-// running, then starts it again when the new config has it enabled. It handles
-// a fresh add (manager built lazily), a credential change (stop + start), and
-// a disable/delete (stop only). Called from the channels REST handlers after a
-// successful save.
+// server restart: it re-reads channels.yml, stops all instances of the
+// platform, then re-starts enabled instances. A credential change, a
+// disable/delete, and a fresh add all flow through here.
 func (s *Server) reloadChannel(platform string) {
 	if s.cfg.NoChannel || s.getSender() == nil {
 		return
@@ -2666,7 +2688,8 @@ func (s *Server) reloadChannel(platform string) {
 		})
 	}
 
-	s.stopOneChannelLocked(platform)
+	// Stop all running instances of this platform (keyed by adapterID).
+	s.stopPlatformLocked(platform)
 	if chCfg.IsEnabled(platform) {
 		s.startOneChannelLocked(platform)
 		slog.Info("channel reloaded", "channel", platform)
@@ -2691,10 +2714,11 @@ func (s *Server) routeChannelEvent(ctx context.Context, ad channel.Adapter, ev c
 	// means "stay silent": a group chat with multiple bound agents and no
 	// @-mention.
 	profile := s.agentRouter().Route(agentprofile.RouteInput{
-		Platform: ev.Platform,
-		ChatID:   ev.ChatID,
-		UserID:   ev.UserID,
-		Text:     ev.Text,
+		Platform:  ev.Platform,
+		ChatID:    ev.ChatID,
+		AdapterID: ev.AdapterID,
+		UserID:    ev.UserID,
+		Text:      ev.Text,
 	})
 	if profile == nil {
 		return
