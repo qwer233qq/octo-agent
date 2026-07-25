@@ -347,3 +347,189 @@ func TestRegistry_ZeroValue_NoEnforcement(t *testing.T) {
 		t.Errorf("zero-value registry should not enforce read-before-write: %v", err)
 	}
 }
+
+// ─── grep counts as a read ────────────────────────────────────────────────
+
+// A grep over a directory surfaces the matching lines of every hit file, so
+// those files count as "read": a following edit_file must not be refused.
+func TestRegistry_GrepDirThenEdit_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after grep should succeed: %v", err)
+	}
+}
+
+// files_with_matches mode shows only paths — still enough to count as seen.
+func TestRegistry_GrepFilesWithMatchesThenEdit_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir, "mode": "files_with_matches",
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after files_with_matches grep should succeed: %v", err)
+	}
+}
+
+// Single-file grep: rg omits the path prefix from its output, so the file
+// must be picked up from the input's own `path` argument.
+func TestRegistry_GrepSingleFileThenEdit_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": p,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after single-file grep should succeed: %v", err)
+	}
+}
+
+// Only files the grep actually surfaced count. A sibling with no matches was
+// never shown to the model, so editing it stays blocked.
+func TestRegistry_GrepThenEdit_UnmatchedFileStillBlocked(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	hit := filepath.Join(dir, "hit.go")
+	miss := filepath.Join(dir, "miss.go")
+	if err := os.WriteFile(hit, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(miss, []byte("package x\nvar b = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	_, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": miss, "old_string": "var b = 2", "new_string": "var b = 3",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not been read") {
+		t.Errorf("editing a file grep did not surface should stay blocked, got %v", err)
+	}
+}
+
+// A grep with zero matches returns "(no matches)" with a nil error. That
+// output must NOT stamp the input path — the model saw nothing, so a
+// following edit would be a blind write the read-before-write guard must
+// still block. This is the regression guard for the no-match stamp bug.
+func TestRegistry_GrepSingleFileNoMatch_EditStillBlocked(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "zzz_no_such_pattern", "path": p,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	_, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not been read") {
+		t.Errorf("edit after a zero-match grep should stay blocked, got %v", err)
+	}
+}
+
+// Count mode outputs "path:N" lines. Those must count as a read too.
+func TestRegistry_GrepCountModeThenEdit_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir, "mode": "count",
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after count-mode grep should succeed: %v", err)
+	}
+}
+
+// Context mode adds "path-N-text" lines and "--" group separators. The
+// separator line must not break parsing, and the hit file must still count.
+func TestRegistry_GrepContextModeThenEdit_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "code.go")
+	if err := os.WriteFile(p, []byte("package x\nconst a = 1\nvar b = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir, "context_lines": 1,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after context-mode grep should succeed: %v", err)
+	}
+}
+
+// Filenames with embedded separator+digit runs (e.g. "report-2024-01-01.txt")
+// used to fail closed: the non-greedy regex settled on the first "-2024-"
+// boundary and the candidate "report" didn't stat. The multi-boundary fix
+// now tries every prefix, so the full filename is found.
+func TestRegistry_GrepNumericDashFilename_Allowed(t *testing.T) {
+	reg := NewDefaultRegistry()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "report-2024-01-01.txt")
+	if err := os.WriteFile(p, []byte("line one\nconst a = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reg.Execute(context.Background(), "grep", map[string]any{
+		"pattern": "const a", "path": dir,
+	}); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if _, err := reg.Execute(context.Background(), "edit_file", map[string]any{
+		"path": p, "old_string": "const a = 1", "new_string": "const a = 2",
+	}); err != nil {
+		t.Errorf("edit after grep on a numeric-dash filename should succeed: %v", err)
+	}
+}

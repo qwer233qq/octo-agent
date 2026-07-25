@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/open-octo/octo-agent/internal/agent"
@@ -152,6 +153,8 @@ func (r DefaultRegistry) ExecuteStream(ctx context.Context, name string, input m
 							r.tracker.RecordRead(abs)
 						}
 					}
+				case "grep":
+					r.recordGrepReads(ctx, input, out.Text)
 				case "terminal":
 					if cmd, ok := input["command"].(string); ok {
 						r.recordTerminalReads(cmd)
@@ -219,6 +222,70 @@ func (r DefaultRegistry) recordTerminalReads(command string) {
 		}
 		if _, err := os.Stat(abs); err == nil {
 			r.tracker.RecordRead(abs)
+		}
+	}
+}
+
+// sepDigitsSep matches a separator (hyphen or colon) followed by digits
+// and another separator — the boundary between a file path and the
+// line-number region of an rg content/context output line
+// ("path:12:text", "path-12-text"). A filename itself may contain
+// separator+digit runs (e.g. "report-2024-01-01.txt:5:hit" has them at
+// "-2024-" and ":5-"), so recordGrepReads collects EVERY such boundary
+// and tries each prefix; the rightmost one that stats to a real file
+// wins. Windows drive prefixes survive because the regex requires a
+// leading separator before the digits.
+var sepDigitsSep = regexp.MustCompile(`[-:]\d+[-:]`)
+
+// grepCountRe matches count-mode lines "path:3", which have no trailing
+// separator after the number and so escape sepDigitsSep.
+var grepCountRe = regexp.MustCompile(`^(.+):\d+$`)
+
+// recordGrepReads stamps the read tracker with every file a successful grep
+// call surfaced, so a grep-then-edit flow doesn't hit "File has not been read
+// yet" — the model HAS seen the lines it is about to edit. Recording also
+// pins the current mtime, so the "modified since read" guard still fires if
+// the file changes out-of-band afterwards.
+//
+// The parser mirrors recordTerminalReads' lightweight philosophy: it tries
+// each output line as a whole path (files_with_matches mode), as "path:N:…"
+// or "path-N-…" (content mode), and as "path:N" (count mode), and records
+// whatever resolves to an existing regular file. Lines that aren't paths —
+// "(no matches)", "--" group separators, the truncation marker — simply fail
+// to stat and are skipped.
+func (r DefaultRegistry) recordGrepReads(ctx context.Context, input map[string]any, output string) {
+	base := WorkingDir(ctx)
+	record := func(candidate string) {
+		abs, err := resolvePathIn(base, candidate)
+		if err != nil {
+			return
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			r.tracker.RecordRead(abs)
+		}
+	}
+
+	// Single-file search: rg omits the path prefix from its output, so the
+	// only place the file appears is the input's own `path` argument. A
+	// zero-match grep returns "(no matches)" with a nil error — in that case
+	// the model saw nothing, so don't stamp (it would wrongly unlock a blind
+	// edit of a file the search didn't actually surface).
+	if p, _ := input["path"].(string); p != "" && output != "(no matches)" {
+		record(p)
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		record(line) // files_with_matches mode: the whole line is a path
+		if idx := sepDigitsSep.FindAllStringIndex(line, -1); idx != nil {
+			// Content/context mode. The line may hold multiple
+			// "separator+digits+separator" boundaries when the filename
+			// itself contains them — try every prefix so the longest one
+			// that resolves to a real file wins.
+			for _, pos := range idx {
+				record(line[:pos[0]])
+			}
+		} else if m := grepCountRe.FindStringSubmatch(line); m != nil {
+			record(m[1])
 		}
 	}
 }
