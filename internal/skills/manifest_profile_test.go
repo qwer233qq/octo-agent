@@ -41,7 +41,19 @@ func TestManifestForProfile_FiltersByToolSkills(t *testing.T) {
 	if len(allSkills) == 0 {
 		t.Fatal("expected skills")
 	}
-	target := allSkills[0].Name
+	// Pick the first non-system skill — a system skill (e.g. skill-creator)
+	// would be stripped from an expert agent's manifest and break the
+	// one-skill-count assertion below.
+	var target string
+	for _, s := range allSkills {
+		if !s.System {
+			target = s.Name
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("no non-system skill available")
+	}
 	profiled := ManifestForProfile(r, &agentprofile.Profile{
 		ID:          "test",
 		Description: "d",
@@ -80,15 +92,18 @@ func countSkillLines(manifest string) int {
 func TestManifestForProfile_EmptyToolSkillsReturnsAll(t *testing.T) {
 	r := discoverWithDefaults(t)
 	full := RenderManifest(r)
-	profiled := ManifestForProfile(r, &agentprofile.Profile{
+	// Default agent sees the full manifest including system skills.
+	profiled := ManifestForProfile(r, agentprofile.DefaultProfile())
+	if full != profiled {
+		t.Fatalf("empty ToolSkills should return full manifest for default agent")
+	}
+	// Non-default agent with empty ToolSkills gets manifest minus system skills.
+	expertProfiled := ManifestForProfile(r, &agentprofile.Profile{
 		ID:          "test",
 		Description: "d",
-		CapabilitySpec: agentprofile.CapabilitySpec{
-			ToolSkills: []string{},
-		},
 	})
-	if full != profiled {
-		t.Fatalf("empty ToolSkills should return full manifest")
+	if expertProfiled == full {
+		t.Fatalf("non-default agent with empty ToolSkills should strip system skills")
 	}
 }
 
