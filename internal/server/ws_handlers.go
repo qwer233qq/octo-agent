@@ -451,19 +451,21 @@ func (s *Server) replayLiveState(sessionID string, conn *wsConn) {
 		}
 	}
 
-	// Replay an outstanding interactive prompt. Its original broadcast only
-	// reached the tabs connected at the time; without this, a page refresh
-	// during ask_user_question / a permission confirmation leaves the new tab
-	// stuck on a spinner with no way to answer.
+	// Replay any outstanding interactive prompt. The original broadcast now goes
+	// to all clients globally, but a client that (re)connects or subscribes
+	// after the ask still needs the pending question(s) replayed — otherwise a
+	// page refresh or a mobile app launched mid-ask would show no prompt.
+	// Replay ALL pending questions (not just this session's): with global
+	// broadcast, the question can originate from any session, and this client
+	// must surface every one the user can answer.
 	s.pendingPromptMu.Lock()
-	pendingQ, hasQ := s.pendingQuestions[sessionID]
-	pendingC, hasC := s.pendingConfirms[sessionID]
-	s.pendingPromptMu.Unlock()
-	if hasQ {
+	for _, pendingQ := range s.pendingQuestions {
 		if b, err := json.Marshal(pendingQ); err == nil {
 			conn.send <- b
 		}
 	}
+	pendingC, hasC := s.pendingConfirms[sessionID]
+	s.pendingPromptMu.Unlock()
 	if hasC {
 		if b, err := json.Marshal(pendingC); err == nil {
 			conn.send <- b
@@ -957,8 +959,9 @@ func (s *Server) handleWSRunTask(conn *wsConn, sessionID string) {
 }
 
 // handleWSConfirmation delivers a confirmation answer from one client and
-// broadcasts a completion event so every other subscribed client can close
-// its modal for the same confirmation.
+// broadcasts a completion event globally so every connected client can close
+// its modal for the same confirmation — not just subscribers of the session,
+// mirroring request_user_question/reach.
 func (s *Server) handleWSConfirmation(confID, result string) {
 	s.confirmMu.Lock()
 	if ch, ok := s.confirmations[confID]; ok {
@@ -970,7 +973,11 @@ func (s *Server) handleWSConfirmation(confID, result string) {
 	defer s.pendingPromptMu.Unlock()
 	for sessionID, pending := range s.pendingConfirms {
 		if pending.ConfID == confID {
-			s.wsHub.broadcast(sessionID, wsEventConfirmationComplete{
+			// Global broadcast (not session-scoped) so every connected client —
+			// desktop or mobile, any session — closes its modal. Mirrors
+			// dismiss_user_question: a session-scoped broadcast would leave other
+			// clients showing a dead modal.
+			s.wsHub.broadcast("", wsEventConfirmationComplete{
 				Type:      "confirmation_complete",
 				SessionID: sessionID,
 				ConfID:    confID,
@@ -2171,7 +2178,18 @@ func (s *Server) requestConfirmation(ctx context.Context, sessionID, message, ki
 		})
 	}
 
-	s.wsHub.broadcast(sessionID, ev)
+	// dismiss both closes the modal on every tab (not just the one that
+	// answered — without this, a tab that didn't answer keeps showing a dead
+	// modal) and is called on ctx cancellation to prevent orphaned modals.
+	dismiss := func() {
+		s.wsHub.broadcast("", wsEventDismissConfirmation{
+			Type:      "dismiss_confirmation",
+			SessionID: sessionID,
+			ConfID:    confID,
+		})
+	}
+
+	s.wsHub.broadcast("", ev)
 	// Cross-session signal (mirrors question_pending) so a client not subscribed
 	// to this session — the mobile feed — can still surface a needs-approval card.
 	s.wsHub.broadcast("", wsEventSessionActivity{
@@ -2194,6 +2212,7 @@ func (s *Server) requestConfirmation(ctx context.Context, sessionID, message, ki
 		return result, nil
 	case <-ctx.Done():
 		cleanup()
+		dismiss()
 		return "", fmt.Errorf("confirmation cancelled")
 	}
 }
