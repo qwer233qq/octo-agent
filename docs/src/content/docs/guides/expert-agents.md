@@ -18,7 +18,7 @@ octo chat --agent code-review "review the diff"
 ```
 
 The Web UI also has an **Agents** panel (`/agents`) where you can create, edit,
-and delete expert agents — plus bind them to IM channels.
+and delete expert agents — plus assign them to IM channels.
 
 ## Creating an agent
 
@@ -78,23 +78,11 @@ Each session in the sidebar is tagged with its agent name.
 ### IM channels
 
 Assign an expert agent to an IM channel through the agent's settings in the
-Web UI. Once assigned, messages from that channel route directly to the agent —
-no `@mention` needed.
+Web UI. Once assigned, all messages from that channel route directly to the
+agent — no `/bind` or `@mention` needed.
 
-To set up multiple bots in the same group (e.g. `@code-review-bot`,
-`@ops-bot`, `@docs-bot` each with a different expert agent), use the
-`channel-manager` skill:
-
-> Set up three Feishu bots for my dev group — one for code review, one for
-> ops, one for docs.
-
-The Default Agent walks you through platform console setup, credentials, and
-agent assignment. Each bot gets its own entry in `channels.yml`, and each is
-bound to the profile you pick.
-
-A group chat with multiple bound agents and no clear routing target stays
-silent — assign at most one agent per bot, or keep the Default Agent for
-general use.
+The Default Agent can also be used in IM: just don't assign a channel to
+any expert agent, and messages will route to Default.
 
 ### CLI
 
@@ -138,7 +126,7 @@ runtime:
 Each agent has its own session pool, separated by an `<agentID>#` prefix on the
 session key. This means:
 
-- A chat bound to `code-review` has its own history, `/bind`, `/list`, and `/stop`
+- A chat routed to `code-review` has its own history, `/bind`, `/list`, and `/stop`
   — independent of the Default Agent's sessions in the same chat.
 - Existing sessions are never migrated; they stay with whichever agent created
   them.
@@ -174,5 +162,5 @@ Cron tasks are owned by the agent that created them. In the Web UI's Tasks panel
   that only reviews code doesn't need `terminal` or `write_file`.
 - **Give it exactly one or two skills**: the skill description is the model's
   trigger cue — don't drown the signal.
-- **Test with a one-shot**: before binding an agent to a channel, try `octo
+- **Test with a one-shot**: before assigning an agent to a channel, try `octo
   --agent new-agent -p "test prompt"` to see how it responds.
