@@ -34,13 +34,15 @@
 | 术语 | 含义 |
 |------|------|
 | **Agent Profile** | 描述一个 expert agent 完整配置的声明式对象，包含 ID、名称、描述、系统提示词、模型、工具白名单、mention 别名、频道绑定 |
-| **Default Agent** | 代码内建的顶级 agent，system prompt 由代码 base prompt + onboard 注入的 `~/.octo/soul.md` 和 `~/.octo/user.md` 构成，**不可通过 profile 编辑器修改**。拥有所有 skill/MCP 的定义权。没有对应的 JSON 文件 |
+| **Default Agent** | 代码内建的顶级 agent，system prompt 由代码 base prompt + onboard 注入的 `~/.octo/soul.md` 和 `~/.octo/user.md` 构成，**不可通过 profile 编辑器修改**。拥有所有 skill/MCP 的定义权。没有对应的 .md 文件 |
 | **Expert Agent** | 用户在 Default Agent 视图下创建的 Agent Profile，只能从 Default Agent 已有的资源池中启用/禁用，不能新增 |
 | **sub_agent** | 工具名。所有 agent 都可通过此工具在会话内部调度匿名子 agent 执行隔离任务。子 agent 的生命周期、上下文、工具集完全独立，运行结束后结果回传给主 agent |
-| **Profile Store** | `~/.octo/agents/` 目录，每个 expert agent 一个 `<id>.json` 文件 |
+| **Profile Store** | 统一加载三来源：`~/.octo/agents/*.md`（用户级，双模式）、`<repo>/.octo/agents/*.md`（项目级，仅委派）、内建 profile；每个 expert agent 一个 `<id>.md` 文件（Markdown + frontmatter） |
 | **Agent Router** | 根据 InboundEvent（平台、chatID、消息内容中的 @ 提及）决定消息路由到哪个 agent profile |
-| **Session Key** | `platform:chat_id:user_id`（私聊时）或 `platform:chat_id`（群聊时），标识一个 session pool 中的唯一会话 |
+| **Session Key** | `platform:chat_id[:user_id]`；expert agent 加 `agentID#` 前缀形成命名空间（如 `a3f9b2c1#weixin:c1:u1`）。default agent 保持 legacy 格式字节级不变 |
 | **Agent 绑定** | 会话创建时绑定 agent，一旦建立不可切换；通过新建会话选择其他 agent |
+| **能力片（CapabilitySpec）** | Profile 中 prompt/model/tools/skills 四元组，是对话模式和委派模式共享的能力定义 |
+| **委派模式** | `sub_agent` 以某 profile 的能力片发起的 ephemeral run：全新上下文、不进 session pool、任务结束即弃；profile 的平台片（别名/绑定/cron）被忽略 |
 
 ---
 
@@ -52,67 +54,39 @@
                          InboundEvent (IM 消息)
                               │
                     ┌─────────▼─────────┐
-                    │    AgentRouter     │
-                    │  (profile 选择器)   │
-                    └─────────┬─────────┘
-                              │ 路由决策：
-                              │ 1. 频道绑定（最高优先）
-                              │ 2. @ 提及
-                              │ 3. fallback → Default Agent
-            ┌─────────────────┼─────────────────┐
-            ▼                 ▼                 ▼
-   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-   │ Manager[def] │  │ Manager[code]│  │ Manager[ops] │
-   │ Default      │  │ code-review  │  │ ops-helper   │
-   │ 独立 session  │  │ 独立 session  │  │ 独立 session  │
-   │ pool         │  │ pool         │  │ pool         │
-   └──────────────┘  └──────────────┘  └──────────────┘
-            │                 │                 │
-            ▼                 ▼                 ▼
-      Agent(Default)    Agent(code)       Agent(ops)
+                    │    AgentRouter     │   纯函数：ev → profile
+                    └─────────┬─────────┘   1. @ 提及  2. 频道绑定  3. fallback default
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │   channel.Manager（单一实例）   │
+              │                               │
+              │  sessions sync.Map:           │
+              │   "weixin:c1:u1"        → default 的 session（legacy key，不变）
+              │   "a3f9b2c1#weixin:c1:u1" → code-review 的 session
+              │   "b7e2d408#weixin:c1:u1" → ops-helper 的 session
+              │                               │
+              │  隔离 = key 命名空间，不堆 Manager │
+              └───────────────────────────────┘
+                              │
+                              ▼
+              per-turn 按 session.AgentID 查 Store 取 profile
+              → system prompt / model / 工具白名单 / skill manifest
 ```
 
 ### 改造后的 Server 结构
 
-`internal/server/server.go` 的 `Server` 结构需要从单一 `channelMgr` 扩展为一组 manager：
+`internal/server/server.go` 的 `Server` **保留单一 `channelMgr`**，只新增 Store 与 Router 两个字段：
 
 ```go
 type Server struct {
     // ─── 多 agent 核心 ───
-    // channelMgr 已完全移除，由 multiMgr 统一派发所有 IM 事件
     agentStore   *agentprofile.Store          // ~/.octo/agents/ 的加载与热管理
-    multiMgr     *channel.MultiManager        // 替代 channelMgr，内持多个 per-agent Manager
-    defaultMgr   *channel.Manager             // Default Agent 的 Manager（快捷引用，冗余但省去每次 map 查找）
-```
+    agentRouter  *agentprofile.Router         // InboundEvent → profile（纯计算）
+    // channelMgr 保留：单 Manager，session 隔离由 key 的 agent 命名空间派生
+    // （见详细设计第 3 节）
 
-### IM 事件流
-
-废弃 `Server.channelMgr` 后，`multiMgr` 成为 IM 事件的唯一分派点：
-
-```
-Channel Adapter (IM 消息)
-    │
-    ▼
-Server.handleChannelMessage(ev)         ← 入口不变，body 改造
-    │
-    ▼
-mgr := multiMgr.Resolve(ev)             ← 路由决策：拿到正确的 per-agent Manager
-if mgr == nil {
-    // 群聊多绑定无 @：drop，不路由到任何 agent
-    return
-}
-    │
-    ▼
-mgr.GetOrCreateSession(ev) & run turn    ← 跟原有单 Manager 路径一致，但隔离到目标 agent 的 pool
-```
-
-**Resolve 返回 nil 的 drop 逻辑**：当群聊绑定多个 agent 但消息无 @ 时，`Router.Route()` 返回 nil，`Resolve` 透传返回 nil，handler 直接 return 不响应。
-
-**迁移期无并存**：没有 `channelMgr` / `multiMgr` 双轨。`initChannels()` 改为 `initMultiManager()`，一次切干净。
-
-**adapter 注入改造**：每个 channel adapter 启动时的回调从 `func(ev)` 改为内部直接调 `multiMgr.Resolve`。由于 Resolve 是纯计算（路由查找 + map 读取），adapter 不需要感知 agent 数量。
-
-    // ─── 以下字段基本不变 ───
+    // ─── 以下字段不变 ───
     cfg          Config
     sender       agent.Sender
     model        string
@@ -123,35 +97,31 @@ mgr.GetOrCreateSession(ev) & run turn    ← 跟原有单 Manager 路径一致�
 }
 ```
 
-`MultiManager` 负责：
-- 按 agent ID 持有各自的 `*channel.Manager`
-- 路由 InboundEvent 到对应 manager 的 session pool
-- 提供按 agent 维度列出/管理 session 的方法
+### IM 事件流
 
-```go
-// internal/channel/multi_manager.go
-type MultiManager struct {
-    mu       sync.RWMutex
-    managers map[string]*Manager  // agentID → Manager
-    router   *AgentRouter
-    store    *agentprofile.Store
-}
-
-// Resolve 根据 InboundEvent 找到应处理的 Manager。
-// profile 为 nil 时（群聊多绑定无 @）返回 nil，caller 应 drop 该消息。
-func (mm *MultiManager) Resolve(ev InboundEvent) *Manager {
-    profile := mm.router.Route(ev)
-    if profile == nil {
-        return nil
-    }
-    mm.mu.RLock()
-    defer mm.mu.RUnlock()
-    return mm.managers[profile.ID]
-}
-
-// Default 返回 Default Agent 的 Manager（始终存在）
-func (mm *MultiManager) Default() *Manager
 ```
+Channel Adapter (IM 消息)
+    │
+    ▼
+Server.handleChannelMessage(ev)              ← 入口不变，body 加一步路由
+    │
+    ▼
+profile := agentRouter.Route(ev)             ← 纯函数路由决策
+if profile == nil {
+    // 群聊多绑定无 @：drop，不路由到任何 agent
+    return
+}
+    │
+    ├─ slash 命令 → channelMgr.CommandRouter(ev, profile.ID)
+    │                （作用于路由到的 agent 的 key 命名空间）
+    │
+    └─ 普通消息  → channelMgr.GetOrCreateSession(ev, profile) & run turn
+                    （同 chat 不同 agent 各自独立 session，由 key 前缀区分）
+```
+
+**Route 返回 nil 的 drop 逻辑**：当群聊绑定多个 agent 但消息无 @ 时，`Router.Route()` 返回 nil，handler 直接 return 不响应（与"群聊未 @ 完全静默"的决策一致）。
+
+**adapter 无改造**：adapter 回调签名不变，路由发生在 `handleChannelMessage` 内部，adapter 不感知 agent 数量。
 
 ---
 
@@ -161,25 +131,30 @@ func (mm *MultiManager) Default() *Manager
 
 #### 1.1 文件存储格式
 
-Profile 存储在 `~/.octo/agents/<profile-id>.json`，每个文件一个 profile：
+Profile 存储为 **Markdown + YAML frontmatter**（与 octo 已有的用户 agent 定义格式一致，对齐 `.claude/agents` 惯例）：
 
-```json
-{
-  "id": "code-review",
-  "name": "代码审查专家",
-  "description": "专责 review PR、发现 bug、建议改进",
-  "model": "claude-sonnet-4-20250514",
-  "system_prompt": "你是代码审查专家。当用户发来 PR 链接或代码变更时...",
-  "tools": ["read_file", "write_file", "edit_file", "grep", "glob", "terminal", "code-review"],
-  "tool_skills": ["code-review"],
-  "mention_as": ["@review", "@CR"],
-  "channel_bindings": [
-    {"platform": "weixin", "chat_id": "dev-group-xxx"}
-  ],
-  "created_at": "2026-07-15T10:00:00Z",
-  "updated_at": "2026-07-15T10:00:00Z"
-}
+- 用户级：`~/.octo/agents/<id>.md` —— 对话模式 + 委派模式双可用
+- 项目级：`<repo>/.octo/agents/<id>.md` —— **仅委派模式**（sub_agent）；平台片（别名/绑定）只认用户级，项目文件不能抢 IM 路由
+
+`id` 即文件名（去 `.md`），人类可读 slug。frontmatter 承载元数据，**正文即 system prompt**：
+
+```markdown
+---
+name: 代码审查专家
+description: 专责 review PR、发现 bug、建议改进
+model: claude-sonnet-4-20250514
+tools: [read_file, write_file, edit_file, grep, glob, terminal, code-review]
+tool_skills: [code-review]
+mention_as: ["@review", "@CR"]
+channel_bindings:
+  - {platform: weixin, chat_id: dev-group-xxx}
+---
+你是代码审查专家。当用户发来 PR 链接或代码变更时...
 ```
+
+> REST API 传输层仍用 JSON；Store 负责 JSON ↔ .md 的序列化。
+
+**为什么不用 JSON**（2026-07-25 决策）：仓库已有用户 agent 定义机制，同样加载 `~/.octo/agents/*.md`（`internal/tools/agents.go`）。采用 .md 后，新旧定义共享同一存储格式和 loader，"定义层统一"零迁移落地——现有 .md 文件自动成为 profile 的能力片；且 system prompt 以正文书写，比 JSON 转义字符串易写易读。
 
 #### 1.2 Go 结构
 
@@ -187,67 +162,86 @@ Profile 存储在 `~/.octo/agents/<profile-id>.json`，每个文件一个 profil
 // internal/agentprofile/profile.go
 package agentprofile
 
+// CapabilitySpec 是 profile 的"能力片"：prompt / model / tools / skills。
+// 它被两种运行模式共享：
+//   - 对话模式：channel.Manager 持久 session（用户直接对话）
+//   - 委派模式：sub_agent 发起的 ephemeral run（见 "sub_agent 委派模式" 一节）
+type CapabilitySpec struct {
+    Model        string   // frontmatter model；空 = 继承
+    SystemPrompt string   // .md 正文（不经 frontmatter）
+    Tools        []string // frontmatter tools
+    ToolSkills   []string // frontmatter tool_skills，这些 skill 以工具形式暴露
+}
+
+// Source 标记 profile 来源，决定可用模式与覆盖优先级。
+type Source string
+
+const (
+    SourceBuiltin Source = "builtin" // 代码内建（default / explore / general / code-review）
+    SourceUser    Source = "user"    // ~/.octo/agents/*.md，对话+委派双模式
+    SourceProject Source = "project" // <repo>/.octo/agents/*.md，仅委派模式
+)
+
 type Profile struct {
-    ID             string           `json:"id"`
-    Name           string           `json:"name"`
-    Description    string           `json:"description"`
-    Model          string           `json:"model"`
-    SystemPrompt   string           `json:"system_prompt"`
-    Tools          []string         `json:"tools"`
-    ToolSkills     []string         `json:"tool_skills"`  // 这些 skill 以工具形式暴露
-    WorkingDir     string           `json:"working_dir,omitempty"`
-    MentionAs      []string         `json:"mention_as"`
-    ChannelBindings []ChannelBinding `json:"channel_bindings"`
-    CreatedAt      time.Time        `json:"created_at"`
-    UpdatedAt      time.Time        `json:"updated_at"`
+    ID              string           // 文件名 slug（去 .md）；内建 profile 用固定名
+    Name            string           // frontmatter name
+    Description     string           // frontmatter description（必填）
+    CapabilitySpec                   // 能力片（见上）
+    WorkingDir      string           // frontmatter working_dir
+    MentionAs       []string         // frontmatter mention_as（仅 user 级生效）
+    ChannelBindings []ChannelBinding // frontmatter channel_bindings（仅 user 级生效）
+    Source          Source
+    CreatedAt       time.Time
+    UpdatedAt       time.Time
 }
 
 type ChannelBinding struct {
-    Platform string `json:"platform"`
-    ChatID   string `json:"chat_id"`
+    Platform string
+    ChatID   string
 }
 
 // IsDefault 判断该 profile 是否为 Default Agent
-// Default Agent 没有 JSON 文件，是代码内建的
+// Default Agent 没有 .md 文件，是代码内建的
 func (p *Profile) IsDefault() bool { return p.ID == "default" }
 ```
 
 #### 1.3 Profile Store
 
-Store 负责从 `~/.octo/agents/` 加载所有 profile，提供增删改查 API，并支持热加载。
+Store 统一加载三个来源的 profile，**取代现有 `internal/tools/agents.go` 的 `discoverAgents()`**（sub_agent 的 profile 查找改由 Store 提供）：
+
+- 用户级 `~/.octo/agents/*.md`（对话 + 委派双模式）
+- 项目级 `<repo>/.octo/agents/*.md`（仅委派模式；同名覆盖用户级，对齐现有 `.claude/agents` 语义）
+- 内建 profile（代码定义：default / explore / general / code-review）
 
 ```go
 // internal/agentprofile/store.go
+// Store 是 read-through 的：每次读操作实时扫描目录，无内存缓存、无
+// fsnotify。任何路径的变更（API / Web UI / 直接编辑 .md）下一次读取即生效。
 type Store struct {
-    mu       sync.RWMutex
-    dir      string           // ~/.octo/agents/
-    profiles map[string]*Profile
-    watcher  *fsnotify.Watcher // 监听文件变更
+    dir string // ~/.octo/agents/
 }
 
 func New(dir string) (*Store, error)
-func (s *Store) Load() error                    // 全量加载
+func (s *Store) Load() error                    // 全量加载（用户级 + 项目级 + 内建）
 func (s *Store) Get(id string) (*Profile, bool)
-func (s *Store) List() []*Profile               // 返回所有 profile（不含 Default Agent）
-func (s *Store) Create(p *Profile) error
+func (s *Store) List() []*Profile               // 返回所有 profile（不含内建）
+func (s *Store) Create(p *Profile) error        // 序列化为 .md 写入用户级目录
 func (s *Store) Update(p *Profile) error
 func (s *Store) Delete(id string) error
-func (s *Store) Watch(ctx context.Context)     // fsnotify 热加载循环
-func (s *Store) ByChannel(platform, chatID string) []*Profile  // 按频道绑定索引
-func (s *Store) ByMention(alias string) (*Profile, bool)       // 按 @ 别名索引
+func (s *Store) ByChannel(platform, chatID string) []*Profile  // 按频道绑定索引（仅 user 级）
+func (s *Store) ByMention(alias string) (*Profile, bool)       // 按 @ 别名索引（仅 user 级）
 ```
 
 **创建规则**：
-- ID 由 Web UI 或 `octo agents create` 生成，格式为 8 位随机小写字母（与 session ID 短格式一致）
-- `id` 字段 immutable，创建后不可改
-- 所有字段在 `Create`/`Update` 时做非空校验
+- ID = 文件名 slug：`[a-z0-9][a-z0-9-]*`，1-32 字符，创建时指定（Web UI / 元技能可从 name 生成建议值）
+- `id` 字段 immutable，创建后不可改（"重命名" = 新建 + 删除）
+- `description` 必填（与现有解析规则一致）；其余字段在 `Create`/`Update` 时做非空校验
 - `model` 必须在 `~/.octo/config.yml` 的 `models` 列表中
 
-**热加载**：
-- `Watch()` 监听 `~/.octo/agents/` 目录的 `CREATE` / `WRITE` / `REMOVE` 事件
-- 文件改动后：`Load()` 全量重读（文件量小，O(N) 可接受）
-- 触发 `MultiManager` 重载（重建受影响的 per-agent Manager）
-- API 路径 `POST /api/agents/:id/reload` 提供手动触发入口
+**热加载**（2026-07-25 修正 Q5：read-through，无缓存、无 fsnotify、无 reload API）：
+- Store 每次读操作实时扫描目录——任何路径的变更（REST API、Web UI、直接编辑 .md）**下一次读取即生效**，无需重启
+- 与现有 agent 加载机制（`discoverAgents` 每次 lookup 全扫，`internal/tools/agents.go`）语义一致，已有 .md 用户无行为回退
+- 目录文件量小（几十个小文件），扫描成本可忽略——现状即如此运行
 
 ### 2. Agent Router
 
@@ -260,7 +254,7 @@ type Router struct {
 }
 
 // Route 返回应处理该消息的 agent profile
-// 返回 *Profile（总不为 nil：fallback 到 Default Agent）
+// 可能返回 nil：群聊绑定多个 agent 且消息无 @ 时返回 nil，caller 应 drop 该消息
 func (r *Router) Route(ev InboundEvent) *Profile {
     // 1. 检查 @ 提及（群聊场景）
     if mentioned := extractMentionAlias(ev.Text); mentioned != "" {
@@ -298,54 +292,74 @@ func (r *Router) Route(ev InboundEvent) *Profile {
 | 群聊（绑定 code + ops） | 无 @ | 有（多） | **静默**（drop） |
 | 群聊（无绑定） | — | 无 | **Default Agent** |
 
-**注意**：AgentRouter 返回 nil 时，MultiManager 应 drop 该消息（不路由到任何 agent），这与"群聊未 @ 完全静默"的决策一致。
+**注意**：AgentRouter 返回 nil 时，handler 直接 drop 该消息（不路由到任何 agent），这与"群聊未 @ 完全静默"的决策一致。
 
-### 3. Multi-Manager Session Pool
+### 3. 单 Manager Session Pool：key 内嵌 agent 命名空间
 
-每个 agent profile 拥有独立的 `*channel.Manager`，即独立的 `sync.Map[SessionKey, *Session]`。
+**不引入 MultiManager**。保留单一 `*channel.Manager`，把 agentID 编码进 SessionKey 字符串，session 隔离由 key 命名空间派生：
 
+```go
+// 默认 agent：legacy key，字节级不变（向后兼容的根基）
+sessionKeyFor(mode, ev, "default")  = "weixin:chat123:user456"
+
+// expert agent：加命名空间前缀（'#' 不会出现在 platform 名或 agent id 中，无解析歧义）
+sessionKeyFor(mode, ev, "a3f9b2c1") = "a3f9b2c1#weixin:chat123:user456"
 ```
-Channel.MultiManager
-├── managers["default"]  → *channel.Manager (Default Agent)
-├── managers["code"]     → *channel.Manager (code-review)
-└── managers["ops"]      → *channel.Manager (ops-helper)
-```
 
-**Session Key** 生成规则不变（`channel.sessionKeyFor(mode, ev)` = `platform:chat_id[:user_id]`），但 manager 按 agent ID 隔离，不同 agent 可以有相同 Session Key 的不同 session。
+这一处设计连锁解决四个问题：
+
+| 问题 | 消解方式 |
+|------|----------|
+| 内存 session map 冲突 | 复合 key 天然不撞，`sync.Map` 结构不动 |
+| 磁盘 store 文件冲突 | `sessionStoreID(key)` 对复合 key 做 FNV → 每 agent 独立文件；default 保持旧 key → **存量 session 文件 ID 不变，零迁移** |
+| `/bind` 重定向表隔离 | `bindings` 按复合 key 索引，per-agent 命名空间自动成立 |
+| profile 热更新 | 无 Manager 重建；per-turn 经 `session.AgentID` 查 Store 取 profile，下一 turn 自然生效 |
+
+> 注：per-agent Manager 方案（本节的旧设计）即使隔离了内存 map，两个 agent 服务同一 chat 时 `sessionStoreID(key)` 仍会派生出**同一个磁盘文件**——磁盘层冲突只能靠 key 命名空间解决，这是本方案的关键论据。
 
 **关键行为**：
-- Session ID 本身已全局唯一（由 `agent.NewSession` 的时间戳 + 随机后缀保证），无需添加 agent 前缀
-- Session 文件保持现名 `~/.octo/sessions/<session_id>.jsonl`，仅按 manager 隔离 in-memory 引用
-- 首次加载时，所有已有 session 自动归属 Default Agent（session 文件名不带 agent 信息）
+- `Session` 结构新增 `AgentID` 字段（创建时写入）；session 文件头部 metadata 同步写 `agent_id`（见 10.2），二者是同一事实的两份表达
+- Session 文件保持现名 `~/.octo/sessions/<session_id>.jsonl`；default agent 的存量文件因 key 不变而完全兼容
+- 重启后 channel session 经 `resolveStoreID(复合 key)` 惰性恢复，自然回到正确 agent 的命名空间；session 列表按 `agent_id` 过滤（缺失归 default）
+- `/list` / `/bind` 只列当前路由 agent 的 session，跨 agent bind 拒绝（MVP 边界规则，避免 session 行为归属歧义）
+- `splitSessionKey` 先剥离可选的 `agentID#` 前缀，再按原规则解析
+
+**Manager 签名变化**（内部约 12 处 key 派生统一走新 `sessionKeyFor`；server 生产调用点仅 2 处——`handleChannelMessage` 路由后注入）：
+
+```go
+func (m *Manager) GetOrCreateSession(ev InboundEvent, profile *agentprofile.Profile) *Session
+func (m *Manager) CommandRouter(ev InboundEvent, agentID string) string
+
+// factory 按 profile 参数化（见第 4 节）
+type AgentFactory func(profile *agentprofile.Profile) *agent.Agent
+```
 
 ### 4. 改造 `buildChannelFactory`
 
 当前 `Server.buildChannelFactory()` 返回无参闭包。需要改为按 profile 参数化：
 
 ```go
-// 改造后：每个 Manager 在创建 session 时传入 profile
-func (s *Server) buildChannelFactoryFor(profile *agentprofile.Profile) func() *agent.Agent {
-    return func() *agent.Agent {
-        sender, model := s.senderForProfile(profile)
-        a := agent.New(sender, model)
-        a.MaxTokens = s.cfg.MaxTokens
+// 改造后：Manager 在创建 session 时传入路由到的 profile
+func (s *Server) buildChannelAgent(profile *agentprofile.Profile) *agent.Agent {
+    sender, model := s.senderForProfile(profile)
+    a := agent.New(sender, model)
+    a.MaxTokens = s.cfg.MaxTokens
 
-        // profile 覆盖默认 system prompt
-        if profile.SystemPrompt != "" {
-            a.System = profile.SystemPrompt
-        }
-
-        // profile 的 working_dir
-        if profile.WorkingDir != "" {
-            a.CWD = profile.WorkingDir  // 或设到 Session 上
-        }
-
-        return a
+    // profile 覆盖默认 system prompt
+    if profile.SystemPrompt != "" {
+        a.System = profile.SystemPrompt
     }
+
+    // profile 的 working_dir
+    if profile.WorkingDir != "" {
+        a.CWD = profile.WorkingDir
+    }
+
+    return a
 }
 ```
 
-`agent.Agent` 不需要大改。Profile 的 `Tools` 白名单在 per-turn 的 `tools.DefaultToolsForProfile(ctx, profile)` 处过滤，不在 factory 中处理。
+`agent.Agent` 不需要大改。Profile 的 `Tools` 白名单在 per-turn 的 `tools.DefaultToolsForProfile(ctx, profile)` 处过滤，不在 factory 中处理——profile 热更新因此下一 turn 即生效，无需重建任何 session 结构。
 
 ### 5. Agent 工具白名单注入
 
@@ -400,7 +414,7 @@ type Server struct {
     disabledMCPs   map[string][]string // agentID → 在该 agent 中禁用的 MCP 名称列表
 
     // 每个 agent 独立的 per-turn 状态（已有，按 session 隔离）
-    // turnLocks, sessionAgents 等保持不变，因为不同 manager 的 session key 已是隔离的
+    // turnLocks, sessionAgents 等保持不变，因为 session key 已含 agent 命名空间
 }
 ```
 
@@ -639,8 +653,8 @@ Default Agent 收到消息，匹配到 expert-agent-manager skill
   ├─ 2. 缺失字段走引导式问答：
   │      "给它起个什么名字？" → "用什么模型？" → "要启用哪些技能？"
   ├─ 3. 校验输入（模型是否在 config 列表中、alias 是否全局唯一）
-  ├─ 4. 调用 Profile Store.Create() 写入 ~/.octo/agents/<id>.json
-  ├─ 5. 热加载事件触发 → MultiManager 重建
+  ├─ 4. 调用 Profile Store.Create() 写入 ~/.octo/agents/<id>.md
+  ├─ 5. 生效：Store read-through，下一次读取即用新配置
   └─ 6. 回复: "代码审查 Agent 已创建，ID: code-review-v1。你可以用 @review 在群里 @ 它。"
 ```
 
@@ -712,14 +726,13 @@ PUT    /api/agents/:id           — 更新 profile
 DELETE /api/agents/:id           — 删除 profile
 POST   /api/agents/:id/bind      — 绑定频道   body: {"platform": "weixin", "chat_id": "xxx"}
 DELETE /api/agents/:id/bind      — 解绑频道
-POST   /api/agents/:id/reload    — 热加载指定 profile
 ```
 
 #### 9.2 Agent Profile 校验规则
 
 - `name`：1-32 字符，同一 Store 内唯一
-- `id`：创建时由服务端生成（8 位随机小写），创建后 immutable
-- `system_prompt`：最大 10000 字符
+- `id`：文件名 slug（`[a-z0-9][a-z0-9-]*`，1-32 字符），创建后 immutable
+- `system_prompt`（.md 正文）：最大 10000 字符
 - `tools`：必须是 `skillReg` + `tools.DefaultRegistry` 中存在名的子集
 - `model`：必须在 `~/.octo/config.yml` 的 `models` 列表中
 - `mention_as`：每个 alias 必须以 `@` 开头，且全局唯一（同一 alias 不能被两个 profile 声明）
@@ -728,7 +741,7 @@ POST   /api/agents/:id/reload    — 热加载指定 profile
 
 #### 10.1 Default Agent Profile（无文件）
 
-Default Agent 没有 JSON 文件。代码中硬编码：
+Default Agent 没有 .md 文件。代码中硬编码：
 
 ```go
 func DefaultProfile() *Profile {
@@ -747,11 +760,40 @@ func DefaultProfile() *Profile {
 #### 10.2 已有 Session 归属
 
 服务器首次启动多 agent 改造后：
-- 所有已有 session 归属于 Default Agent（它们都用旧格式存储，不带 agent 前缀）
-- `~/.octo/sessions/` 中的文件直接划入 Default Agent 的 session pool
+- 所有已有 session 归属于 Default Agent（旧格式存储，metadata 中无 `agent_id` 字段，按"缺失即 default"处理）
+- `~/.octo/sessions/` 中的历史文件直接划入 Default Agent 的 session pool
 - 这导致 Default Agent 首次加载时 session 列表包含所有历史 session — 符合预期（用户视角无感）
+- 改造后新建的 session 均在头部 metadata 写入 `agent_id`，重启后仍归属正确的 agent
 
 **Cron 迁移**：现有 cron JSON 含 `"agent": "general"`（死代码字段）。加载时忽略旧 `agent` 字段，`agent_id` 默认设为 `"default"`。无需数据迁移，旧值被静默丢弃。
+
+---
+
+## sub_agent 委派模式：一套 Profile，两种消费方式
+
+### 背景
+
+octo 已有的用户 agent 定义机制（`~/.octo/agents/*.md`，供 `subagent_type` 选用）与本方案的 Expert Agent 在"能力定义"上同构——都是 prompt + model + tools 的组合。本方案不做两套概念：**统一称为 profile，一套 schema、一个 loader、两种运行模式**（对话 / 委派），运行层保持独立。
+
+> 术语约定：仓库中 "preset" 一词废弃。原"内置 preset"（explore / general / code-review）即**内建 profile**；原"用户 preset"（.md 文件）即**用户 profile**。对外参数 `subagent_type` 名称不变（向后兼容），语义为"profile id"。
+
+### 统一规则
+
+1. **Profile 是唯一的能力定义 schema**。能力片（`CapabilitySpec`：prompt/model/tools/skills）抽为独立结构，对话模式和委派模式共享；平台片（别名/频道绑定/session pool/cron 归属）仅对话模式使用
+2. **内建 profile 代码定义**。`explore` / `general` / `code-review`（外加 `default`）无 .md 文件，行为与现状完全一致，对用户透明
+3. **`subagent_type` 解析顺序与现状一致**：项目级 .md > 用户级 .md > 内建 profile（行为无回归）。参数名保持 `subagent_type` 不变（向后兼容），语义为"profile id"
+4. **现有用户 .md 零迁移**：`~/.octo/agents/*.md` 和 `<repo>/.octo/agents/*.md` 自动成为 profile 的能力片；项目级文件保持仅委派模式（平台片只认用户级）
+
+### 委派模式的约束（红线）
+
+- **ephemeral、全新上下文**：委派 run 不携带目标 profile 的任何 session 历史，用完即弃
+- **不进 session pool**：委派 run 由 SubAgentManager 管理，不出现在该 agent 的会话列表，不写入其 session pool
+- **只取能力片**：profile 的 `mention_as` / `channel_bindings` / cron 归属在委派模式下被忽略
+- **model 解析优先级**：`sub_agent(model:)` 显式参数 > profile.model > 继承父 agent model
+
+### 一致性提示
+
+用户修改 profile 会影响所有引用它的 workflow / 会话。expert-agent-manager 元技能在执行 Update/Delete 时提示引用情况（如"有 N 个 saved workflow 在引用此 profile"）。
 
 ---
 
@@ -768,7 +810,6 @@ func DefaultProfile() *Profile {
 | DELETE | `/api/agents/:id` | 删除 profile |
 | POST | `/api/agents/:id/bind` | 绑定频道 |
 | DELETE | `/api/agents/:id/bind` | 解绑频道 |
-| POST | `/api/agents/:id/reload` | 热加载 |
 
 ### Per-Agent 资源
 
@@ -803,10 +844,9 @@ func DefaultProfile() *Profile {
 
 | 文件 | 说明 |
 |------|------|
-| `internal/agentprofile/profile.go` | Profile 结构 + 校验 |
-| `internal/agentprofile/store.go` | Store（加载/保存/热加载/索引） |
+| `internal/agentprofile/profile.go` | Profile 结构 + .md frontmatter 解析/序列化 + 校验 |
+| `internal/agentprofile/store.go` | Store（三来源加载/保存/索引） |
 | `internal/agentprofile/router.go` | AgentRouter（按事件路由到 profile） |
-| `internal/channel/multi_manager.go` | MultiManager（per-agent Manager 容器） |
 | `web/src/views/AgentsView.svelte` | Agent 管理主面板 |
 | `web/src/views/AgentEditView.svelte` | Agent 编辑表单 |
 | `web/src/components/agents/AgentList.svelte` | 下拉 agent 列表 |
@@ -816,11 +856,14 @@ func DefaultProfile() *Profile {
 
 | 文件 | 改动 |
 |------|------|
-| `internal/server/server.go` | `Server` 增加 `agentStore`、`multiMgr`；`initChannels()` 改为 `initMultiManager()` |
+| `internal/server/server.go` | `Server` 增加 `agentStore`、`agentRouter`；`handleChannelMessage` 加路由步骤 |
 | `internal/server/server.go` | `buildChannelFactory()` 改为按 profile 创建 |
 | `internal/server/handlers.go` | 新增 agents handlers（CRUD + 资源子路由） |
-| `internal/channel/manager.go` | 接受 profile 参数注入 system prompt / model |
+| `internal/channel/manager.go` | `sessionKeyFor` 加 agent 命名空间；`GetOrCreateSession`/`CommandRouter` 加 agent 维度；`Session` 新增 `AgentID` 字段；`splitSessionKey` 剥离前缀 |
+| `internal/agent/`（session 序列化处） | session metadata 新增 `agent_id` 字段；读取时缺失归 default |
 | `internal/tools/registry.go` | `DefaultToolsForProfile()` — 按 profile 过滤工具 |
+| `internal/tools/`（sub_agent 工具定义处） | `subagent_type` 解析改走 Store（profile id）；委派模式只取 CapabilitySpec |
+| `internal/tools/agents.go` | `discoverAgents` 合并进 `agentprofile.Store`（删除或改为委托调用） |
 | `internal/skills/skills.go` | `ManifestForProfile()` — 按 profile 过滤 skill manifest；系统级 skill frontmatter 标记 `system: true` 后对 expert agent 隐藏；browser-recorded skill 在 profile 不含 browser 工具时隐藏 |
 | `internal/scheduler/` 或 task 存储 | cron task 新增 `agent_id` 字段；`GET /api/cron` 支持 `?agent_id=` 过滤；新增 `PUT /api/cron/:id/transfer` |
 | `internal/server/server.go` | `Server.Config`（server.go:56）新增 `agentName` 字段（仅客户端路径 `octo`/`octo-desktop` 设置；`octo serve` 不接受此 flag，由 session 绑定 agent） |
@@ -844,14 +887,14 @@ func DefaultProfile() *Profile {
 
 1. `store.go`：CRUD、热加载事件、并发安全
 2. `router.go`：各种路由场景（绑定冲突、@ 别名、私聊、群聊）
-3. `multi_manager.go`：不同 manager 的 session 隔离
+3. manager 复合 key：同 chat 不同 agent 的 session 隔离、store 文件 ID 不冲突、default agent key 与改造前字节级一致
 4. tools/skills 过滤逻辑
 
 ### 集成测试
 
 1. 创建 profile → assign → 重启 → 热加载 → 删除，全流程
 2. Default Agent 的 skill/MCP 定义新增后，expert agent 立即可见（在启用列表中）
-3. 热加载后新配置生效（无需重启）
+3. 任何路径的变更（CRUD API / 直接编辑 .md）下一次读取即生效，无需重启（read-through，与现有加载机制语义一致）
 4. Default Agent 的 system prompt 不可通过 profile 编辑器修改（只读显示"由 onboard 管理"）
 5. IM 频道绑定：发消息到绑定群 → 只有被绑 agent 响应；@ 提及 → 被 @ agent 响应
 6. `octo chat --agent code-review` 正常启动
@@ -867,7 +910,7 @@ func DefaultProfile() *Profile {
 
 ## 安全
 
-1. **Agent Profile 文件写入限制**：Profile JSON 只能写入 `~/.octo/agents/` 目录，路径校验拒绝 `..` 和绝对路径（与 `session.resolveSessionPath` 同策略）
+1. **Agent Profile 文件写入限制**：Profile 文件只能写入 `~/.octo/agents/` 目录，slug 与路径校验拒绝 `..` 和绝对路径（与 `session.resolveSessionPath` 同策略）
 2. **Tools 白名单**：Expert Agent 不能通过 API 添加 Default Agent 未声明的工具；`PUT /api/agents/:id` 中 `tools` 字段必须在 `tools.DefaultRegistry` 和 `skillReg` 名单位有交集
 3. **Mention Alias 全局唯一**：创建/更新时校验 alias 不与其他 profile 冲突（防"身份冒充"）
 4. **删除保护**：有频道绑定或有活跃 session 的 profile 删除时返回错误，需先解绑/关闭 session
@@ -876,10 +919,10 @@ func DefaultProfile() *Profile {
 
 ## 高可用
 
-1. **Profile 热加载失败**：文件写入过程中读取到半写状态 → 跳过本次变更，保留旧 profile 并打印警告日志（不崩溃）
-2. **Profile 文件损坏（JSON 解析失败）**：跳过该文件，其他 profile 正常加载
+1. **读取到半写状态的 profile 文件**：frontmatter 解析失败 → 跳过该文件并打印警告日志，下一次读取自愈（不崩溃、无脏缓存）
+2. **Profile 文件损坏（frontmatter 解析失败）**：跳过该文件，其他 profile 正常加载
 3. **Default Agent 不可用时**：Default Agent 是代码内建的，不会"不可用"。agentStore 为空时 fallback 到 Default Agent（向后兼容）
-4. **MultiManager 部分 agent 启动失败**：隔离故障 — 单个 Manager 启动失败不影响其他 Manager（与现在单 Manager 启动失败导致 channel 全挂不同，这次是 per-agent 隔离的）
+4. **单个 profile 损坏或启动时缺失**：加载跳过该文件，路由 fallback 到 Default Agent（向后兼容）；单 Manager 架构下不存在 per-agent 启动失败面
 
 ---
 
@@ -896,24 +939,30 @@ func DefaultProfile() *Profile {
 
 ---
 
-## 发布顺序
+## 发布顺序（PR 切片）
 
-按依赖链从底向上：
+贯穿全程的不变量：**无 profile 文件时行为与改造前完全一致**——每个 PR 的验收都包含这条，主干随时可发。
 
-1. **`internal/agentprofile/`** — Profile / Store / Router 包（纯新代码，无依赖）
-2. **`internal/channel/` — MultiManager** — 引用 agentprofile
-3. **`internal/server/server.go`** — 重构 initChannels → initMultiManager，替换 channelMgr 为 multiMgr
-4. **`internal/tools/registry.go` + `internal/skills/skills.go`** — 过滤函数
-5. **Web UI** — AgentViews + 改造 Header/Skills/Mcp/Chat
-6. **`cmd/octo/`** — `--agent` flag + `/agent` 命令
-7. **测试 + 文档**
+| PR | 内容 | 验收重点 |
+|----|------|----------|
+| 1 | `internal/agentprofile/` 纯新包（Profile / Store / Router）+ 单测 | 不接线，纯库 |
+| 2 | Manager 加 agent 维度（key 命名空间 / 签名扩展 / `Session.AgentID`）+ `handleChannelMessage` 路由接入 | 兼容测试：default agent 的 key、store 文件 ID、IM 行为与改造前字节级全等。**单独成 PR，不捆绑其他改动** |
+| 3 | tools/skills 按 profile 过滤（`DefaultToolsForProfile`、`ManifestForProfile`、`system:true`、browser skill 隐藏）+ `subagent_type` 解析改走 Store、`discoverAgents` 合并进 Store、代码内 "preset" 标识符统一更名为 profile | 只依赖 PR1，可与 PR2 并行 |
+| 4 | CLI/TUI `--agent` + `/agent` 命令 | 第一个端到端验证切片：profile 创建 → 路由 → 工具过滤全链路 |
+| 5 | REST API `/api/agents/*` + cron `agent_id`/transfer + `expert-agent-manager` 元技能 | 对话式管理入口可用 |
+| 6 | Web UI（Agents 面板、Header 切换、各 View 过滤） | 纯前端，API 已就绪 |
+
+要点：
+
+- **CLI 先于 Web UI**：CLI 是全栈最薄的验证路径，让 PR2 这个高风险重构尽早获得端到端信号，而不是压到 Web UI 做完才第一次跑通全链路
+- **PR2 单独成 PR**：它是多 agent 的核心接线，评审聚焦一件事——"default agent 的 key、store 文件 ID、IM 行为是否与改造前完全等价"
 
 ### 发布后验证清单
 
 - [ ] 无 profile 文件时行为与改造前完全一致（向后兼容）
 - [ ] 创建 profile → 绑定频道 → IM 发消息 → 正确路由
 - [ ] Web 新建会话选 agent → 会话正确归属；skill/MCP 面板不按 agent 过滤
-- [ ] 热加载后新配置生效（无需重启）
+- [ ] API 变更与直接编辑 .md 均在下一次读取生效（无需重启、无 reload API）
 - [ ] Default Agent 的 system prompt 不可通过 profile 编辑器修改（只读显示"由 onboard 管理"）
 - [ ] `octo --agent code-review` 正常启动
 - [ ] `octo serve` 桌面版 default 和新 profile 共存
@@ -935,6 +984,7 @@ func DefaultProfile() *Profile {
 | **`~/.octo/config.yml`** | 无影响 | Agent profile 是新引入的存储路径 (`~/.octo/agents/`)，不改动现有配置文件 |
 | **`onboard` 流程** | 无影响 | onboard 仍操作 `~/.octo/soul.md` 和 `~/.octo/user.md`，不引入新路径 |
 | **API 端点** | 向后兼容 | 新增 `/api/agents/*` 路由组；旧端点 `/api/sessions`、`/api/channels/*` 行为不变 |
+| **已有 .md agent 定义（`~/.octo/agents/`、项目级）** | 无影响 | 自动成为 profile 的能力片；解析优先级（项目级 > 用户级 > 内建）与现状一致 |
 | **WebSocket 事件** | 无影响 | WS 事件类型不变（still broadcast per-session）；但创建新 session 时需带 `agent_id` 字段（可选，默认 default） |
 | **`octo serve` CLI** | 无影响 | 无需新增 flag；桌面版和 serve 均自动加载 profile |
 
@@ -946,8 +996,8 @@ func DefaultProfile() *Profile {
 
 本次改造的所有代码改动集中在以下几个独立包中：
 - `internal/agentprofile/` — 全新包，可整体删除
-- `internal/channel/multi_manager.go` — 全新文件，可删除
-- `internal/server/` — 改动集中在 `initChannels()` 重构为 `initMultiManager()` + 新增 handlers，撤销后恢复旧 `initChannels()` 即可
+- `internal/server/` — 改动集中在 `handleChannelMessage` 路由步骤 + 新增 handlers，撤销路由步骤即可
+- `internal/channel/manager.go` — key 命名空间与签名扩展向后兼容（default agent key 不变），无需回滚数据
 - `web/src/views/AgentsView.svelte` + `AgentEditView.svelte` + `AgentAvatar.svelte` — 全新文件，可删除
 
 回滚步骤：
@@ -959,7 +1009,7 @@ func DefaultProfile() *Profile {
 
 ### 数据回滚
 
-- **`~/.octo/agents/` 目录**：直接删除即可。profile 定义不写入任何其他位置，删除后系统行为恢复为单 agent（Default Agent）
+- **新建的用户级 profile 文件**：逐个删除即可。注意 `~/.octo/agents/` 目录里可能还有**先于本特性存在的 .md agent 定义**，不能整目录删除；删干净新建 profile 后，系统行为恢复为单 agent（Default Agent）+ 原有 `subagent_type` 加载机制
 - **已有 session 文件**：不需要迁移或删除；回滚后它们自动归属 Default Agent（读取时默认 agent_id = "default"），行为不变
 
 ### 回滚安全性
