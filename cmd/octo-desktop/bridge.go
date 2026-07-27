@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,6 +59,23 @@ type nativeBridge struct {
 	// Atomic: the auto-check goroutine writes it while the tray loop / UI thread
 	// read it.
 	updateAvailable atomic.Pointer[string]
+	// inplaceUpdate reports whether this build swaps itself via app.Updater
+	// (bundled release build; see canInplaceUpdate) — when false, update
+	// actions open the download page instead. Written once in main before the
+	// event loop starts; atomic because tray/notification callbacks read it
+	// from other goroutines.
+	inplaceUpdate atomic.Bool
+	// updateFlowBusy single-flights startUpdateFlow across its entry points
+	// (tray item, toast tap, web badge): a second concurrent CheckAndInstall
+	// would tear down the running flow's window and misreport
+	// ErrDownloadInProgress as a failure.
+	updateFlowBusy atomic.Bool
+	// updateRestart is set when the user confirms the updater window's
+	// restart: the quit that follows must never be vetoed (the updater's
+	// helper waits for this process to exit before swapping the binary, so a
+	// veto deadlocks the update). Sticky by design — it flips only on the
+	// restart hand-off, after which the process is exiting anyway.
+	updateRestart atomic.Bool
 	// tray is the system-tray handle, stored so an update check can refresh the
 	// menu immediately rather than waiting for refreshTrayLoop's next tick.
 	tray atomic.Pointer[application.SystemTray]
@@ -264,8 +282,9 @@ func (b *nativeBridge) requestNotificationAuthorization() {
 
 // Update-check notifications: the tray "Check for Updates…" flow reports via a
 // toast rather than a modal dialog. The "update available" toast carries an
-// action button; both it and a tap on the body open the download page, routed
-// in main.go's OnNotificationResponse handler by matching updateNotifyCategoryID.
+// action button; both it and a tap on the body start the update flow (in-place
+// install, or the download page — see startUpdateFlow), routed in main.go's
+// OnNotificationResponse handler by matching updateNotifyCategoryID.
 const (
 	updateNotifyID           = "octo-update-available"
 	updateNotifyCategoryID   = "octo.update-available"
@@ -273,17 +292,22 @@ const (
 )
 
 // registerUpdateNotifyCategory registers the category that gives the "update
-// available" toast its "Open Download Page" action button. No-op when the
-// notifier is unavailable (an unbundled dev binary). Register once at startup,
-// after the notification service has started.
+// available" toast its action button — "Update Now" when this build installs
+// in place, "Open Download Page" otherwise. No-op when the notifier is
+// unavailable (an unbundled dev binary). Register once at startup, after the
+// notification service has started (and after main sets inplaceUpdate).
 func (b *nativeBridge) registerUpdateNotifyCategory() {
 	if b.notifier == nil {
 		return
 	}
+	action := L().updOpen
+	if b.inplaceUpdate.Load() {
+		action = L().updInstall
+	}
 	_ = b.notifier.RegisterNotificationCategory(notifications.NotificationCategory{
 		ID: updateNotifyCategoryID,
 		Actions: []notifications.NotificationAction{
-			{ID: updateNotifyOpenActionID, Title: L().updOpen},
+			{ID: updateNotifyOpenActionID, Title: action},
 		},
 	})
 }
@@ -485,6 +509,20 @@ func (b *nativeBridge) showError(title, message string) {
 // runtime's own browser API isn't reachable here because the page is
 // octo-served, not served off Wails' asset server (same reason ExecJS is dead
 // in showWindowAt).
+// CanSelfUpdate / SelfUpdate back the web badge's "Update Now" action
+// (POST /api/native/self-update): available only when this build swaps itself
+// in place (see canInplaceUpdate). SelfUpdate hands off to the same flow the
+// tray and toast use — the native updater window takes over from here.
+func (b *nativeBridge) CanSelfUpdate() bool { return b.inplaceUpdate.Load() }
+
+func (b *nativeBridge) SelfUpdate() error {
+	if !b.inplaceUpdate.Load() {
+		return errors.New("this build updates through its installer; use the download link")
+	}
+	go startUpdateFlow(b)
+	return nil
+}
+
 func (b *nativeBridge) OpenExternal(url string) error {
 	switch runtime.GOOS {
 	case "darwin":
