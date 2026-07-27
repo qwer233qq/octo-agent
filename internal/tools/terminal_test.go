@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,8 +148,13 @@ func TestDefaultRegistry_Execute(t *testing.T) {
 // ─── ExecuteStream tests ────────────────────────────────────────────────────
 
 func TestTerminalTool_ExecuteStream_LineByLine(t *testing.T) {
+	var mu sync.Mutex
 	var got []string
-	progress := func(line string) { got = append(got, line) }
+	progress := func(line string) {
+		mu.Lock()
+		got = append(got, line)
+		mu.Unlock()
+	}
 
 	result, err := TerminalTool{}.ExecuteStream(context.Background(), "terminal", map[string]any{
 		"command": "echo line1 && echo line2 && echo line3",
@@ -157,12 +163,18 @@ func TestTerminalTool_ExecuteStream_LineByLine(t *testing.T) {
 		t.Fatalf("ExecuteStream: %v", err)
 	}
 
-	if len(got) != 3 {
-		t.Errorf("expected 3 progress callbacks, got %d: %v", len(got), got)
+	mu.Lock()
+	n := len(got)
+	g := make([]string, len(got))
+	copy(g, got)
+	mu.Unlock()
+
+	if n != 3 {
+		t.Errorf("expected 3 progress callbacks, got %d: %v", n, g)
 	}
 	for i, want := range []string{"line1", "line2", "line3"} {
-		if i < len(got) && got[i] != want {
-			t.Errorf("got[%d] = %q, want %q", i, got[i], want)
+		if i < n && g[i] != want {
+			t.Errorf("got[%d] = %q, want %q", i, g[i], want)
 		}
 	}
 	if result.Text != "line1\nline2\nline3" {
@@ -171,8 +183,13 @@ func TestTerminalTool_ExecuteStream_LineByLine(t *testing.T) {
 }
 
 func TestTerminalTool_ExecuteStream_MergedStdoutAndStderr(t *testing.T) {
+	var mu sync.Mutex
 	var got []string
-	progress := func(line string) { got = append(got, line) }
+	progress := func(line string) {
+		mu.Lock()
+		got = append(got, line)
+		mu.Unlock()
+	}
 
 	// Write to stdout AND stderr; both should reach progress in the order
 	// the shell flushes them. (sh tends to be unbuffered enough for this
@@ -184,7 +201,9 @@ func TestTerminalTool_ExecuteStream_MergedStdoutAndStderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteStream: %v", err)
 	}
+	mu.Lock()
 	joined := strings.Join(got, "|")
+	mu.Unlock()
 	if !strings.Contains(joined, "from-stdout") || !strings.Contains(joined, "from-stderr") {
 		t.Errorf("both streams should reach progress; got: %s", joined)
 	}
@@ -497,6 +516,57 @@ func TestTerminalTool_SubAgent_NotPromotable(t *testing.T) {
 	}
 	mgr.PromoteSync() // let the control return promptly instead of waiting out the sleep
 	<-ctlDone
+}
+
+// TestTerminalTool_ExecuteStream_SlowProgressDoesNotDeadlock verifies that
+// a slow/blocking progress handler never deadlocks the pipe chain (the root
+// cause fixed by decoupling progress via a buffered channel).
+func TestTerminalTool_ExecuteStream_SlowProgressDoesNotDeadlock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell only")
+	}
+
+	// A progress callback that blocks forever.
+	block := make(chan struct{})
+	progress := func(line string) { <-block }
+
+	done := make(chan agent.ToolResult, 1)
+	go func() {
+		res, _ := TerminalTool{}.ExecuteStream(context.Background(), "terminal",
+			map[string]any{"command": "for i in $(seq 1 200); do echo line$i; done"},
+			progress)
+		done <- res
+	}()
+
+	// The command must finish WITHOUT deadlocking. With the fix, the scanner
+	// never blocks on progress — it drops excess events via the non-blocking
+	// channel send. The aggregated output is unaffected.
+	select {
+	case res := <-done:
+		// Success — returned promptly despite blocked progress.
+		for i := 1; i <= 200; i++ {
+			want := "line" + itoa(i)
+			if !strings.Contains(res.Text, want) {
+				t.Errorf("aggregated output missing line %d (%q)", i, want)
+				break
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ExecuteStream deadlocked — did not return within 5s while progress was blocked")
+	}
+	close(block) // cleanup: unblock progress goroutine
+}
+
+// itoa is a minimal int-to-string helper for tests.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var digits []byte
+	for n := i; n > 0; n /= 10 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+	}
+	return string(digits)
 }
 
 func TestTerminalInputTool_Definition(t *testing.T) {
