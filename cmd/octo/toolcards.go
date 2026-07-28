@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -161,8 +162,98 @@ func toolCardOpts(toolName string, input map[string]any, output string, isErr bo
 		}
 	case "terminal_output", "kill_shell", "terminal_input":
 		opts.Tail = true
+	case "web_search":
+		// Which backend answered is otherwise invisible: the body preview folds
+		// away before reaching it. It matters because the zero-key fallbacks are
+		// HTML scrapes whose results are markedly worse than a real index — so
+		// name the backend, and flag the scrape.
+		if p := webSearchProvider(output); p != "" {
+			opts.Meta = joinMeta(p, webSearchProviderNote(p), opts.Meta)
+		}
 	}
 	return output, opts
+}
+
+// webSearchProvider pulls the backend name out of a web_search result body
+// (WebSearchResponse.Provider). Returns "" for a body that isn't a JSON object,
+// or one whose provider field never arrives — an errored search, or a future
+// change to the tool's output shape.
+//
+// Scans token-by-token rather than json.Unmarshal-ing the whole body, because
+// what reaches here is AgentEvent.Output, which the agent loop truncates at
+// EventToolOutputCap. A truncated body is invalid JSON, so a whole-document
+// unmarshal fails outright and the label would vanish for exactly the largest
+// searches. An incremental scan gets everything ahead of the cut — which is why
+// WebSearchResponse marshals Provider ahead of Results.
+func webSearchProvider(output string) string {
+	dec := json.NewDecoder(strings.NewReader(output))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return ""
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if name, _ := key.(string); name == "provider" {
+			v, err := dec.Token()
+			if err != nil {
+				return ""
+			}
+			s, _ := v.(string)
+			return s
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return ""
+		}
+	}
+	return ""
+}
+
+// skipJSONValue consumes exactly one value from dec — a scalar, or a whole
+// object/array however deeply nested — leaving the decoder positioned at the
+// next key. Returns the decoder's error when the stream ends mid-value, which
+// for a truncated body is the expected outcome.
+func skipJSONValue(dec *json.Decoder) error {
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if t != json.Delim('{') && t != json.Delim('[') {
+		return nil // scalar: already consumed
+	}
+	for depth := 1; depth > 0; {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
+}
+
+// webSearchProviderNote returns the flag shown beside a scrape backend, or ""
+// for a keyed one.
+//
+// It states only what the provider name proves — that these results were
+// scraped. It deliberately does NOT say "no search key": Execute's cascade
+// falls through on an HTTP error, an exhausted quota, or a zero-result
+// response, so a user with a perfectly good Brave key can land here, and
+// telling them to go get a key they already own would bury the real fault.
+// `octo doctor`, which can actually see the env, carries the key advice.
+//
+// Terse on purpose: the note shares the header line with the query, and the
+// query is the more useful of the two when the terminal is narrow.
+func webSearchProviderNote(provider string) string {
+	if tools.WebSearchIsScrapedBackend(provider) {
+		return "scraped"
+	}
+	return ""
 }
 
 // renderToolFull re-renders a finished tool call with its output fully

@@ -50,12 +50,88 @@ type WebSearchResult struct {
 // WebSearchResponse is what gets serialised back to the LLM. Provider
 // records which backend actually produced the results, so the LLM knows
 // whether to trust the corpus (Brave/Google index vs. DDG/Bing HTML scrape).
+//
+// Field order matters: Provider precedes Results because the marshalled body
+// reaches event consumers through AgentEvent.Output, which the agent loop
+// truncates at EventToolOutputCap (8 KiB) — a size 20 results with long
+// snippets can exceed. Behind the results array, Provider would be the first
+// field cut, and the TUI card (which parses this body for the backend name)
+// would silently lose its label exactly for the biggest searches.
 type WebSearchResponse struct {
 	Query    string            `json:"query"`
-	Results  []WebSearchResult `json:"results"`
-	Count    int               `json:"count"`
 	Provider string            `json:"provider"`
+	Count    int               `json:"count"`
+	Results  []WebSearchResult `json:"results"`
 	Error    string            `json:"error,omitempty"`
+}
+
+// keyedSearchBackends lists the key-gated backends in priority order, each
+// paired with the env var that enables it. Single-sourced so `octo doctor` can
+// report which one is live without duplicating the env-var names.
+var keyedSearchBackends = []struct {
+	name string
+	env  string
+	run  func(context.Context, string, int) ([]WebSearchResult, error)
+}{
+	{"brave", "BRAVE_SEARCH_API_KEY", searchBrave},
+	{"tavily", "TAVILY_API_KEY", searchTavily},
+	{"serper", "SERPER_API_KEY", searchSerper},
+}
+
+// scrapedSearchBackends lists the zero-key HTML-scrape fallbacks in priority
+// order. Always available, and always a quality downgrade from a real search
+// index. Single-sourced so a renderer asking "were these results scraped?"
+// can't fall out of step with the cascade — adding a fourth fallback here
+// updates every surface at once.
+var scrapedSearchBackends = []struct {
+	name string
+	run  func(context.Context, string, int) ([]WebSearchResult, error)
+}{
+	{"duckduckgo", searchDuckDuckGo},
+	{"bing", searchBing},
+}
+
+// WebSearchKeyedBackend returns the name of the highest-priority key-gated
+// backend that has its env var set, or "" when none is — i.e. searches start
+// from the DuckDuckGo/Bing HTML scraping path, whose result quality is
+// substantially worse. `octo doctor` uses the empty case to point the user at
+// the free tiers.
+//
+// A non-empty result does NOT mean a search actually used that backend: the
+// cascade in Execute falls through on an HTTP error, an exhausted quota, or a
+// zero-result response, so a configured key can still end in a scrape. Callers
+// reporting on a finished search must read the response's Provider instead.
+func WebSearchKeyedBackend() string {
+	for _, b := range keyedSearchBackends {
+		if os.Getenv(b.env) != "" {
+			return b.name
+		}
+	}
+	return ""
+}
+
+// WebSearchIsScrapedBackend reports whether name is one of the zero-key HTML
+// scrapers, i.e. whether a search that reported this provider returned
+// scrape-quality results.
+func WebSearchIsScrapedBackend(name string) bool {
+	for _, b := range scrapedSearchBackends {
+		if b.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// WebSearchKeyEnvVar returns the env var that enables the named key-gated
+// backend, or "" for an unknown or zero-key one. Lets `octo doctor` name the
+// variable it actually read instead of restating the mapping.
+func WebSearchKeyEnvVar(backend string) string {
+	for _, b := range keyedSearchBackends {
+		if b.name == backend {
+			return b.env
+		}
+	}
+	return ""
 }
 
 // WebSearchTool searches the web. Backend priority (descending):
@@ -125,20 +201,15 @@ func (WebSearchTool) Execute(ctx context.Context, _ string, input map[string]any
 		run  func(context.Context, string, int) ([]WebSearchResult, error)
 	}
 	backends := []backend{}
-	if os.Getenv("BRAVE_SEARCH_API_KEY") != "" {
-		backends = append(backends, backend{"brave", searchBrave})
-	}
-	if os.Getenv("TAVILY_API_KEY") != "" {
-		backends = append(backends, backend{"tavily", searchTavily})
-	}
-	if os.Getenv("SERPER_API_KEY") != "" {
-		backends = append(backends, backend{"serper", searchSerper})
+	for _, b := range keyedSearchBackends {
+		if os.Getenv(b.env) != "" {
+			backends = append(backends, backend{b.name, b.run})
+		}
 	}
 	// Zero-key fallbacks are always available.
-	backends = append(backends,
-		backend{"duckduckgo", searchDuckDuckGo},
-		backend{"bing", searchBing},
-	)
+	for _, b := range scrapedSearchBackends {
+		backends = append(backends, backend{b.name, b.run})
+	}
 
 	for _, b := range backends {
 		results, err := b.run(ctx, query, max)
@@ -180,12 +251,15 @@ func (WebSearchTool) Execute(ctx context.Context, _ string, input map[string]any
 	res := agent.ToolResult{Text: string(body)}
 	if succeeded {
 		// Structured payload for the web frontend's rich result card
-		// (sessions.js _renderWebSearchResult expects query/results/total).
+		// (ToolGroup.svelte reads query/provider/results/total). provider rides
+		// along so the card can name the backend without re-parsing the
+		// (truncatable) result body — UI is never truncated.
 		res.UI = map[string]any{
-			"type":    "web_search",
-			"query":   response.Query,
-			"results": response.Results,
-			"total":   response.Count,
+			"type":     "web_search",
+			"query":    response.Query,
+			"provider": response.Provider,
+			"results":  response.Results,
+			"total":    response.Count,
 		}
 	}
 	return res, nil
