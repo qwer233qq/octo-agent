@@ -22,7 +22,7 @@ metadata:
 
 1. 在要用的浏览器打开 inspect 页面并勾选 **Allow remote debugging for this browser instance**（可能需重启浏览器）：
    - Chrome：`chrome://inspect/#remote-debugging`
-   - Edge：`edge://inspect/#remote-debugging`
+   - Edge：`edge://inspect`，然后点左侧 **Remote debugging**
 2. 或直接运行 `octo browser setup`，它会给出上面的步骤、验证连接、并把端口写进配置。
 
 连上后 `browser` 工具天然携带登录态——大多数常用网站都已登录。无独立浏览器、无需命令行参数。

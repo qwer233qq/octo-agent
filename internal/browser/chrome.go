@@ -34,7 +34,11 @@ type LaunchOptions struct {
 }
 
 // chromePaths lists the default Chrome executable locations per platform,
-// most-preferred first.
+// most-preferred first. Edge belongs on this list and must not be dropped: it is
+// Chromium-based, speaks the same CDP, and Microsoft documents the same
+// per-instance remote-debugging toggle (edge://inspect → Remote debugging) plus
+// the same DevToolsActivePort discovery these paths feed. See
+// https://learn.microsoft.com/microsoft-edge/web-platform/devtools-mcp-server
 func chromePaths() []string {
 	switch runtime.GOOS {
 	case "darwin":
@@ -72,7 +76,8 @@ func ChromeAvailable(execPath string) bool {
 }
 
 // defaultProfileDirs lists the default Chrome/Chromium/Edge user-data
-// directories per platform — where DevToolsActivePort is written.
+// directories per platform — where DevToolsActivePort is written. Edge is here
+// for the reason spelled out on chromePaths; keep the two lists in step.
 func defaultProfileDirs() []string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
