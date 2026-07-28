@@ -9,12 +9,13 @@
   import { ws } from '../../lib/ws'
   import * as api from '../../lib/api'
   import { t } from '../../lib/i18n'
+  import { submitIntent } from '../../lib/composerKeys'
   import StatusTag from '../ui/StatusTag.svelte'
   import FolderPickerModal from '../overlays/FolderPickerModal.svelte'
   import type { McpServerDetail, McpTool } from '../../lib/types'
   import { getMcpServer } from '../../lib/api'
 
-  let { onSend }: { onSend?: (text: string, files?: any[]) => void } = $props()
+  let { onSend }: { onSend?: (text: string, files?: any[], queued?: boolean) => void } = $props()
 
   // A staged attachment. Images carry inline as a base64 data URL (the model
   // gets an image block); every other type is uploaded to the server and
@@ -727,7 +728,10 @@
     return parts.length <= 2 ? p : '…/' + parts.slice(-2).join('/')
   }
 
-  function send() {
+  // queued=true parks the message as its own follow-up turn instead of steering
+  // the turn in flight (Cmd/Ctrl+Enter — the web counterpart of the TUI's
+  // Ctrl+Q). Idle it makes no difference: the server just starts the turn.
+  function send(queued = false) {
     if (!text.trim() && attachments.length === 0) return
     // Don't send while an attachment upload is still in flight — the file
     // would be dropped and re-appear on the next message.
@@ -752,7 +756,7 @@
     text = ''
     attachments = []
     if (onSend) {
-      onSend(v, files)
+      onSend(v, files, queued)
     } else {
       running.set(true)
     }
@@ -840,10 +844,12 @@
       }
     }
 
-    // Enter to send (unless shift is held)
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Enter sends (mid-turn: steers); Cmd/Ctrl+Enter queues as the next turn;
+    // Shift+Enter falls through to the textarea's own newline. See composerKeys.
+    const intent = submitIntent(e)
+    if (intent) {
       e.preventDefault()
-      send()
+      send(intent === 'queue')
       return
     }
 
@@ -1000,7 +1006,7 @@
       <textarea
         bind:this={textareaEl}
         rows={1}
-        placeholder={$t('chat.placeholder')}
+        placeholder={isStreaming || $running ? $t('chat.placeholder_running') : $t('chat.placeholder')}
         bind:value={text}
         onkeydown={onKeydown}
         oninput={onInput}
@@ -1060,13 +1066,16 @@
         {#if isStreaming || $running}
           <!-- Mid-turn: Stop interrupts the running turn; Send stays available
                so a follow-up message steers the turn in flight (rides the
-               running Agent's Inbox server-side). -->
+               running Agent's Inbox server-side), and Cmd/Ctrl+Enter queues it
+               as a separate turn instead (the server's steer queue). -->
           <button class="stop-btn" onclick={stop}>
             <span class="stop-sq"></span>
             {$t('chat.stop')}
           </button>
         {/if}
-        <button class="send-btn" onclick={send}>{$t('chat.send')}</button>
+        <!-- Arrow-wrapped: a bare `onclick={send}` would hand the MouseEvent to
+             the `queued` parameter and queue every click. -->
+        <button class="send-btn" title={isStreaming || $running ? $t('chat.send_or_queue_hint') : undefined} onclick={() => send()}>{$t('chat.send')}</button>
       </div>
     </div>
   </div>
