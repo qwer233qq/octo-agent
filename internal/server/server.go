@@ -2750,23 +2750,48 @@ func (s *Server) routeChannelEvent(ctx context.Context, ad channel.Adapter, ev c
 	// Text-less events (stickers, images, voice) never answer an ask or
 	// steer — an empty reply would consume the ask slot and deny for
 	// nothing, and an empty steer adds noise.
-	if strings.TrimSpace(ev.Text) != "" {
-		if sess := s.channelMgr.GetSession(ev, profile.ID); sess != nil {
-			if sess.DeliverAskReply(ev.ChatID, ev.UserID, ev.Text) {
+	if sess := s.channelMgr.GetSession(ev, profile.ID); sess != nil {
+		// The ask-reply and steer paths carry text only. When either could
+		// claim this message, persist its attachments up front and fold the
+		// path notes into the text — otherwise an image sent as the answer
+		// to ask_user_question (or as a mid-turn steer) silently vanishes:
+		// the adapter's "[图片]" placeholder text made the guard below pass,
+		// the ask consumed it, and the image bytes in ev.Files went nowhere.
+		// When neither path consumes the message, handleChannelMessage
+		// persists the files instead (attachInboundFiles), so persisting is
+		// gated on HasPendingAsk/IsRunning to avoid a duplicate upload.
+		// running is snapshotted once and reused for both the persist gate
+		// and the steer check below: two separate IsRunning() calls could
+		// observe the turn finish in between, in which case DeliverAskReply
+		// also finds no pending ask and the message falls through to
+		// handleChannelMessage — which re-persists the same attachment via
+		// attachInboundFiles, leaking the first copy as an orphaned upload
+		// nothing ever references. Reusing one snapshot keeps the persist
+		// decision and the enqueue decision consistent.
+		running := sess.IsRunning()
+		text := ev.Text
+		if len(ev.Files) > 0 && (sess.HasPendingAsk() || running) {
+			if notes := inboundFileNotes(ev.Files); len(notes) > 0 {
+				text = strings.TrimSpace(text + "\n\n" + strings.Join(notes, "\n"))
+			}
+		}
+		if strings.TrimSpace(text) != "" {
+			if sess.DeliverAskReply(ev.ChatID, ev.UserID, text) {
 				return
 			}
 			// Steer: a message arriving mid-turn rides the running turn's
 			// Inbox (drained between loop iterations; leftovers chain in
 			// handleChannelMessage) — web/CLI parity, instead of queueing a
 			// whole second turn. Known small race: a turn that finishes
-			// between this check and the enqueue leaves the message in the
-			// Inbox until the chat's next turn — delayed, not lost. Under
-			// shared-session bindings (BindByChat/BindByUser) this folds
-			// OTHER users' messages into the running turn too — coherent
-			// for a shared conversation, but a behavior those modes should
-			// revisit if the server ever stops hardcoding BindByChatUser.
-			if sess.IsRunning() {
-				sess.Agent.Inbox.Enqueue(ev.Text)
+			// between the running snapshot above and here leaves the
+			// message in the Inbox until the chat's next turn — delayed,
+			// not lost. Under shared-session bindings (BindByChat/BindByUser)
+			// this folds OTHER users' messages into the running turn too —
+			// coherent for a shared conversation, but a behavior those modes
+			// should revisit if the server ever stops hardcoding
+			// BindByChatUser.
+			if running {
+				sess.Agent.Inbox.Enqueue(text)
 				return
 			}
 		}
