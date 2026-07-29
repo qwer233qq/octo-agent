@@ -6,6 +6,20 @@
 // fetches the file body from the whitelisted GET /api/sessions/{id}/artifacts
 // endpoint, and pushes a previewable entry into the `artifacts` store that
 // ArtifactsPanel renders. Mirrors the old hand-written Artifacts.observe().
+//
+// Constraint on every preview document built here: it must not reference
+// /api/* — nothing inside the sandboxed srcdoc iframe can authenticate. The
+// iframe has no allow-same-origin, so its subresource requests carry an opaque
+// origin and count as cross-site; the SameSite=Strict access-key cookie is
+// withheld and the endpoint answers 401 for every client that isn't exempt as
+// loopback. It works on localhost and breaks over a tunnel or on the LAN.
+//
+// The same goes for any local file the artifact itself points at — a markdown
+// `![](shot.png)` or an HTML `<img src="chart.png">` resolves against the host
+// page rather than the file's own directory, and the /api/ path it would need
+// can't authenticate from in there either. Two ways out: render outside the
+// iframe (what `src` is for) or inline the bytes as a data: URI (what
+// inlineLocalRefs does).
 
 import { get, writable } from 'svelte/store'
 import { artifacts, panelContent, artifactSel } from './stores'
@@ -31,6 +45,10 @@ const EXT_KIND: Record<string, Kind> = {
 
 // Once-per-session guard so a live write auto-opens the panel only the first time.
 let autoOpened = false
+
+// How many times each image path has been observed this session, used as the
+// cache-busting revision in its src. Cleared with the artifacts themselves.
+const imageRevisions = new Map<string, number>()
 
 function kindOf(path: string): Kind | null {
   const dot = path.lastIndexOf('.')
@@ -73,6 +91,221 @@ function hasExternalRefs(html: string): boolean {
   return EXTERNAL_REF_RE.test(html)
 }
 
+function artifactURL(sessionId: string, path: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/artifacts?path=${encodeURIComponent(path)}`
+}
+
+// ─── Local file references inside a preview document ────────────────────────
+//
+// A markdown or HTML artifact can point at its own images: `![shot](shot.png)`,
+// `<img src="chart.png">`, `background-image:url(bg.png)`. None of those survive
+// inside the preview iframe — a relative path resolves against the host page,
+// and the /api/ path it would need can't authenticate from in there (see the
+// file-header note) — so the bytes are inlined as data: URIs, the one form the
+// iframe can read.
+//
+// Two gates on what gets inlined: the reference must resolve to an image (the
+// endpoint also serves .html and .md, and an artifact must not be able to pull
+// those in), and the session itself must have written it, since the endpoint
+// serves nothing else. That covers the case that matters: a report the agent
+// wrote beside the screenshots it took. Everything else is left exactly as
+// written and simply doesn't render, same as today — which is also the fallback
+// for a local .css or .js, already routed to the warning page by
+// hasExternalRefs.
+//
+// The budget counts raw file bytes, not what they cost once resident: a data:
+// URI carries base64's ~1.37x, doubled again by UTF-16, and the srcdoc
+// attribute holds a second copy — so a full budget is several times its own
+// size in memory for as long as the artifact stays in the store. It is also
+// per-artifact, so a session with many image-bearing documents accumulates.
+// Both numbers are deliberately well under what one page needs.
+const inlineRefBudget = 4 << 20
+const inlineRefMax = 20
+
+// Cheap pre-check: skip the parse/serialize round-trip entirely for a document
+// with nothing to rewrite, which is most of them.
+const LOCAL_REF_HINT = /<img\b|<image\b|url\(/i
+const CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi
+
+// mode picks how the result is serialized: an HTML artifact is a whole document
+// (doctype and <head> must survive), markdown output is a body fragment.
+async function inlineLocalRefs(
+  html: string,
+  sessionId: string,
+  basePath: string,
+  mode: 'document' | 'fragment',
+): Promise<string> {
+  if (!LOCAL_REF_HINT.test(html)) return html
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+
+  // null caches a failed lookup so a repeated broken reference is fetched once.
+  const seen = new Map<string, string | null>()
+  let spent = 0
+  let count = 0
+  let changed = false
+
+  const inline = async (raw: string): Promise<string | null> => {
+    const abs = localFilePath(raw, basePath)
+    if (!abs) return null
+    // Images only, enforced rather than assumed. The endpoint also serves .html
+    // and .md, so without this an artifact could name a sibling document here
+    // and have the host page — which is authenticated — fetch it and hand the
+    // bytes to a preview iframe that runs scripts and can reach the network.
+    // The artifact would be reading files it was never granted.
+    if (kindOf(abs) !== 'image') return null
+    const cached = seen.get(abs)
+    if (cached !== undefined) return cached
+    if (count >= inlineRefMax || spent >= inlineRefBudget) return null
+    let dataUrl: string | null = null
+    try {
+      const res = await fetch(artifactURL(sessionId, abs))
+      if (res.ok) {
+        const blob = await res.blob()
+        dataUrl = await blobToDataURL(blob)
+        spent += blob.size
+        count++
+      }
+    } catch {
+      // Leave the reference as written — a broken image beats no preview.
+    }
+    seen.set(abs, dataUrl)
+    return dataUrl
+  }
+
+  for (const img of Array.from(doc.querySelectorAll('img'))) {
+    const dataUrl = await inline(img.getAttribute('src') ?? '')
+    if (!dataUrl) continue
+    img.setAttribute('src', dataUrl)
+    // Whatever outranks the src has to go, or the rewrite achieves nothing: a
+    // srcset beats src, and a <picture>'s <source> beats both. Their candidates
+    // are unreachable for exactly the reason the src was, so dropping them is
+    // what makes the inlined src take effect.
+    img.removeAttribute('srcset')
+    const parent = img.parentElement
+    if (parent && parent.tagName === 'PICTURE') {
+      for (const s of Array.from(parent.querySelectorAll('source'))) s.remove()
+    }
+    changed = true
+  }
+  // SVG's <image> is the same reference in a different attribute.
+  for (const el of Array.from(doc.querySelectorAll('image'))) {
+    const dataUrl = await inline(el.getAttribute('href') ?? el.getAttribute('xlink:href') ?? '')
+    if (!dataUrl) continue
+    if (el.hasAttribute('href')) el.setAttribute('href', dataUrl)
+    if (el.hasAttribute('xlink:href')) el.setAttribute('xlink:href', dataUrl)
+    changed = true
+  }
+  for (const el of Array.from(doc.querySelectorAll('style'))) {
+    const css = el.textContent ?? ''
+    const next = await inlineCSSURLs(css, inline)
+    if (next === css) continue
+    el.textContent = next
+    changed = true
+  }
+  for (const el of Array.from(doc.querySelectorAll('[style]'))) {
+    const css = el.getAttribute('style') ?? ''
+    const next = await inlineCSSURLs(css, inline)
+    if (next === css) continue
+    el.setAttribute('style', next)
+    changed = true
+  }
+
+  // Hand back the original text when nothing was rewritten, so a document with
+  // no local references is never reshaped by the round-trip.
+  if (!changed) return html
+  if (mode === 'fragment') return doc.body.innerHTML
+  return serializeDoctype(doc.doctype) + doc.documentElement.outerHTML
+}
+
+// documentElement.outerHTML drops the doctype, so it gets rebuilt — with its
+// public/system identifiers, since those are what decide the rendering mode and
+// a name-only `<!DOCTYPE html>` would silently switch a legacy file to standards
+// mode. Anything else above <html> (a build comment, say) is still lost.
+function serializeDoctype(dt: DocumentType | null): string {
+  if (!dt) return ''
+  let out = `<!DOCTYPE ${dt.name}`
+  if (dt.publicId) out += ` PUBLIC "${dt.publicId}"`
+  else if (dt.systemId) out += ' SYSTEM'
+  if (dt.systemId) out += ` "${dt.systemId}"`
+  return out + '>'
+}
+
+async function inlineCSSURLs(
+  css: string,
+  inline: (raw: string) => Promise<string | null>,
+): Promise<string> {
+  const out: string[] = []
+  let last = 0
+  for (const m of Array.from(css.matchAll(CSS_URL_RE))) {
+    const dataUrl = await inline(m[2])
+    if (!dataUrl) continue
+    out.push(css.slice(last, m.index), `url("${dataUrl}")`)
+    last = m.index + m[0].length
+  }
+  if (out.length === 0) return css
+  out.push(css.slice(last))
+  return out.join('')
+}
+
+// localFilePath resolves a reference to the absolute on-disk path to ask the
+// endpoint for, or null when it isn't a local file. Anything carrying a scheme
+// is left alone: an http(s) image is a cross-origin no-cors load, which a
+// sandboxed iframe performs just fine.
+function localFilePath(raw: string, basePath: string): string | null {
+  const src = raw.trim()
+  if (!src || src.startsWith('//') || src.startsWith('#')) return null
+  if (/^[a-z][a-z0-9+.-]*:/i.test(src) && !/^[a-z]:[\\/]/i.test(src)) return null
+  let rel = src.split(/[?#]/)[0]
+  try {
+    rel = decodeURIComponent(rel)
+  } catch {
+    // Malformed escapes: use the reference verbatim.
+  }
+  if (!rel) return null
+  const abs = isAbsolutePath(rel) ? rel : `${dirOf(basePath)}/${rel}`
+  const clean = cleanPath(abs)
+  return isAbsolutePath(clean) ? clean : null
+}
+
+// A leading "/" or a Windows drive letter. Paths are normalised to forward
+// slashes; the server runs filepath.Clean on its side, which re-separates them
+// per platform before matching against the transcript.
+function isAbsolutePath(p: string): boolean {
+  return p.startsWith('/') || /^[a-z]:[\\/]/i.test(p)
+}
+
+function dirOf(p: string): string {
+  const norm = p.replace(/\\/g, '/')
+  const cut = norm.lastIndexOf('/')
+  return cut < 0 ? '' : norm.slice(0, cut)
+}
+
+// Resolves "." and ".." segments and collapses repeats. Traversal needs no
+// guarding here: the endpoint only serves paths this session's transcript
+// records, so a resolved path outside the artifact's directory is simply a 404.
+function cleanPath(p: string): string {
+  const norm = p.replace(/\\/g, '/')
+  const out: string[] = []
+  for (const seg of norm.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') {
+      out.pop()
+      continue
+    }
+    out.push(seg)
+  }
+  return (norm.startsWith('/') ? '/' : '') + out.join('/')
+}
+
+function blobToDataURL(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(blob)
+  })
+}
+
 // Clear artifacts on session switch; history replay then repopulates. The
 // session marker gates in-flight fetches so a late response can't leak into the
 // newly-selected session.
@@ -81,6 +314,7 @@ export function resetArtifacts(sessionId: string): void {
   artifactSel.set(0)
   panelContent.set(null)
   autoOpened = false
+  imageRevisions.clear()
   artifactSelSession.set(sessionId)
 }
 
@@ -100,17 +334,40 @@ export async function observeArtifact(
   const kind = kindOf(path)
   if (!kind) return
 
-  const url = `/api/sessions/${encodeURIComponent(sessionId)}/artifacts?path=${encodeURIComponent(path)}`
+  const url = artifactURL(sessionId, path)
 
   let code = ''
   let preview = ''
+  let src = ''
   try {
     const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
     if (kind === 'image') {
-      // The sandboxed iframe loads the image from the same-host endpoint.
-      code = url
-      const imgBg = isDark ? '#1e1e1e' : '#f5f5f5'
-      preview = `<body style="margin:0;display:flex;align-items:center;justify-content:center;background:${imgBg};height:100vh"><img style="max-width:100%;max-height:100vh" src="${url}"></body>`
+      // Images render as a plain <img> in the host document — see the
+      // file-header note on why an <img src="/api/…"> inside the sandboxed
+      // iframe 401s. The host document's own request is same-site and
+      // authenticates normally, and observing costs no network at all: the URL
+      // only becomes a request once the panel renders this artifact, and it
+      // renders one at a time. History replay over a session full of multi-MB
+      // screenshots therefore transfers none of them.
+      //
+      // The revision counter matters: re-observing a path (the agent overwrote
+      // the file) otherwise yields a byte-identical src, so Svelte skips the
+      // attribute update and the panel keeps showing the previous bytes — the
+      // endpoint sends no validators, so nothing prompts a revalidation either.
+      // Counting observations rather than stamping a clock keeps the URL stable
+      // across a straight replay of the same transcript, so a reopened session
+      // can still reuse whatever the browser happens to have cached.
+      //
+      // Dropping the iframe costs no isolation here. The endpoint pins
+      // Content-Type and sends X-Content-Type-Options: nosniff, and an SVG
+      // loaded through <img> runs no script and fetches no external resource.
+      const rev = (imageRevisions.get(path) ?? 0) + 1
+      imageRevisions.set(path, rev)
+      src = `${url}&rev=${rev}`
+      // A binary artifact has no source view, so `code` carries the on-disk
+      // path instead: it is the one text form worth copying. Download saves
+      // the bytes from `src`.
+      code = path
     } else {
       const res = await fetch(url)
       if (!res.ok) return
@@ -134,7 +391,9 @@ export async function observeArtifact(
 <pre style="margin:0;padding:12px;background:${warnPreBg};border-radius:6px;overflow:auto;font:12px/1.6 'SFMono-Regular',Menlo,monospace;color:${warnPreColor};white-space:pre-wrap">${escaped}</pre>
 </body>`
         } else {
-          preview = code
+          // No unreachable scripts or stylesheets, but the file's own images
+          // still need inlining to survive the iframe.
+          preview = await inlineLocalRefs(code, sessionId, path, 'document')
         }
       } else if (kind === 'markdown') {
         // Markdown is rendered inside a sandboxed srcdoc iframe which has no
@@ -145,17 +404,43 @@ export async function observeArtifact(
         const bodyStyle = isDark
           ? 'margin:0;padding:16px;font:14px/1.6 system-ui,-apple-system,sans-serif;color:#d4d4d4;background:#1e1e1e'
           : 'margin:0;padding:16px;font:14px/1.6 system-ui,-apple-system,sans-serif;color:rgba(0,0,0,0.88);background:#ffffff'
+        // Bound to document.body, not '.body': this is a hand-inlined copy of
+        // setupCopyButtons(), whose caller passes the host app's container, and
+        // that selector matched nothing here — querySelector returned null and
+        // the whole handler died on load, so the button never worked at all.
+        //
+        // The clipboard call has a fallback because this document's origin is
+        // opaque; whether the async Clipboard API is available to it varies by
+        // browser even with clipboard-write delegated on the iframe. execCommand
+        // is deprecated but needs no permission, only the click's activation.
+        //
+        // The .code-block lookup is null-guarded like setupCopyButtons' is; the
+        // old unguarded form would throw if the wrapper ever went missing.
         const COPY_SCRIPT = `<script>
-	document.querySelector('.body').addEventListener('click',function(e){
+	document.body.addEventListener('click',function(e){
 	  var b=e.target.closest('.copy-btn');if(!b)return;
-	  var c=b.closest('.code-block').querySelector('pre code');
-	  navigator.clipboard.writeText(c?c.textContent:'').then(function(){
-	    var o=b.textContent;b.textContent='Copied!';
+	  var k=b.closest('.code-block');
+	  var c=k&&k.querySelector('pre code');
+	  var t=c?c.textContent:'';
+	  var done=function(ok){
+	    var o=b.textContent;b.textContent=ok?'Copied!':'Copy failed';
 	    setTimeout(function(){b.textContent=o},1500);
-	  })
+	  };
+	  var legacy=function(){
+	    var ta=document.createElement('textarea');
+	    ta.value=t;ta.setAttribute('readonly','');
+	    ta.style.position='fixed';ta.style.opacity='0';
+	    document.body.appendChild(ta);ta.select();
+	    var ok=false;try{ok=document.execCommand('copy')}catch(err){}
+	    ta.remove();done(ok);
+	  };
+	  if(navigator.clipboard&&navigator.clipboard.writeText){
+	    navigator.clipboard.writeText(t).then(function(){done(true)},legacy)
+	  }else{legacy()}
 	});
 	<\/script>`
-        preview = `<style>${MD_STYLES}</style><body style="${bodyStyle}">${renderMarkdown(code)}${COPY_SCRIPT}</body>`
+        const body = await inlineLocalRefs(renderMarkdown(code), sessionId, path, 'fragment')
+        preview = `<style>${MD_STYLES}</style><body style="${bodyStyle}">${body}${COPY_SCRIPT}</body>`
       } else {
         // code kind: show with theme-aware monospace style
         const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -181,6 +466,7 @@ export async function observeArtifact(
     code,
     preview,
     path,
+    src: src || undefined,
   }
 
   artifacts.update(list => {

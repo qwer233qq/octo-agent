@@ -6,9 +6,11 @@
 
   // ── Session artifacts (existing) ──────────────────────────────────────────
   const cur = $derived($artifacts[$artifactSel] ?? $artifacts[0])
+  // Images render outside the sandboxed iframe and have no source view.
+  const curIsImage = $derived(!!cur?.src)
 
   function onCopy() { copyArtifact(cur?.code ?? '', showToast) }
-  function onDownload() { downloadArtifact(cur?.name, cur?.code ?? '', showToast) }
+  function onDownload() { downloadArtifact(cur, showToast) }
 
   // ── Save to Light App (HTML artifacts only) ─────────────────────────────
   let saveToLAName = $state('')
@@ -105,7 +107,7 @@
       {#if laLoading}
         <div class="empty"><iconify-icon icon="ant-design:loading-outlined" width="28" class="spin"></iconify-icon><span>{$t('common.loading')}</span></div>
       {:else if laCurHTML}
-        <iframe srcdoc={laCurHTML} sandbox="allow-scripts clipboard-write" title={laCurName}></iframe>
+        <iframe srcdoc={laCurHTML} sandbox="allow-scripts" allow="clipboard-write" title={laCurName}></iframe>
       {:else if $lightapps.length === 0}
         <div class="empty">
           <iconify-icon icon="ant-design:appstore-outlined" width="28"></iconify-icon>
@@ -179,17 +181,21 @@
         </div>
       {/if}
 
-      <div class="toolbar">
-        <div class="seg">
-          <button class="seg-btn" class:active={$artifactView === 'preview'} onclick={() => artifactView.set('preview')}>{$t('artifacts.preview')}</button>
-          <button class="seg-btn" class:active={$artifactView === 'code'} onclick={() => artifactView.set('code')}>{$t('artifacts.code')}</button>
+      {#if !curIsImage}
+        <div class="toolbar">
+          <div class="seg">
+            <button class="seg-btn" class:active={$artifactView === 'preview'} onclick={() => artifactView.set('preview')}>{$t('artifacts.preview')}</button>
+            <button class="seg-btn" class:active={$artifactView === 'code'} onclick={() => artifactView.set('code')}>{$t('artifacts.code')}</button>
+          </div>
+          <span class="sandboxed-label">{$t('artifacts.sandboxed')}</span>
         </div>
-        <span class="sandboxed-label">{$t('artifacts.sandboxed')}</span>
-      </div>
+      {/if}
 
       <div class="body">
-        {#if $artifactView === 'preview'}
-          <iframe srcdoc={cur.preview} sandbox="allow-scripts clipboard-write" title={cur.name}></iframe>
+        {#if curIsImage}
+          <div class="img-wrap"><img src={cur.src} alt={cur.name} /></div>
+        {:else if $artifactView === 'preview'}
+          <iframe srcdoc={cur.preview} sandbox="allow-scripts" allow="clipboard-write" title={cur.name}></iframe>
         {:else}
           <pre class="code-view">{cur.code}</pre>
         {/if}
@@ -243,6 +249,12 @@
   gap: 12px; padding: 32px; text-align: center; color: var(--text-tertiary); font-size: 13px;
 }
 iframe { border: 0; width: 100%; height: 100%; display: block; }
+.img-wrap {
+  width: 100%; height: 100%; box-sizing: border-box; padding: 8px;
+  display: flex; align-items: center; justify-content: center;
+  overflow: auto; background: var(--bg-layout);
+}
+.img-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .code-view {
   margin: 0; height: 100%; box-sizing: border-box; overflow: auto;
   padding: 14px 16px; background: var(--bg-sidebar); font-size: 12px; line-height: 1.7;
