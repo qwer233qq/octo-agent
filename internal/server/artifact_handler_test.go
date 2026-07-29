@@ -14,19 +14,45 @@ import (
 )
 
 // newArtifactSession persists a session whose transcript wrote the given
-// paths (one write_file tool_use per path) and returns its id.
+// paths — one write_file tool_use per path, each answered by a successful
+// tool_result, which is what the whitelist requires — and returns its id.
 func newArtifactSession(t *testing.T, paths ...string) string {
+	t.Helper()
+	return newArtifactSessionWith(t, "write_file", writeOK, paths...)
+}
+
+// writeOutcome describes the tool_result answering a recorded write.
+type writeOutcome int
+
+const (
+	writeOK     writeOutcome = iota // succeeded
+	writeDenied                     // the permission gate refused it
+)
+
+// newArtifactSessionWith builds a transcript with one call per path under the
+// given tool name, each paired with the described outcome.
+func newArtifactSessionWith(t *testing.T, tool string, outcome writeOutcome, paths ...string) string {
 	t.Helper()
 	sess := agent.NewSession("stub-model", "")
 	for i, p := range paths {
+		id := "t" + string(rune('0'+i))
 		sess.Messages = append(sess.Messages, agent.Message{
 			Role: agent.RoleAssistant,
 			Blocks: []agent.ContentBlock{{
 				Type:  "tool_use",
-				ID:    "t" + string(rune('0'+i)),
-				Name:  "write_file",
+				ID:    id,
+				Name:  tool,
 				Input: map[string]any{"path": p, "content": "x"},
 			}},
+		})
+		result := agent.NewToolResultBlock(id, "wrote "+p, false)
+		if outcome == writeDenied {
+			// Exactly what dispatchTools synthesises for a denied call.
+			result = agent.NewToolResultBlock(id, "permission_denied: user declined to run "+tool, true)
+		}
+		sess.Messages = append(sess.Messages, agent.Message{
+			Role:   agent.RoleUser,
+			Blocks: []agent.ContentBlock{result},
 		})
 	}
 	if err := sess.Save(); err != nil {
@@ -155,6 +181,10 @@ func TestHandleGetArtifact_ShowArtifactCountsAsWrite(t *testing.T) {
 			Type: "tool_use", ID: "t1", Name: "show_artifact",
 			Input: map[string]any{"path": p},
 		}}})
+	sess.Messages = append(sess.Messages, agent.Message{
+		Role:   agent.RoleUser,
+		Blocks: []agent.ContentBlock{agent.NewToolResultBlock("t1", "shown", false)},
+	})
 	if err := sess.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +216,10 @@ func TestHandleGetArtifact_EditCountsAsWrite(t *testing.T) {
 			Type: "tool_use", ID: "t1", Name: "edit_file",
 			Input: map[string]any{"path": p, "old_string": "a", "new_string": "b"},
 		}},
+	})
+	sess.Messages = append(sess.Messages, agent.Message{
+		Role:   agent.RoleUser,
+		Blocks: []agent.ContentBlock{agent.NewToolResultBlock("t1", "edited", false)},
 	})
 	if err := sess.Save(); err != nil {
 		t.Fatal(err)
@@ -223,6 +257,162 @@ func TestHandleGetArtifact_WorktreeOutsideServerCWD(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 	if w.Body.String() != "<p>worktree</p>" {
+		t.Errorf("body = %q", w.Body.String())
+	}
+}
+
+// A write the user refused must not become a readable path. The tool_use lands
+// in the transcript before the permission gate rules on it, so the call alone
+// cannot be the whitelist — otherwise denying a write grants a read.
+func TestHandleGetArtifact_DeniedWriteIsNotServed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	// The realistic shape: the file already exists, the agent proposes
+	// overwriting it, and the user says no. The bytes on disk are the user's.
+	artDir := t.TempDir()
+	private := filepath.Join(artDir, "private.md")
+	if err := os.WriteFile(private, []byte("# my notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	denied := newArtifactSessionWith(t, "write_file", writeDenied, private)
+	if w := getArtifact(t, srv, denied, private); w.Code != http.StatusNotFound {
+		t.Errorf("denied write: status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+
+	// An unanswered call that something else has already moved past is stale:
+	// this is what stops a denial from being harvestable after the fact, and it
+	// is the difference from the in-flight case covered by the test below.
+	stale := agent.NewSession("stub-model", "")
+	stale.Messages = append(stale.Messages,
+		agent.Message{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{{
+			Type: "tool_use", ID: "t0", Name: "write_file",
+			Input: map[string]any{"path": private, "content": "x"},
+		}}},
+		agent.Message{Role: agent.RoleUser, Content: "never mind"},
+	)
+	if err := stale.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if w := getArtifact(t, srv, stale.ID, private); w.Code != http.StatusNotFound {
+		t.Errorf("stale unanswered write: status = %d, want 404", w.Code)
+	}
+
+	// Same for a refused show_artifact, the other way into the whitelist.
+	deniedShow := newArtifactSessionWith(t, "show_artifact", writeDenied, private)
+	if w := getArtifact(t, srv, deniedShow, private); w.Code != http.StatusNotFound {
+		t.Errorf("denied show_artifact: status = %d, want 404", w.Code)
+	}
+
+	// The control: the same call, allowed, still serves.
+	allowed := newArtifactSessionWith(t, "write_file", writeOK, private)
+	if w := getArtifact(t, srv, allowed, private); w.Code != http.StatusOK {
+		t.Errorf("allowed write: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// Tool-call ids come from the model, so "this id succeeded somewhere in the
+// transcript" is not a fact about the call being asked about. Both of these
+// borrow an unrelated success to vouch for a denied write.
+func TestHandleGetArtifact_ForgedSuccessIsRejected(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	artDir := t.TempDir()
+	private := filepath.Join(artDir, "private.md")
+	if err := os.WriteFile(private, []byte("# my notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deniedWrite := agent.ContentBlock{
+		Type: "tool_use", ID: "X", Name: "write_file",
+		Input: map[string]any{"path": private, "content": "x"},
+	}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	// Across turns: the denied write in turn 1, then any harmless call in turn 2
+	// reusing its id and succeeding.
+	crossTurn := agent.NewSession("stub-model", "")
+	crossTurn.Messages = append(crossTurn.Messages,
+		agent.Message{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{deniedWrite}},
+		agent.Message{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			agent.NewToolResultBlock("X", "permission_denied: user declined", true),
+		}},
+		agent.Message{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{{
+			Type: "tool_use", ID: "X", Name: "terminal",
+			Input: map[string]any{"command": "true"},
+		}}},
+		agent.Message{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			agent.NewToolResultBlock("X", "ok", false),
+		}},
+	)
+	if err := crossTurn.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if w := getArtifact(t, srv, crossTurn.ID, private); w.Code != http.StatusNotFound {
+		t.Errorf("id reused across turns: status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+
+	// Within one batch: two calls share an id, and the surviving result is the
+	// sibling's success (normalizeMessages keeps the first of a duplicate pair).
+	sameBatch := agent.NewSession("stub-model", "")
+	sameBatch.Messages = append(sameBatch.Messages,
+		agent.Message{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{
+			{Type: "tool_use", ID: "X", Name: "terminal", Input: map[string]any{"command": "true"}},
+			deniedWrite,
+		}},
+		agent.Message{Role: agent.RoleUser, Blocks: []agent.ContentBlock{
+			agent.NewToolResultBlock("X", "ok", false),
+		}},
+	)
+	if err := sameBatch.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if w := getArtifact(t, srv, sameBatch.ID, private); w.Code != http.StatusNotFound {
+		t.Errorf("id reused in one batch: status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// The live case, which is the whole reason an unanswered call is servable. The
+// panel is told to fetch from inside dispatchTools: EventToolDone carries the
+// ui_payload, the web handler broadcasts it and then persists (ws_handlers.go),
+// and the tool_result message is only appended once dispatchTools returns. So
+// the transcript the client's fetch reads ends at the tool_use. Requiring a
+// result would 404 every write the user just watched happen.
+func TestHandleGetArtifact_ServesAWriteStillInFlight(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	artDir := t.TempDir()
+	p := filepath.Join(artDir, "report.md")
+	if err := os.WriteFile(p, []byte("# report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the mid-turn shape: user message, then the assistant's tool_use,
+	// and nothing yet after it.
+	sess := agent.NewSession("stub-model", "")
+	sess.Messages = append(sess.Messages,
+		agent.Message{Role: agent.RoleUser, Content: "write the report"},
+		agent.Message{Role: agent.RoleAssistant, Blocks: []agent.ContentBlock{{
+			Type: "tool_use", ID: "t0", Name: "write_file",
+			Input: map[string]any{"path": p, "content": "# report"},
+		}}},
+	)
+	if err := sess.Save(); err != nil {
+		t.Fatal(err)
+	}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	w := getArtifact(t, srv, sess.ID, p)
+	if w.Code != http.StatusOK {
+		t.Fatalf("in-flight write: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if w.Body.String() != "# report" {
 		t.Errorf("body = %q", w.Body.String())
 	}
 }

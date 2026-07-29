@@ -15,10 +15,10 @@ import (
 //
 // Serves a previewable file the session's agent wrote, for the web Artifacts
 // panel (dev-docs/web-artifacts-panel-design.md). The path must be one this
-// session actually wrote: the whitelist is derived from the transcript's
-// tool_use blocks on each request, so it needs no extra state and survives
-// restarts. Anything not on the whitelist — including files that exist but
-// were never written by this session — is a 404.
+// session actually wrote: the whitelist is derived on each request from the
+// transcript's tool_use blocks *and the results answering them*, so it needs no
+// extra state and survives restarts. Anything not on the whitelist — including
+// files that exist but were never written by this session — is a 404.
 
 // artifactMaxBytes caps what the panel will serve inline; bigger files get a
 // 413 and the panel offers no preview. Artifact HTML bundles run 200 KB–2 MB.
@@ -91,27 +91,100 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {
 
 // sessionWrotePath looks for a write_file, edit_file, or show_artifact tool_use
 // in the transcript whose path input matches reqPath (after Clean on both
-// sides — the payloads carry absolute paths, so no base-dir join is needed).
-// show_artifact is how script-produced files (built rather than written through
-// the file tools) enter the whitelist. On a match it returns the transcript's
-// own copy of the path so callers serve a value sourced from what the agent
-// recorded rather than from the raw request.
+// sides — the payloads carry absolute paths, so no base-dir join is needed) and
+// which actually ran. show_artifact is how script-produced files (built rather
+// than written through the file tools) enter the whitelist. On a match it
+// returns the transcript's own copy of the path so callers serve a value sourced
+// from what the agent recorded rather than from the raw request.
+//
+// The "actually ran" half matters: the agent records a tool_use before the
+// permission gate rules on it, so a write the user *denied* sits in the
+// transcript looking exactly like one that succeeded. Trusting the call alone
+// means refusing a write grants a read of that path instead — the reverse of
+// what the user just decided.
 func sessionWrotePath(sess *agent.Session, reqPath string) (string, bool) {
 	want := filepath.Clean(reqPath)
-	for _, m := range sess.Messages {
+	for i, m := range sess.Messages {
 		for _, b := range m.Blocks {
 			if b.Type != "tool_use" || (b.Name != "write_file" && b.Name != "edit_file" && b.Name != "show_artifact") {
 				continue
 			}
 			p, ok := b.Input["path"].(string)
-			if ok {
-				if clean := filepath.Clean(p); clean == want {
-					return clean, true
-				}
+			if !ok {
+				continue
 			}
+			clean := filepath.Clean(p)
+			if clean != want || !callAuthorized(sess.Messages, i, b.ID) {
+				continue
+			}
+			return clean, true
 		}
 	}
 	return "", false
+}
+
+// callAuthorized reports whether the tool_use with the given id in messages[i]
+// may serve its path. A gate denial and a genuine execution failure both come
+// back as IsError=true (see dispatchTools), and the result is the only place the
+// transcript records what became of a call — so the rule is that an *answered*
+// call must have been answered without error.
+//
+// Pairing is scoped to the next message rather than searched for across the
+// transcript, because tool-call ids come from the model, not the runtime. A
+// transcript-wide set of "ids that succeeded" is forgeable: emit a write the
+// user is going to deny, then reuse that same id on a trivial call that
+// succeeds, and the denial inherits the success. Scoping also just matches the
+// wire format — an assistant tool_use message is answered by the next user
+// message, and the agent loop appends the two back to back — so nothing
+// legitimate depends on a wider search.
+//
+// A call with nothing after it at all is allowed, and that is not laxness — it
+// is the live case. The panel is told to fetch from inside dispatchTools:
+// EventToolDone carries the ui_payload, the web handler broadcasts it and then
+// persists (ws_handlers.go), and the tool_result message is only appended once
+// dispatchTools returns. So at the moment the client asks, the newest thing on
+// disk is the tool_use itself. Requiring a result here would 404 every write the
+// user just watched happen.
+//
+// The window that leaves open is narrow and bounded: a denied write is
+// momentarily unanswered too, until the error result reaches disk on the next
+// event. Nothing points a client at that path in the meantime — a denied call
+// produces no ui_payload — so reaching it means already knowing the path and
+// racing a sub-second write. Once any later message exists, an unanswered call
+// is stale and refused, which is what keeps a denial from being harvestable
+// afterwards. That is the property #1891 was actually about.
+//
+// Context reclamation is safe for all of this: it rewrites a stale result's text
+// but preserves ToolUseID and IsError.
+func callAuthorized(msgs []agent.Message, i int, id string) bool {
+	if id == "" {
+		return false
+	}
+	// An id repeated inside one batch is unusable: whichever sibling succeeded
+	// would vouch for the other.
+	uses := 0
+	for _, b := range msgs[i].Blocks {
+		if b.Type == "tool_use" && b.ID == id {
+			uses++
+		}
+	}
+	if uses != 1 {
+		return false
+	}
+	if i+1 >= len(msgs) {
+		return true // in flight, or the process died holding it
+	}
+	answered := false
+	for _, b := range msgs[i+1].Blocks {
+		if b.Type != "tool_result" || b.ToolUseID != id {
+			continue
+		}
+		if b.IsError {
+			return false
+		}
+		answered = true
+	}
+	return answered
 }
 
 // resolveArtifactPath validates a path from a tool UI payload. UI payloads carry
