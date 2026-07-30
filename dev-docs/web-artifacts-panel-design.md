@@ -1,6 +1,6 @@
 # Web Artifacts Panel
 
-A collapsible right sidebar in the web session view that collects previewable files the agent produces during a session — HTML pages, Markdown documents, and images — and renders them in place. The flagship case is a skill like `web-artifacts-builder` emitting a self-contained `bundle.html`: the user sees it rendered next to the conversation instead of hunting for a path in tool output.
+A collapsible right sidebar in the web session view that collects previewable files the agent produces during a session — HTML pages, Markdown documents, images, and plain-text/code files — and renders them in place. The flagship case is a skill like `web-artifacts-builder` emitting a self-contained `bundle.html`: the user sees it rendered next to the conversation instead of hunting for a path in tool output.
 
 ## Goals
 
@@ -12,7 +12,7 @@ A collapsible right sidebar in the web session view that collects previewable fi
 
 - Not a file browser: only files this session's agent wrote appear, nothing else on disk.
 - No artifact persistence layer of its own — the session transcript is the source of truth.
-- Code files (`.go`, `.ts`, …) don't enter the panel; diffs and editors are a different feature.
+- No diff or editor views; code files preview as read-only plain text.
 - No editing inside the preview.
 
 ## Artifact model
@@ -24,6 +24,9 @@ An artifact is identified by its absolute path. It qualifies by extension:
 | html | `.html`, `.htm` | sandboxed iframe |
 | markdown | `.md`, `.markdown` | `marked` render (same pipeline as chat messages) |
 | image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp` | `<img>` via blob URL |
+| code | `.js`, `.ts`, `.jsx`, `.tsx`, `.mjs`, `.cjs`, `.css`, `.scss`, `.less`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.go`, `.rs`, `.sh`, `.bash`, `.zsh`, `.txt`, `.xml`, `.csv` | escaped monospace text in the sandboxed iframe |
+
+The code-kind extension set is defined twice — `EXT_KIND` in `web/src/lib/artifacts.ts` and `artifactTextExts` in `internal/tools/artifact.go` — and the two must stay identical: a kind the client recognizes but the endpoint refuses makes the fetch 404 and the artifact silently vanish from the panel.
 
 A write to an already-listed path updates that entry (and refreshes the preview if it is open) rather than appending a duplicate. The list orders by last-write time, newest first. Artifacts are per-session; switching sessions swaps the list.
 
@@ -50,7 +53,7 @@ GET /api/sessions/{id}/artifacts?path=<absolute path>
 
 Response headers:
 
-- `Content-Type` from the extension (`text/html`, `text/markdown`, `image/*`)
+- `Content-Type` from the extension (`text/html`, `text/markdown`, `image/*`; every code kind is pinned to `text/plain` — never its native type — so a directly-opened URL can only ever be a plain-text document)
 - `X-Content-Type-Options: nosniff`
 - `Content-Security-Policy: sandbox` — defense in depth should anyone open the URL directly in a tab; the primary isolation is the iframe sandbox below
 - Size cap 10 MB (artifact HTML bundles run 200 KB–2 MB); larger files return 413 and the panel shows a download-only entry
@@ -62,6 +65,7 @@ Agent-generated HTML is untrusted by definition (prompt injection can author it)
 - **HTML**: fetched as text, injected into `<iframe sandbox="allow-scripts" srcdoc=…>`. No `allow-same-origin` — scripts run, but in an opaque origin with no cookies, no `localStorage`, no reach back into the app. This is the same model claude.ai artifacts use.
 - **Markdown**: rendered with the existing `marked` pipeline used for assistant chat messages — the same trust class (model-authored content) with the same posture.
 - **Images**: fetched as a blob, shown via object URL; never interpreted as HTML (nosniff + explicit Content-Type).
+- **Code/text**: fetched as text, HTML-escaped, and rendered as a `<pre>` inside the same sandboxed iframe; served as `text/plain` so the bytes never gain a script, stylesheet, or XML rendering context.
 
 ## UI
 
@@ -78,7 +82,7 @@ Agent-generated HTML is untrusted by definition (prompt injection can author it)
 ```
 
 - Mirrors the existing left `<aside id="sidebar">` pattern on the right of `<main id="main">`: a `<aside id="artifacts-panel">` that is hidden until the session has at least one artifact, then shows a header toggle with a count badge.
-- Collapsed by default; auto-opens the first time an artifact appears in a **live** turn (not on history replay — reloading an old session shouldn't pop the panel).
+- Collapsed by default; auto-opens the first time an artifact appears in a **live** turn (not on history replay — reloading an old session shouldn't pop the panel). Code kinds enter the list but never trigger the auto-open and don't consume its once-per-session flag: source-file writes are the routine bulk of a coding session, and a later HTML report or chart should still pop the panel.
 - List rows: kind icon, basename, relative time. Row actions: preview (default), open raw in new tab, download.
 - Preview fills the lower pane; HTML previews get a refresh button (re-fetch + re-render).
 - Narrow viewports (≤768px, the existing mobile breakpoint): the panel becomes an overlay like the left sidebar's mobile mode.
