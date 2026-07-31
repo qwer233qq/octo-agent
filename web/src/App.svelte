@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { view, sessions, sessionGroups, activeSessionId, showToast, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode, nativeShell, mobileShell, panelContent } from './lib/stores'
+  import { view, sessions, sessionGroups, activeSessionId, showToast, onboardPhase, openAgentSession, chatShowReasoning, globalPermissionMode, nativeShell, mobileShell, panelContent, cmdkOpen } from './lib/stores'
   import MobileApp from './mobile/MobileApp.svelte'
   import { ws, wsState } from './lib/ws'
   import { notificationsEnabled } from './lib/notifications'
@@ -25,6 +25,7 @@
   import ProfileView from './views/ProfileView.svelte'
   import FileRecallView from './views/FileRecallView.svelte'
   import LightAppsView from './views/LightAppsView.svelte'
+  import ComponentsView from './views/ComponentsView.svelte'
   import CommandPalette from './components/overlays/CommandPalette.svelte'
   import McpModal from './components/overlays/McpModal.svelte'
   import ConfirmModal from './components/overlays/ConfirmModal.svelte'
@@ -43,7 +44,7 @@
   // Reflect the current view (and active chat session) in the hash so a refresh
   // lands back where the user was instead of the default chat view.
   let routeReady = false
-  const VALID_VIEWS = ['chat', 'agents', 'skills', 'workflows', 'browser', 'tasks', 'mcp', 'channels', 'settings', 'profile', 'files', 'lightapps']
+  const VALID_VIEWS = ['chat', 'agents', 'skills', 'workflows', 'browser', 'tasks', 'mcp', 'channels', 'settings', 'profile', 'files', 'lightapps', 'components']
 
   function applyHash() {
     const h = location.hash.replace(/^#\/?/, '')
@@ -328,7 +329,18 @@
     const lang = get(locale).startsWith('zh') ? 'zh' : 'en'
     openAgentSession(`/onboard lang:${lang}`, '✨ Onboard').catch(() => {})
   }
+
+  // Cmd/Ctrl+K toggles the command palette — the Header pill advertises the
+  // shortcut, and it fires even while an input has focus (palette convention).
+  function onGlobalKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
+      e.preventDefault()
+      cmdkOpen.update(v => !v)
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onGlobalKeydown} />
 
 {#if authDenied}
   <div class="splash splash-msg">{$t('auth.denied')}</div>
@@ -368,6 +380,8 @@
         <FileRecallView />
       {:else if $view === 'lightapps'}
         <LightAppsView />
+      {:else if $view === 'components'}
+        <ComponentsView />
       {/if}
     </main>
     {#if $panelContent}
@@ -418,7 +432,7 @@
   max-width: 420px; margin: 0 auto;
 }
 .splash .spinner {
-  width: 28px; height: 28px; border: 3px solid rgba(22,119,255,0.2);
+  width: 28px; height: 28px; border: 3px solid var(--blue-2);
   border-top-color: var(--blue-6); border-radius: 50%;
   animation: octo-spin 0.7s linear infinite;
 }
