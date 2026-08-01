@@ -306,8 +306,10 @@
 
   function parseSlashInput(value: string): { mode: SlashItem['kind'] | null; query: string; serverName?: string } {
     const trimmed = normalizeSlash(value)
-    // A leading "@" with no whitespace summons the agent picker, mirroring
-    // the "/" skill trigger (the design's \u8f93\u5165 @ \u4e5f\u53ef\u5524\u8d77).
+    // A leading "@" with no whitespace summons the agent picker — only
+    // meaningful before the session is locked (see handleSlashInput's
+    // agentLocked guard): agent_profile can be reassigned up until the
+    // session's first turn runs, never after.
     if (/^@\S*$/.test(trimmed)) {
       return { mode: 'agent', query: trimmed.slice(1).toLowerCase() }
     }
@@ -451,7 +453,10 @@
       return
     }
     if (parsed.mode === 'agent') {
-      showSlashMenu('agents', parsed.query)
+      // Once a session has run its first turn, agent_profile is locked —
+      // "@" is just a character then, not a picker trigger.
+      if (!agentLocked) showSlashMenu('agents', parsed.query)
+      else hideSlashMenu()
       return
     }
     if (parsed.mode === 'workflow') {
@@ -614,22 +619,40 @@
   })
 
   // ── agent assignment ───────────────────────────────────────────────────────
-  // agent_profile is fixed at session creation (no server-side update path), so
-  // the chip *assigns the agent for new sessions* (the activeAgent store that
-  // ensureActiveSession passes to createSession). On an existing session it
-  // shows that session's own profile.
+  // agent_profile can be (re)assigned right up until the session's first turn
+  // runs — the server 409s a rebind past that point, since a turn may already
+  // have applied the old profile's system prompt/tool allowlist (see
+  // handleUpdateSessionAgentProfile). Before that point — no session yet, or
+  // an existing session with turn_count 0 — the chip stays a live picker;
+  // once locked, it becomes a read-only label of the session's own profile.
   let agents = $state<api.Agent[]>([])
+  let agentLocked = $derived(!!currentSession && ((currentSession as any)?.turn_count ?? 0) > 0)
   let sessionAgent = $derived((currentSession as any)?.agent_profile ?? '')
+  // Which id is "current" right now: the session's own profile once one
+  // exists (even pre-lock), else the pending pick for the session about to
+  // be auto-created (ensureActiveSession in ChatView reads the activeAgent
+  // store, mirroring the sidebar's own new-session picker).
+  let effectiveAgentId = $derived(currentSession ? sessionAgent : $activeAgent)
   // Empty when the default agent applies — the chip only renders for an
-  // expert agent; the default state keeps a bare "@" ghost button instead.
+  // expert agent.
   let agentLabel = $derived.by(() => {
-    const id = sessionAgent && sessionAgent !== 'default' ? sessionAgent : ($activeAgent !== 'default' ? $activeAgent : '')
-    if (!id) return ''
-    return agents.find(a => a.id === id)?.name ?? id
+    if (!effectiveAgentId || effectiveAgentId === 'default') return ''
+    return agents.find(a => a.id === effectiveAgentId)?.name ?? effectiveAgentId
   })
-  function pickAgent(id: string) {
-    activeAgent.set(id)
+  async function pickAgent(id: string) {
     agentMenu = false
+    if (currentSession) {
+      if (id !== sessionAgent) {
+        try {
+          await api.updateSessionAgentProfile(sid, id)
+          sessions.update(list => list.map((s: any) => s.id === sid ? { ...s, agent_profile: id } : s))
+        } catch (e: any) {
+          showToast(e.message ?? 'Failed to change agent', 'error')
+        }
+      }
+    } else {
+      activeAgent.set(id)
+    }
     queueMicrotask(() => textareaEl?.focus())
   }
   let dirDraft = $state('')
@@ -901,6 +924,16 @@
       }
     }
 
+    // Backspace on an empty box un-assigns the picked agent (back to Default)
+    // instead of doing nothing — only while it's still changeable (agentLocked
+    // false) and there's actually something assigned to clear. Lets the user
+    // immediately reselect via "@" without hunting for the dropdown.
+    if (e.key === 'Backspace' && text === '' && !slashMenu && !agentLocked && agentLabel) {
+      e.preventDefault()
+      pickAgent('default')
+      return
+    }
+
     // Enter sends (mid-turn: steers); Cmd/Ctrl+Enter queues as the next turn;
     // Shift+Enter falls through to the textarea's own newline. See composerKeys.
     const intent = submitIntent(e)
@@ -962,19 +995,25 @@
       {/if}
       <div class="input-row">
         {#if agentLabel}
+        {#if agentLocked}
+        <span class="agent-chip" title={$t('composer.session_agent')}>
+          <span class="agent-at">@</span>
+          <span class="agent-name">{agentLabel}</span>
+        </span>
+        {:else}
         <div class="picker">
-          <button class="agent-chip" title={$t('composer.assign_agent')} onclick={(e) => { e.stopPropagation(); const open = agentMenu; closeMenus(); agentMenu = !open }}>
+          <button class="agent-chip pickable" title={$t('composer.assign_agent')} onclick={(e) => { e.stopPropagation(); const open = agentMenu; closeMenus(); agentMenu = !open }}>
             <span class="agent-at">@</span>
             <span class="agent-name">{agentLabel}</span>
           </button>
           {#if agentMenu}
             <div class="menu agent-menu" onclick={(e) => e.stopPropagation()}>
               <div class="menu-label">{$t('composer.assign_agent')}</div>
-              <button class="menu-item" class:active={$activeAgent === 'default' && (!sessionAgent || sessionAgent === 'default')} onclick={() => pickAgent('default')}>
+              <button class="menu-item" class:active={effectiveAgentId === 'default'} onclick={() => pickAgent('default')}>
                 <span class="mi-name">Default</span>
               </button>
               {#each agents as a (a.id)}
-                <button class="menu-item" class:active={$activeAgent === a.id} onclick={() => pickAgent(a.id)}>
+                <button class="menu-item" class:active={effectiveAgentId === a.id} onclick={() => pickAgent(a.id)}>
                   <span class="mi-name">{a.name}</span>
                 </button>
               {/each}
@@ -986,6 +1025,7 @@
             </div>
           {/if}
         </div>
+        {/if}
         {/if}
         <textarea
           bind:this={textareaEl}
@@ -1270,9 +1310,10 @@ textarea {
   height: 28px; padding: 0 10px 0 5px; margin: 0 2px 2px 0;
   background: var(--active-blue-bg); border: none; border-radius: 8px;
   color: var(--blue-6); font-size: 12px; font-weight: 600;
-  cursor: pointer; font-family: inherit; flex: 0 0 auto;
+  font-family: inherit; flex: 0 0 auto;
 }
-.agent-chip:hover { background: var(--row-hover); }
+.agent-chip.pickable { cursor: pointer; }
+.agent-chip.pickable:hover { background: var(--row-hover); }
 .agent-at {
   width: 16px; height: 16px; border-radius: 5px;
   background: var(--blue-6); color: var(--on-accent);
