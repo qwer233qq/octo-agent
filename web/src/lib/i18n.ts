@@ -36,7 +36,7 @@ export const en: Record<string, string> = {
   "nav.light_apps": "Light Apps",
   "nav.file_recall": "File Recall",
   "nav.settings": "Settings",
-  "nav.manage": "More settings",
+  "nav.manage": "More",
   "nav.agents": "Agents",
   "nav.workbench": "Agent Workbench",
   "agents.desc": "Create and manage custom agent personalities for different tasks",
