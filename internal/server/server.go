@@ -427,6 +427,7 @@ func New(cfg Config) (*Server, error) {
 	// file), so calling it from both paths is harmless.
 	_ = skills.MaterializeDefaults(version.Version)
 	_ = tools.MaterializeDefaultWorkflows(version.Version)
+	_ = agentprofile.MaterializeDefaults(version.Version)
 	_ = workflow.PruneJournals()
 
 	cwd, _ := os.Getwd()
@@ -897,6 +898,7 @@ func (s *Server) registerRoutes() {
 	s.api("DELETE /api/agents/{id}", s.handleDeleteAgent)
 	s.api("POST /api/agents/{id}/bind", s.handleBindAgent)
 	s.api("DELETE /api/agents/{id}/bind", s.handleUnbindAgent)
+	s.api("PATCH /api/agents/{id}/toggle", s.handleToggleAgent)
 
 	// MCP server management
 	s.api("GET /api/mcp/servers", s.handleListMCPServers)
@@ -1639,14 +1641,11 @@ func (s *Server) curSkillsManifest() string {
 }
 
 // curSkillsManifestForProfile is curSkillsManifest filtered to the profile's
-// ToolSkills. When profile is nil or declares no ToolSkills, the full manifest
-// is returned (default agent behavior). Resolved fresh per turn so profile
-// edits land on the next message.
+// ToolSkills — see skills.ManifestForProfile for the per-source empty-
+// allowlist rule (builtin sees everything, everyone else sees nothing until
+// they opt in). Resolved fresh per turn so profile edits land on the next
+// message.
 func (s *Server) curSkillsManifestForProfile(profile *agentprofile.Profile) string {
-	raw := s.curSkillsManifest()
-	if profile == nil || len(profile.ToolSkills) == 0 {
-		return raw
-	}
 	return skills.ManifestForProfile(s.skillReg, profile)
 }
 
@@ -2223,6 +2222,9 @@ func (s *Server) agentRouter() *agentprofile.Router {
 			return
 		}
 		s.agentStore = agentprofile.New(agentUserDir())
+		if cfg, err := config.Load(); err == nil {
+			s.agentStore.SetDisabledDefaults(cfg.Agents.DisabledDefaults)
+		}
 		s.agentRouterVal = agentprofile.NewRouter(s.agentStore)
 	})
 	return s.agentRouterVal
