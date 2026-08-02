@@ -28,7 +28,7 @@ func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
 		Force  bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeInvalidJSONBody(w, err)
 		return
 	}
 	source := strings.TrimSpace(req.Source)
