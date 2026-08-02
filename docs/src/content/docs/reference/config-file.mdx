@@ -31,7 +31,7 @@ anything friendly.
 | `compact_auto_pct` | int | Auto-compaction threshold as % of the context window (default `75`); the same threshold is checked both between turns and after each tool-call batch |
 | `reasoning_effort` | string | Global reasoning intensity: `low` \| `medium` \| `high` \| `xhigh` \| `max`; empty means off |
 | `show_reasoning` | bool | Global default for surfacing the reasoning trace to the Web UI |
-| `workspace_dir` | string | Default working dir for new web sessions; `"auto"` → `~/Desktop/octo` |
+| `workspace_dir` | string | Default working dir for new web sessions; empty → `~/Octo`, or set a literal path to override |
 | `tools` | [tools block](#tools-block) | Per-tool behavior knobs |
 | `browser` | [browser block](#browser-block) | Chrome connection settings |
 | `goal` | `{ enabled: bool }` | Gates `/goal` and the goal tools (default enabled) |
@@ -45,6 +45,22 @@ When the agent edits this file, octo validates it right after the write and warn
 in the turn if it no longer parses or has a semantic problem (a `default`
 pointing at a missing endpoint, a duplicate id or half-filled entry) — a broken edit otherwise
 degrades silently, since octo keeps using the last config that parsed cleanly.
+
+## Working directory
+
+octo tracks a working directory per surface, not one global cwd:
+
+- **TUI / CLI** (`octo`, `octo -c`) always run tools in the directory you launched them from —
+  `workspace_dir` and the per-session override below don't apply. Whatever directory the shell
+  process inherited is what `read_file`, `terminal`, and every other tool resolve relative paths
+  against.
+- **Web sessions** get theirs in two steps: a new session with no directory of its own defaults to
+  `workspace_dir` (empty → `~/Octo`, created on first use); the directory chip in the Composer (or
+  `PATCH /api/sessions/{id}/working_dir`) then overrides that default for just that session, and
+  the override sticks even if `workspace_dir` changes later.
+- The **server's own launch directory** (where `octo serve` or the desktop app started) is separate
+  from both of the above — it only seeds skill discovery and the project-level memory root, not any
+  session's tool cwd.
 
 ## Endpoint
 

@@ -29,7 +29,7 @@ flag。所有字段都是可选的——文件不存在，或者字段缺失，�
 | `compact_auto_pct` | int | 自动压缩阈值,按上下文窗口的百分比（默认 `75`）；同一个阈值在轮次之间和每个工具调用批次后都会检查 |
 | `reasoning_effort` | string | 全局推理强度：`low` \| `medium` \| `high` \| `xhigh` \| `max`；留空表示关闭 |
 | `show_reasoning` | bool | 是否把推理轨迹提供给 Web UI 的全局默认值 |
-| `workspace_dir` | string | 新建 Web 会话的默认工作目录；`"auto"` → `~/Desktop/octo` |
+| `workspace_dir` | string | 新建 Web 会话的默认工作目录；留空 → `~/Octo`，也可填写具体路径覆盖 |
 | `tools` | [tools 配置块](#tools-配置块) | 各工具的行为开关 |
 | `browser` | [browser 配置块](#browser-配置块) | Chrome 连接设置 |
 | `goal` | `{ enabled: bool }` | 控制 `/goal` 和目标相关工具（默认启用） |
@@ -40,6 +40,19 @@ flag。所有字段都是可选的——文件不存在，或者字段缺失，�
 | `terminal_title` | bool | 仅 TUI：启动时将终端标签/窗口标题设为会话名（OSC 2，Ghostty、iTerm2、Kitty 及大多数现代终端支持；默认 `true`） |
 
 当 agent 编辑这个文件时,octo 会在写入后立刻校验:如果不再能解析、或有语义问题(`default` 指向不存在的端点、id 重复或字段不全),会在当前这一轮里给出警告——否则坏改动会静默降级,因为 octo 会继续用最后一份能正常解析的配置。
+
+## 工作目录
+
+octo 按不同界面分别追踪工作目录,而不是一个全局 cwd:
+
+- **TUI / CLI**（`octo`、`octo -c`）永远在启动它的那个目录里跑工具——`workspace_dir` 和下面的
+  单会话覆盖都不适用。shell 进程继承的是哪个目录，`read_file`、`terminal` 等所有工具的相对路径
+  就以哪个目录为准。
+- **Web 会话**分两步确定:一个还没有自己目录的新会话,默认用 `workspace_dir`(留空 → `~/Octo`,
+  首次用到时才创建);Composer 里的目录选择器（或 `PATCH /api/sessions/{id}/working_dir`）会为
+  这一个会话单独覆盖这个默认值,而且这个覆盖会一直生效,哪怕之后 `workspace_dir` 又改了。
+- **服务器进程自身的启动目录**（`octo serve` 或桌面端启动时所在的目录）和上面两者都无关——它只
+  决定技能发现和项目级记忆的根目录，不影响任何会话的工具 cwd。
 
 ## 端点
 
