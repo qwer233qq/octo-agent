@@ -58,6 +58,7 @@
   import { renderMarkdown, setupCopyButtons } from '../lib/markdown'
   import { t, tr, pickLocalized } from '../lib/i18n'
   import { insertPendingSend } from '../lib/pendingSendOrder'
+  import { exportModeStore, selectedMessagesStore } from '../lib/exportStore'
   import ToolGroup from '../components/chat/ToolGroup.svelte'
   import SubAgentsCard from '../components/chat/SubAgentsCard.svelte'
   import WorkflowsCard from '../components/chat/WorkflowsCard.svelte'
@@ -177,6 +178,12 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   })
 
   let lightboxSrc = $state<string | null>(null)
+
+  // ── export mode ─────────────────────────────────────────────────────────────
+  let inExportMode = $derived($exportModeStore[$activeSessionId ?? ''] ?? false)
+  let selectedIds   = $derived($selectedMessagesStore[$activeSessionId ?? ''] ?? new Set<string>())
+  let exportBusy    = $state(false)
+  let exportIncludeTools = $state(false)
 
   let pendingSteerList = $state<{ pendingId: string; text: string; files?: any[]; retracting?: boolean; queued?: boolean }[]>([])
 
@@ -1466,15 +1473,70 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
     if (sid) chatSuggestion.update(s => ({ ...s, [sid]: '' }))
   }
 
-  // ── export the visible transcript as a markdown file ────────────────────────
-  async function exportTranscript() {
+  // ── export mode helpers ────────────────────────────────────────────────────
+
+  function enterExportMode() {
     const sid = get(activeSessionId)
     if (!sid) return
+    const msgsForSession = get(chatMessages)[sid] ?? []
+    const selectable = msgsForSession
+      .filter((m: any) => m.type === 'user' || m.type === 'assistant')
+      .map((m: any) => m.id)
+    selectedMessagesStore.initForSession(sid, selectable)
+    exportModeStore.enter(sid)
+  }
 
-    // Fetch complete history from server instead of relying on the local
-    // chatMessages store, which may only contain a partial view of the
-    // session. The server has no pagination (GET .../messages always returns
-    // the full transcript), so there is nothing to page through here.
+  function exitExportMode() {
+    const sid = get(activeSessionId)
+    if (!sid) return
+    exportModeStore.exit(sid)
+    selectedMessagesStore.clear(sid)
+    exportBusy = false
+    exportIncludeTools = false
+  }
+
+  function toggleSelect(msgId: string) {
+    const sid = get(activeSessionId)
+    if (!sid) return
+    selectedMessagesStore.toggle(sid, msgId)
+  }
+
+  // Filter server events to only those corresponding to selected local messages.
+  // User/assistant events are matched by running index against local msgs of the
+  // same type; tool_call, tool_result and thinking events always ride along.
+  //
+  // handleHistoryEvent skips creating a local bubble for an assistant_message
+  // whose content AND thinking are both empty (tool-only rounds) — see its
+  // comment above. That predicate is duplicated here so the index walk stays
+  // aligned: without it, any such event would consume a uaIdx slot that no
+  // local message ever occupied, permanently shifting every match after it.
+  function filterEventsBySelection(events: any[]): any[] {
+    const sid = get(activeSessionId)
+    if (!sid) return events
+    const selected = selectedMessagesStore.getForSession(sid)
+    const allLocal = get(chatMessages)[sid] ?? []
+    const localUA = allLocal.filter((m: any) => m.type === 'user' || m.type === 'assistant')
+    let uaIdx = 0
+
+    const result: any[] = []
+    for (const ev of events) {
+      const etype = ev.type ?? ''
+      const isEmptyAssistant = etype === 'assistant_message' &&
+        !(ev.content ?? '').trim() && !(ev.thinking ?? '').trim()
+      if ((etype === 'history_user_message' || etype === 'assistant_message') && !isEmptyAssistant) {
+        const local = localUA[uaIdx]
+        uaIdx++
+        if (local && selected.has(local.id)) result.push(ev)
+      } else {
+        result.push(ev)
+      }
+    }
+    return result
+  }
+
+  async function fetchEvents(): Promise<{ events: any[]; sid: string } | null> {
+    const sid = get(activeSessionId)
+    if (!sid) return null
     let events: any[] = []
     try {
       const data = await api.getSessionMessages(sid)
@@ -1482,18 +1544,37 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
     } catch (e) {
       console.error('Export failed:', e)
       showToast(tr('chat.export_failed'), 'error')
-      return
+      return null
     }
+    if (!events.length) {
+      showToast(tr('chat.nothing_to_export'), 'error')
+      return null
+    }
+    return { events, sid }
+  }
 
-    if (!events.length) { showToast(tr('chat.nothing_to_export'), 'error'); return }
+  function triggerDownload(content: string, filename: string, mime: string) {
+    const blob = new Blob([content], { type: mime })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
 
-    const title = currentSession?.title ?? currentSession?.name ?? 'session'
+  // Returns whether the export actually completed, so the caller only exits
+  // export mode (and drops the user's checkbox selection) on success — not on
+  // "nothing selected" or a cancelled/failed native save.
+  async function exportAsMarkdown(events: any[], title: string): Promise<boolean> {
+    const filtered = filterEventsBySelection(events)
+    if (!filtered.length) { showToast(tr('chat.nothing_to_export'), 'error'); return false }
+
     const lines: string[] = [`# ${title}`, '']
     let omittedToolEvents = false
 
-    for (const ev of events) {
+    for (const ev of filtered) {
       const type = ev.type ?? ''
-
       if (type === 'history_user_message') {
         lines.push('## You', '')
         lines.push(ev.content ?? '', '')
@@ -1504,12 +1585,17 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
         }
         lines.push(ev.content ?? '', '')
       } else if (type === 'thinking' && ev.text) {
-        // Standalone thinking block (tool round) — include as a note.
         lines.push('<!-- Thinking -->', ev.text, '')
       } else if (type === 'tool_call' || type === 'tool_result') {
-        // Rendered as tool cards in the UI but don't belong in a readable
-        // markdown transcript — noted below rather than silently dropped.
-        omittedToolEvents = true
+        if (exportIncludeTools) {
+          if (type === 'tool_call') {
+            lines.push(`- **Tool call**: ${ev.tool_name ?? ev.name ?? 'unknown'}`, '')
+          } else {
+            lines.push(`- **Tool result**: ${typeof ev.content === 'string' ? ev.content.slice(0, 500) : '(non-text result)'}`, '')
+          }
+        } else {
+          omittedToolEvents = true
+        }
       }
     }
 
@@ -1518,23 +1604,52 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
     if (get(nativeShell)) {
       try {
         const r = await api.nativeSaveFile(`${title_safe}.md`, content)
-        if (r.cancelled) return
+        if (r.cancelled) return false
       } catch {
         showToast(tr('chat.export_failed'), 'error')
-        return
+        return false
       }
     } else {
-      const blob = new Blob([content], { type: 'text/markdown' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${title_safe}.md`
-      a.click()
-      URL.revokeObjectURL(url)
+      triggerDownload(content, `${title_safe}.md`, 'text/markdown')
     }
 
     if (omittedToolEvents) {
       showToast(tr('chat.export_tools_omitted'), 'info')
+    }
+    return true
+  }
+
+  function exportAsJSON(events: any[], title: string) {
+    const title_safe = title.replace(/[^\w.-]+/g, '_')
+    const json = JSON.stringify(events, null, 2)
+    triggerDownload(json, `${title_safe}.json`, 'application/json')
+  }
+
+  async function exportByFormat(format: string) {
+    if (exportBusy) return
+    exportBusy = true
+    try {
+      const title = currentSession?.title ?? currentSession?.name ?? 'session'
+      // Both MD and JSON fetch the full server transcript. MD filters by
+      // selection internally (filterEventsBySelection); JSON is always
+      // lossless and ignores the checkbox selection.
+      const result = await fetchEvents()
+      if (!result) { exportBusy = false; return }
+      let ok = true
+      switch (format) {
+        case 'md':
+          ok = await exportAsMarkdown(result.events, title)
+          break
+        case 'json':
+          exportAsJSON(result.events, title)
+          break
+      }
+      if (ok) exitExportMode()
+    } catch (e: any) {
+      console.error('Export error:', e)
+      showToast(tr('chat.export_failed'), 'error')
+    } finally {
+      exportBusy = false
     }
   }
 
@@ -1760,12 +1875,35 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
         <iconify-icon icon="lucide:box" width="13"></iconify-icon>
         <span class="btn-label">{$t('artifacts.toggle')}</span>
       </button>
-      <button class="hdr-btn" title={$t('chat.export')} onclick={exportTranscript}>
+      <button class="hdr-btn" title={$t('chat.export')} onclick={enterExportMode}>
         <iconify-icon icon="ant-design:export-outlined" width="13"></iconify-icon>
         <span class="btn-label">{$t('chat.export')}</span>
       </button>
     </div>
   </div>
+
+  <!-- Export mode bar: sticky format selector -->
+  {#if inExportMode}
+    <div class="export-bar">
+      <div class="export-formats">
+        <button class="export-fmt-btn" title={$t('chat.export_md')} disabled={exportBusy} onclick={() => exportByFormat('md')}>
+          <iconify-icon icon="ant-design:file-markdown-outlined" width="16"></iconify-icon>
+          <span>MD</span>
+        </button>
+        <button class="export-fmt-btn" title="{$t('chat.export_json')} — {$t('chat.export_json_full')}" disabled={exportBusy} onclick={() => exportByFormat('json')}>
+          <iconify-icon icon="ant-design:file-text-outlined" width="16"></iconify-icon>
+          <span>JSON</span>
+        </button>
+      </div>
+      <span class="export-count">{$t('chat.export_selected_count').replace('{n}', String(selectedIds.size))}</span>
+      <label class="export-tools-toggle" title={$t('chat.export_include_tools')}>
+        <input type="checkbox" bind:checked={exportIncludeTools} />
+        <span>{$t('chat.export_include_tools')}</span>
+      </label>
+      <span style="margin-left:auto"></span>
+      <button class="export-cancel-btn" onclick={exitExportMode} disabled={exportBusy}>{$t('chat.export_cancel')}</button>
+    </div>
+  {/if}
 
   <!-- Force-bind banner: session is owned by another entry but can be taken over.
        Guard on `id` too: when the active session is deleted, both
@@ -1866,7 +2004,13 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
           {#each msgs as msg, i (msg.id)}
             {#if msg.type === 'user'}
               <!-- Right-aligned user bubble -->
-              <div class="msg-user fadein" id={`msg-${msg.id}`}>
+              <div class="msg-row" class:export-mode={inExportMode}>
+                {#if inExportMode}
+                  <label class="msg-checkbox">
+                    <input type="checkbox" checked={selectedIds.has(msg.id)} onchange={() => toggleSelect(msg.id)} />
+                  </label>
+                {/if}
+                <div class="msg-user fadein" id={`msg-${msg.id}`}>
                 <div class="msg-meta">
                   <span class="meta-avatar user" aria-hidden="true">
                     <iconify-icon icon="ant-design:user-outlined" width="13"></iconify-icon>
@@ -1943,10 +2087,17 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
                   {/if}
                 </div>
               </div>
+              </div>
 
             {:else if msg.type === 'assistant'}
               <!-- Assistant message with avatar -->
-              <div class="msg-agent fadein">
+              <div class="msg-row" class:export-mode={inExportMode}>
+                {#if inExportMode}
+                  <label class="msg-checkbox">
+                    <input type="checkbox" checked={selectedIds.has(msg.id)} onchange={() => toggleSelect(msg.id)} />
+                  </label>
+                {/if}
+                <div class="msg-agent fadein">
                 {@render agentMeta(i === 0 || msgs[i - 1]?.type === 'user', msg.createdAt)}
                 <div class="agent-content">
                   <!-- Plan card (todos attached to this message) -->
@@ -2020,6 +2171,7 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
                     </div>
                   {/if}
                 </div>
+              </div>
               </div>
 
             {:else if msg.type === 'thinking' && showReasoning}
@@ -2265,7 +2417,10 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   </div>
 {/if}
 
-<svelte:window onkeydown={(e) => { if (e.key === 'Escape' && lightboxSrc) lightboxSrc = null }} />
+<svelte:window onkeydown={(e) => {
+  if (e.key === 'Escape' && inExportMode) { e.preventDefault(); exitExportMode(); return }
+  if (e.key === 'Escape' && lightboxSrc) lightboxSrc = null
+}} />
 
 <style>
 /* ── Layout ──────────────────────────────────────────────────────────────── */
@@ -2318,6 +2473,49 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   border-radius: 6px; font-size: 12px; color: var(--warning-text); cursor: pointer; font-family: inherit;
 }
 .ws-retry:hover { border-color: var(--warning); }
+
+/* ── Export bar ──────────────────────────────────────────────────────────── */
+.export-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 12px;
+  padding: 8px 20px; background: var(--bg-layout); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.export-formats { display: flex; align-items: center; gap: 4px; }
+.export-fmt-btn {
+  display: flex; align-items: center; gap: 4px; padding: 5px 10px;
+  border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: var(--radius-sm); font-size: 12px; font-weight: 500;
+  color: var(--text); cursor: pointer; font-family: inherit;
+  transition: 0.12s;
+}
+.export-fmt-btn:hover { background: var(--bg-table-header); border-color: var(--text-quaternary); }
+.export-fmt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.export-count {
+  font-size: 12px; color: var(--text-secondary); white-space: nowrap;
+}
+.export-tools-toggle {
+  display: flex; align-items: center; gap: 5px; font-size: 12px;
+  color: var(--text-secondary); cursor: pointer; user-select: none;
+}
+.export-tools-toggle input[type="checkbox"] { cursor: pointer; }
+.export-cancel-btn {
+  height: 30px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container);
+  border-radius: var(--radius-sm); font-size: 12px; font-weight: 500;
+  color: var(--text-secondary); cursor: pointer; font-family: inherit;
+}
+.export-cancel-btn:hover { border-color: var(--text-quaternary); color: var(--text); }
+
+/* ── Export mode message rows ────────────────────────────────────────────── */
+.msg-row { display: flex; align-items: flex-start; gap: 0; }
+.msg-row.export-mode { gap: 8px; }
+.msg-row > :not(.msg-checkbox) { flex: 1; min-width: 0; }
+.msg-checkbox {
+  flex: none; display: flex; align-items: flex-start; padding-top: 28px;
+  cursor: pointer;
+}
+.msg-checkbox input[type="checkbox"] {
+  width: 16px; height: 16px; cursor: pointer; accent-color: var(--blue-6);
+}
 
 .bind-banner {
   background: var(--surface-info);
