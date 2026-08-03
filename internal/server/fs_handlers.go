@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 // fsListCap bounds how many entries a single listing returns so a pathological
@@ -14,6 +17,73 @@ import (
 // shows a "list truncated" hint when the cap trips rather than implying the
 // folder is small.
 const fsListCap = 1000
+
+// fsThisPCPath is a synthetic path standing in for Windows' drive list ("This
+// PC") — the level above a drive root (C:\) that filepath.Dir has no way to
+// reach, since Dir("C:\") == "C:\". It's returned as a drive root's `parent`
+// so the web picker's "up" button has somewhere to go, and recognized on the
+// way back in (bare, or as "<sentinel>/C:") to enumerate drives or descend
+// into one. '<' and '>' can't appear in a real Windows path or filename, so
+// this can never collide with one; gated to GOOS==windows throughout since
+// no other platform has more than one filesystem root.
+const fsThisPCPath = "<This PC>"
+
+var (
+	// winDriveRootRe only recognizes a lettered drive root (C:\), not a UNC
+	// share (\\server\share) or an extended-length path (\\?\C:\) — those
+	// also collapse under filepath.Dir but have no "This PC" entry to
+	// navigate back from, so they're left with the pre-fix parent == ""
+	// behavior. Not reachable through the picker's own navigation (nothing
+	// it lists ever becomes a UNC path), so only a directly-typed working
+	// dir on one would hit this.
+	winDriveRootRe   = regexp.MustCompile(`^[A-Za-z]:\\?$`)
+	winDriveSelectRe = regexp.MustCompile(`^` + regexp.QuoteMeta(fsThisPCPath) + `/([A-Za-z]):$`)
+)
+
+// listWindowsDrives probes each possible drive letter with os.Stat rather
+// than calling the GetLogicalDrives Win32 API — one less cgo/syscall surface
+// to maintain. Probes run concurrently with a bounded overall wait: os.Stat
+// has no cancellation of its own, and a stale mapped network drive (common
+// on a corporate machine after a VPN drops) can block for the OS's SMB
+// timeout — tens of seconds, the classic cause of Explorer hanging on "This
+// PC". A drive that hasn't answered within the deadline is just left off
+// the list rather than stalling the whole navigation; its goroutine is
+// abandoned and exits harmlessly whenever the OS call eventually returns.
+func listWindowsDrives() []fsEntry {
+	type probe struct {
+		letter rune
+		ok     bool
+	}
+	results := make(chan probe, 26)
+	for c := 'A'; c <= 'Z'; c++ {
+		go func(c rune) {
+			info, err := os.Stat(string(c) + ":\\")
+			results <- probe{c, err == nil && info.IsDir()}
+		}(c)
+	}
+
+	seen := make(map[rune]bool, 26)
+	deadline := time.After(2 * time.Second)
+collect:
+	for i := 0; i < 26; i++ {
+		select {
+		case p := <-results:
+			if p.ok {
+				seen[p.letter] = true
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	drives := make([]fsEntry, 0, len(seen))
+	for c := 'A'; c <= 'Z'; c++ {
+		if seen[c] {
+			drives = append(drives, fsEntry{Name: string(c) + ":", IsDir: true})
+		}
+	}
+	return drives
+}
 
 // fsEntry is one row of a directory listing. Files are returned alongside
 // directories for orientation ("yes, this is the repo, there's go.mod"), but
@@ -38,6 +108,23 @@ func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
 	// default). expandDir would resolve "" to the launch dir, which is less
 	// useful as a starting point.
 	raw := r.URL.Query().Get("path")
+
+	if runtime.GOOS == "windows" {
+		if raw == fsThisPCPath {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"path":       fsThisPCPath,
+				"parent":     "",
+				"entries":    listWindowsDrives(),
+				"truncated":  false,
+				"is_this_pc": true,
+			})
+			return
+		}
+		if m := winDriveSelectRe.FindStringSubmatch(raw); m != nil {
+			raw = strings.ToUpper(m[1]) + ":\\"
+		}
+	}
+
 	if strings.TrimSpace(raw) == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			raw = home
@@ -102,16 +189,21 @@ func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// parent lets the frontend offer "up" without guessing; empty at the
-	// filesystem root, where Dir(dir) == dir.
+	// filesystem root, where Dir(dir) == dir — except a Windows drive root,
+	// which has a level above it (the drive list) that Dir can't express.
 	parent := filepath.Dir(dir)
 	if parent == dir {
 		parent = ""
+		if runtime.GOOS == "windows" && winDriveRootRe.MatchString(dir) {
+			parent = fsThisPCPath
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":      dir,
-		"parent":    parent,
-		"entries":   entries,
-		"truncated": truncated,
+		"path":       dir,
+		"parent":     parent,
+		"entries":    entries,
+		"truncated":  truncated,
+		"is_this_pc": false,
 	})
 }
