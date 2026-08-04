@@ -275,6 +275,142 @@ func TestSetLastContextTokens_AppendsAndRoundTrips(t *testing.T) {
 	}
 }
 
+// TestSetComposedSystem_FreezesAppendsAndRoundTrips: the first call freezes
+// and appends a composed_system record; a later call for the SAME model
+// (already frozen) is a no-op that appends nothing; both an initial in-memory
+// freeze and a fresh LoadSession afterward (simulating a server restart) see
+// the frozen value — the actual cache-stability guarantee this mechanism
+// exists to provide.
+func TestSetComposedSystem_FreezesAppendsAndRoundTrips(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil { // persisted > 0, transcript on disk
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := s.SetComposedSystem("full prompt", "lean prompt", "model-a"); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if s.ComposedSystem != "full prompt" || s.ComposedLeanSystem != "lean prompt" || s.ComposedForModel != "model-a" {
+		t.Fatalf("SetComposedSystem did not set fields: got %q / %q / %q", s.ComposedSystem, s.ComposedLeanSystem, s.ComposedForModel)
+	}
+
+	path, err := s.SavePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"type":"composed_system"`) {
+		t.Fatalf("expected an appended composed_system record; file was:\n%s", data)
+	}
+
+	// Already-frozen no-op: a second call for the SAME model must not
+	// overwrite or append.
+	before := len(data)
+	if err := s.SetComposedSystem("different prompt", "different lean", "model-a"); err != nil {
+		t.Fatal(err)
+	}
+	if s.ComposedSystem != "full prompt" {
+		t.Errorf("already-frozen SetComposedSystem overwrote the value: got %q", s.ComposedSystem)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != before {
+		t.Errorf("no-op SetComposedSystem must not append: file grew %d -> %d bytes", before, len(after))
+	}
+
+	// Round-trips through a reload — simulates a server restart reloading the
+	// session from disk rather than reusing the in-memory Session.
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.ComposedSystem != "full prompt" || got.ComposedLeanSystem != "lean prompt" || got.ComposedForModel != "model-a" {
+		t.Errorf("reloaded composed system = %q / %q / %q, want %q / %q / %q", got.ComposedSystem, got.ComposedLeanSystem, got.ComposedForModel, "full prompt", "lean prompt", "model-a")
+	}
+}
+
+// TestSetComposedSystem_ModelSwitchForcesRefreeze: a call for a DIFFERENT
+// model than the one the session is frozen for must overwrite the freeze
+// (not no-op) and persist the new model — the fix for a mid-session model
+// switch (e.g. IM's /model) silently stranding the frozen prompt's MCP-tools
+// manifest out of sync with the per-turn tools array, which is always
+// computed fresh for the current model regardless of the freeze.
+func TestSetComposedSystem_ModelSwitchForcesRefreeze(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi"), NewAssistantMessage("hello")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.SetComposedSystem("prompt for model-a", "lean for model-a", "model-a"); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+	if !s.IsComposedFor("model-a") {
+		t.Fatal("expected IsComposedFor(\"model-a\") after freezing for model-a")
+	}
+	if s.IsComposedFor("model-b") {
+		t.Fatal("IsComposedFor(\"model-b\") must be false when frozen for model-a")
+	}
+
+	if err := s.SetComposedSystem("prompt for model-b", "lean for model-b", "model-b"); err != nil {
+		t.Fatalf("SetComposedSystem for model-b: %v", err)
+	}
+	if s.ComposedSystem != "prompt for model-b" || s.ComposedForModel != "model-b" {
+		t.Fatalf("model switch did not re-freeze: got %q / %q", s.ComposedSystem, s.ComposedForModel)
+	}
+
+	// Round-trips: the second composed_system record (for model-b) replays
+	// correctly rather than the first (for model-a) winning.
+	got, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if got.ComposedSystem != "prompt for model-b" || got.ComposedLeanSystem != "lean for model-b" || got.ComposedForModel != "model-b" {
+		t.Errorf("reloaded composed system = %q / %q / %q, want %q / %q / %q", got.ComposedSystem, got.ComposedLeanSystem, got.ComposedForModel, "prompt for model-b", "lean for model-b", "model-b")
+	}
+}
+
+// TestSetComposedSystem_PersistedZeroRewritesWhenFileExists: a session with no
+// prior Save (persisted == 0) that already has a transcript file on disk (the
+// load-modify-discard case SetWorkingDir's sibling comment describes) must
+// rewrite the file with the frozen value rather than silently dropping it.
+func TestSetComposedSystem_PersistedZeroRewritesWhenFileExists(t *testing.T) {
+	setTempHome(t)
+	s := NewSession("m", "")
+	s.Messages = []Message{NewUserMessage("hi")}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// A second Session value pointed at the same on-disk file via a shared ID,
+	// but never itself Save()d — persisted is its zero value, 0, even though
+	// a transcript already exists at its path. Mirrors a handler that
+	// constructs/loads a Session without going through the normal Save path
+	// (LoadSession itself sets persisted = len(Messages), so it can't produce
+	// this state — see SetWorkingDir's sibling comment for the scenario).
+	shadow := NewSession(s.Model, s.System)
+	shadow.ID = s.ID
+
+	if err := shadow.SetComposedSystem("rewritten prompt", "rewritten lean", "m"); err != nil {
+		t.Fatalf("SetComposedSystem: %v", err)
+	}
+
+	again, err := LoadSession(s.ID)
+	if err != nil {
+		t.Fatalf("LoadSession after SetComposedSystem: %v", err)
+	}
+	if again.ComposedSystem != "rewritten prompt" || again.ComposedLeanSystem != "rewritten lean" {
+		t.Errorf("reloaded composed system = %q / %q, want %q / %q", again.ComposedSystem, again.ComposedLeanSystem, "rewritten prompt", "rewritten lean")
+	}
+}
+
 // PersistContextUsage records the agent's current context-token count on the
 // session and round-trips it, and is a safe no-op with a nil session or no
 // count. Every transport (web, IM, CLI, scheduled) calls it at turn end so a
