@@ -34,3 +34,45 @@ describe('renderMarkdown: blockquote contents', () => {
     expect(out).toContain('<code>code</code>')
   })
 })
+
+describe('renderMarkdown: tables', () => {
+  it('wraps the table in a .table-scroll container for horizontal scrolling', () => {
+    const out = renderMarkdown('| A | B |\n|---|---|\n| x | 1 |')
+    expect(out).toContain('<div class="table-scroll"><table>')
+    expect(out).toContain('<thead>')
+    expect(out).toContain('<tbody>')
+  })
+
+  it('renders header cells as th and data cells as td', () => {
+    const out = renderMarkdown('| A | B |\n|---|---|\n| x | y |')
+    expect(out).toContain('<th>A</th>')
+    expect(out).toContain('<th>B</th>')
+    expect(out).toContain('<td>x</td>')
+    expect(out).toContain('<td>y</td>')
+  })
+
+  it('preserves inline markup inside table cells', () => {
+    const out = renderMarkdown('| A |\n|---|\n| **bold** |')
+    expect(out).toContain('<td><strong>bold</strong></td>')
+  })
+
+  it('preserves per-column alignment', () => {
+    const out = renderMarkdown('| A | B |\n|:---|:---:|\n| x | y |')
+    expect(out).toContain('<th align="left">A</th>')
+    expect(out).toContain('<th align="center">B</th>')
+  })
+
+  it('wraps header cells in a tr (matching marked default output)', () => {
+    const out = renderMarkdown('| A | B |\n|---|---|\n| x | y |')
+    // The <th>s must sit inside a <tr> (marked emits newlines inside the row).
+    expect(out).toMatch(/<thead><tr>\s*<th>A<\/th>\s*<th>B<\/th>\s*<\/tr>\s*<\/thead>/)
+    expect(out).not.toMatch(/<thead>\s*<th\b/)
+  })
+
+  it('renders an escaped pipe as a literal single cell', () => {
+    const out = renderMarkdown('| A |\n|---|\n| a\\|b |')
+    expect(out).toContain('<td>a|b</td>')
+    // The escaped pipe must not create a spurious second column.
+    expect(out.match(/<td>/g)).toHaveLength(1)
+  })
+})
