@@ -2,7 +2,7 @@
   import { artifacts, panelContent, artifactSel, artifactView, artifactModalOpen, lightappSel, lightapps, lightappHTML, showToast } from '../lib/stores'
   import { t } from '../lib/i18n'
   import { copyArtifact, downloadArtifact, imagePreviewError } from '../lib/artifact-actions'
-  import { hydrateArtifact, lightAppSource } from '../lib/artifacts'
+  import { hydrateArtifact, lightAppSource, pathIsInside } from '../lib/artifacts'
   import * as api from '../lib/api'
 
   // ── Session artifacts (existing) ──────────────────────────────────────────
@@ -81,6 +81,41 @@
   }
 
   const curIsHTML = $derived(cur?.type === 'HTML')
+
+  // ── Already-a-Light-App detection ──────────────────────────────────────────
+  // "Save to Light App" is pointless for a file that already lives inside the
+  // Light Apps directory (a Light App's own index.html, or a file beside it).
+  // The directory itself is server-side knowledge (~/.octo/light-apps), so it
+  // is fetched once, lazily, while the session panel shows an HTML artifact.
+  // A failed lookup must not hide a working action, so the button stays
+  // visible until the directory is actually known — and the attempt resets,
+  // so a transient failure is retried on the next artifact switch instead of
+  // disabling the feature for the rest of the session.
+  let laDir = $state<string | null>(null)
+  let laDirAttempted = $state(false)
+
+  async function ensureLaDir() {
+    if (laDir !== null || laDirAttempted) return
+    laDirAttempted = true
+    try {
+      laDir = await api.getLightAppsDir()
+    } catch {
+      laDir = ''
+      laDirAttempted = false
+    }
+  }
+
+  const curIsLightApp = $derived(curIsHTML && pathIsInside(cur?.path ?? '', laDir ?? ''))
+
+  $effect(() => {
+    if ($panelContent === 'session' && curIsHTML) void ensureLaDir()
+  })
+
+  // The Save dialog must not outlive the button: once the lookup settles and
+  // the artifact turns out to be inside the Light Apps directory, close it.
+  $effect(() => {
+    if (curIsLightApp) saveToLADialog = false
+  })
 
   // ── Light Apps (new) ──────────────────────────────────────────────────────
   let laLoading = $state(false)
@@ -304,7 +339,7 @@
           <iconify-icon icon="ant-design:download-outlined" width="14"></iconify-icon>
           {$t('artifacts.download')}
         </button>
-        {#if curIsHTML}
+        {#if curIsHTML && !curIsLightApp}
           <button class="wbtn" disabled={!cur.loaded || cur.loadFailed} onclick={openSaveToLA}>
             <iconify-icon icon="ant-design:save-outlined" width="14"></iconify-icon>
             {$t('artifacts.save_to_lightapp')}
