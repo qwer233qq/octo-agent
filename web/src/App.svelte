@@ -61,6 +61,15 @@
       history.replaceState(null, '', location.pathname + location.search + hash)
       return
     }
+    // The desktop tray's "New Session" item navigates to #new (see
+    // nativeBridge.openNewSession). Desktop-gated: under a plain browser this
+    // hash is unreachable from the shell, so don't let a hand-typed #new create
+    // a throwaway session there. createNewSession() re-normalizes the hash to
+    // the fresh #/chat/{id}, so a reload won't loop back into #new.
+    if (v === 'new' && isDesktopShell) {
+      createNewSession().catch((err: any) => showToast(err.message, 'error'))
+      return
+    }
     if (!VALID_VIEWS.includes(v)) return
     if (get(view) !== v) view.set(v)
     if (v === 'chat' && rest[0]) {
