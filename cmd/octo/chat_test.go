@@ -36,6 +36,138 @@ func TestRunChat_NoArgs_NoStdin_Errors(t *testing.T) {
 	}
 }
 
+// TestResolveResumedModel pins the sender/model resolution for `octo -c`: a
+// resumed session's saved model must re-resolve to its own config entry —
+// rebuilding the sender when it targets a different endpoint than the current
+// config default (otherwise the deepseek sender would send k3-256k → HTTP
+// 400), reusing it when the endpoint matches, and rejecting models that have
+// left the config.
+func TestResolveResumedModel(t *testing.T) {
+	openaiEP := config.Endpoint{
+		ID:       "ep-openai",
+		Provider: "openai",
+		Models:   []config.EndpointModel{{Model: "gpt-4o"}},
+	}
+	deepseekEP := config.Endpoint{
+		ID:       "ep-deepseek",
+		Provider: "deepseek",
+		BaseURL:  "https://api.deepseek.com",
+		Models:   []config.EndpointModel{{Model: "deepseek-v4-flash"}, {Model: "deepseek-v4-pro"}},
+	}
+	kimiEP := config.Endpoint{
+		ID:       "ep-kimi",
+		Provider: "kimi",
+		Models:   []config.EndpointModel{{Model: "k3-256k"}},
+	}
+	relayEP := config.Endpoint{
+		ID:       "ep-deepseek-relay",
+		Provider: "deepseek",
+		BaseURL:  "https://relay.example.com",
+		Models:   []config.EndpointModel{{Model: "deepseek-v4-flash"}},
+	}
+	cfg := config.Config{
+		Endpoints: []config.Endpoint{openaiEP, deepseekEP, kimiEP, relayEP},
+		Default:   "ep-openai::gpt-4o",
+	}
+	openaiEntry := config.ModelEntry{Provider: "openai", Model: "gpt-4o"}
+	deepseekEntry := config.ModelEntry{Provider: "deepseek", Model: "deepseek-v4-pro", BaseURL: "https://api.deepseek.com"}
+
+	tests := []struct {
+		name        string
+		sessionRef  string
+		startProv   string
+		startEntry  config.ModelEntry
+		wantProv    string
+		wantModel   string
+		wantBaseURL string
+		wantRebuild bool
+		wantOK      bool
+	}{
+		{
+			name:        "session model on another endpoint rebuilds the sender",
+			sessionRef:  "deepseek-v4-pro",
+			startProv:   "openai",
+			startEntry:  openaiEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:        "same endpoint, different model keeps the sender",
+			sessionRef:  "deepseek-v4-pro",
+			startProv:   "deepseek",
+			startEntry:  deepseekEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: false,
+			wantOK:      true,
+		},
+		{
+			name:        "same provider, different base URL rebuilds the sender",
+			sessionRef:  "deepseek-v4-flash",
+			startProv:   "deepseek",
+			startEntry:  config.ModelEntry{Provider: "deepseek", Model: "deepseek-v4-flash", BaseURL: "https://relay.example.com"},
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-flash",
+			wantBaseURL: "https://api.deepseek.com",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:        "composite ref resolves to the bound endpoint",
+			sessionRef:  "ep-deepseek::deepseek-v4-pro",
+			startProv:   "openai",
+			startEntry:  openaiEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: true,
+			wantOK:      true,
+		},
+		{
+			name:       "model deleted from config is rejected",
+			sessionRef: "claude-opus-4-7",
+			startProv:  "openai",
+			startEntry: openaiEntry,
+			wantOK:     false,
+		},
+		{
+			name:        "empty session ref passes the startup resolution through",
+			sessionRef:  "",
+			startProv:   "deepseek",
+			startEntry:  deepseekEntry,
+			wantProv:    "deepseek",
+			wantModel:   "deepseek-v4-pro",
+			wantRebuild: false,
+			wantOK:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, m, e, rebuild, ok := resolveResumedModel(tt.sessionRef, tt.startProv, tt.startEntry, cfg)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if p != tt.wantProv || m != tt.wantModel {
+				t.Errorf("resolved (%q, %q), want (%q, %q)", p, m, tt.wantProv, tt.wantModel)
+			}
+			if rebuild != tt.wantRebuild {
+				t.Errorf("rebuild = %v, want %v", rebuild, tt.wantRebuild)
+			}
+			if e.Model != tt.wantModel {
+				t.Errorf("entry.Model = %q, want %q", e.Model, tt.wantModel)
+			}
+			if tt.wantBaseURL != "" && e.BaseURL != tt.wantBaseURL {
+				t.Errorf("entry.BaseURL = %q, want %q", e.BaseURL, tt.wantBaseURL)
+			}
+		})
+	}
+}
+
 func TestRunChat_MissingAPIKey(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
@@ -818,5 +950,22 @@ func TestRunChat_ResumedPlainSession_NoWarning(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "may make the model emit tool calls as text") {
 		t.Errorf("plain session should not warn; got stderr:\n%s", stderr.String())
+	}
+}
+
+// TestResumeModelRef pins the resume ref selection: a session that recorded a
+// mid-session /model switch (ModelConfig, possibly a composite
+// "<endpoint>::<model>" binding) resumes on that binding; a plain session
+// falls back to its bare wire model.
+func TestResumeModelRef(t *testing.T) {
+	sess := agent.NewSession("deepseek-v4-flash", "")
+	if got := resumeModelRef(sess); got != "deepseek-v4-flash" {
+		t.Errorf("bare session ref = %q, want deepseek-v4-flash", got)
+	}
+	if err := sess.SetModelConfig("ep-b::deepseek-v4-flash", "deepseek-v4-flash"); err != nil {
+		t.Fatalf("SetModelConfig: %v", err)
+	}
+	if got := resumeModelRef(sess); got != "ep-b::deepseek-v4-flash" {
+		t.Errorf("bound session ref = %q, want ep-b::deepseek-v4-flash", got)
 	}
 }
