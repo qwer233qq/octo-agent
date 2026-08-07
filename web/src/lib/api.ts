@@ -71,6 +71,10 @@ export interface CreateSessionOpts {
   model?: string
   source?: string
   agent_profile?: string
+  // Files the session under an existing group (the sidebar's per-group "+").
+  // For a project, the server skips seeding a default working dir so the
+  // session runs purely in the project's directory.
+  group_id?: string
 }
 
 export async function createSession(opts: CreateSessionOpts): Promise<Session> {
@@ -101,12 +105,17 @@ export async function listSessionGroups(): Promise<{ groups: SessionGroup[]; pin
   return { groups: d.groups ?? [], pinned: d.pinned_session_ids ?? [] }
 }
 
-export async function createSessionGroup(name: string): Promise<SessionGroup> {
-  const d = await request<{ group: SessionGroup }>('/api/session-groups', { method: 'POST', ...json({ name }) })
+// Pass working_dir to create the group as a project outright.
+export async function createSessionGroup(name: string, project?: { working_dir?: string; notes?: string }): Promise<SessionGroup> {
+  const d = await request<{ group: SessionGroup }>('/api/session-groups', { method: 'POST', ...json({ name, ...project }) })
   return d.group
 }
 
-export async function updateSessionGroup(id: string, patch: { name?: string; collapsed?: boolean }): Promise<SessionGroup> {
+// working_dir: '' demotes a project back to a plain group.
+export async function updateSessionGroup(
+  id: string,
+  patch: { name?: string; collapsed?: boolean; working_dir?: string; notes?: string },
+): Promise<SessionGroup> {
   const d = await request<{ group: SessionGroup }>(`/api/session-groups/${id}`, { method: 'PATCH', ...json(patch) })
   return d.group
 }
