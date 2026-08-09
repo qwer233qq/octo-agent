@@ -233,12 +233,18 @@ type Server struct {
 	// goalsEnabled mirrors the config's goal.enabled at server start: it
 	// gates the goal-continuation kick after each turn (the goal tools'
 	// visibility is gated separately via tools.SetGoalsEnabled). atomic.Bool
-	// because syncGoalsEnabled can write it from inside ensureSender's
-	// senderMu-guarded section (to close a race with initChannels/
-	// reloadChannel, which read it from other goroutines with no lock of
-	// their own) while every other reader/writer here still needs a
-	// consistent, lock-free way to see the same value.
+	// because syncGoalsEnabled writes it from inside ensureSender's
+	// senderMu-guarded section while turn paths read it from their own
+	// goroutines with no lock of their own.
 	goalsEnabled atomic.Bool
+
+	// goalLastStatus is the last goal status broadcast per session, the
+	// baseline noticeGoalTransition compares against so a status change is
+	// announced once instead of on every accounting tick. Web-only state: it
+	// exists to render scrollback lines, so it is not persisted and a restart
+	// simply starts the comparison over.
+	goalLastStatus map[string]agent.GoalStatus
+	goalStatusMu   sync.Mutex
 
 	// confirmation channels (from request_user_feedback in browser).
 	confirmations map[string]chan string
@@ -512,6 +518,7 @@ func New(cfg Config) (*Server, error) {
 		sessionInjectors:    make(map[string]*memory.Injector),
 		wakeupTimers:        make(map[string]*time.Timer),
 		wakeupStart:         make(map[string]time.Time),
+		goalLastStatus:      make(map[string]agent.GoalStatus),
 	}
 
 	// Register the WebSocket-backed asker so ask_user_question appears in the
@@ -1020,6 +1027,10 @@ func (s *Server) forgetTurnLock(id string) {
 	s.askSlotsMu.Lock()
 	delete(s.askSlots, id)
 	s.askSlotsMu.Unlock()
+
+	s.goalStatusMu.Lock()
+	delete(s.goalLastStatus, id)
+	s.goalStatusMu.Unlock()
 }
 
 // cachedEntryBinding is a short-lease, in-process cache of a session's binding.
@@ -1848,16 +1859,12 @@ func (s *Server) ensureSender() error {
 	s.provider = provName
 	enableTools := s.cfg.Tools
 	if enableTools {
-		// Sync goal.enabled before releasing senderMu, not after. Once
-		// unlocked, getSender() != nil is visible to other goroutines —
-		// initChannels/reloadChannel gate solely on that and construct a
-		// channel.Manager immediately, locking in whatever s.goalsEnabled
-		// holds at that instant via SetGoalsEnabled. reloadChannel only
-		// re-syncs when it constructs a fresh manager, so a channel-settings
-		// save landing in the gap between unlock and enableSubAgentTools
-		// (below) finishing would otherwise capture a stale value
-		// permanently. syncGoalsEnabled needs no lock of its own, so running
-		// it here adds no deadlock risk.
+		// goal.enabled belongs to the same tools-on switch this branch is
+		// applying, so sync it here rather than after the unlock: the flags it
+		// sets gate tool visibility, and a turn that starts the moment
+		// getSender() becomes non-nil must already see the configured value.
+		// syncGoalsEnabled needs no lock of its own, so running it under
+		// senderMu adds no deadlock risk.
 		s.syncGoalsEnabled()
 	}
 	s.senderMu.Unlock()
@@ -2236,7 +2243,6 @@ func (s *Server) initChannels() {
 		return
 	}
 	s.channelMgr = channel.NewManager(chCfg, s.buildChannelAgent, channel.BindByChatUser)
-	s.channelMgr.SetGoalsEnabled(s.goalsEnabled.Load())
 	s.channelMgr.SetModelOps(s.channelModelOps())
 	s.channelMgr.SetProfileLookup(func(id string) (*agentprofile.Profile, bool) {
 		return s.profileForAgent(id), true
@@ -2772,7 +2778,6 @@ func (s *Server) reloadChannel(platform string) {
 	s.channelCfg = chCfg
 	if s.channelMgr == nil {
 		s.channelMgr = channel.NewManager(chCfg, s.buildChannelAgent, channel.BindByChatUser)
-		s.channelMgr.SetGoalsEnabled(s.goalsEnabled.Load())
 		s.channelMgr.SetModelOps(s.channelModelOps())
 		s.channelMgr.SetProfileLookup(func(id string) (*agentprofile.Profile, bool) {
 			return s.profileForAgent(id), true
@@ -2935,7 +2940,7 @@ func (s *Server) handleChannelCommand(ad channel.Adapter, ev channel.InboundEven
 	// Reserved commands must not be intercepted by a skill (matching
 	// the TUI reservedReplCommands pattern).
 	switch cmd {
-	case "/stop", "/bind", "/unbind", "/clear", "/new", "/status", "/list", "/help", "/goal", "/compact", "/reload":
+	case "/stop", "/bind", "/unbind", "/clear", "/new", "/status", "/list", "/help", "/compact", "/reload":
 		// fall through to CommandRouter
 	case "/loop":
 		// /loop is a built-in the model handles via the schedule_wakeup tool

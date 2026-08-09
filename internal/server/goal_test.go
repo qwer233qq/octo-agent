@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/open-octo/octo-agent/internal/agent"
 	"github.com/open-octo/octo-agent/internal/agentprofile"
@@ -167,6 +168,242 @@ func TestRunAgentTurnLoop_ErroredTurnSuppressesContinuation(t *testing.T) {
 	}
 	if _, ok := sess.GoalContinuation(); ok {
 		t.Error("continuation must stay suppressed after an errored turn")
+	}
+}
+
+// waitGoalTurnIdle blocks until the session has no turn running. The kick sets
+// turnRunning synchronously before returning, so a caller that has already
+// issued the command sees a true reading before this ever observes false.
+func waitGoalTurnIdle(t *testing.T, srv *Server, sessionID string) {
+	t.Helper()
+	mu := srv.sessionTurnLock(sessionID)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		running := srv.turnRunning[sessionID]
+		mu.Unlock()
+		if !running {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn never wound down")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A goal set from the web composer must start pursuing itself immediately, the
+// way the TUI's /goal does. Web used to only continue a goal at the tail of a
+// turn already running, so a goal created while idle sat active and untouched
+// until the user happened to send an unrelated message.
+func TestWSGoalCommand_StartsIdleTurn(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	sender := &goalRoundSender{}
+	srv.sender = sender
+
+	srv.wsGoalCommand(sess.ID, "ship the release")
+	waitGoalTurnIdle(t, srv, sess.ID)
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.calls) == 0 {
+		t.Fatal("/goal <objective> started no turn")
+	}
+	saw := 0
+	for _, call := range sender.calls {
+		saw += countGoalContextUserMsgs(call)
+	}
+	if saw == 0 {
+		t.Error("the turn that started did not carry the goal continuation prompt")
+	}
+}
+
+// Pause must not start work; the resume that follows must. Both run against a
+// reloaded session — wsGoalCommand mutates whatever copy is authoritative, so
+// the pause has to be durable for the resume to see it.
+func TestWSGoalCommand_PauseIdleResume(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	if _, err := sess.CreateGoal("keep going", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatal(err)
+	}
+	sender := &goalRoundSender{}
+	srv.sender = sender
+
+	srv.wsGoalCommand(sess.ID, "pause")
+	waitGoalTurnIdle(t, srv, sess.ID)
+	sender.mu.Lock()
+	calls := len(sender.calls)
+	sender.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("/goal pause started %d LLM call(s), want none", calls)
+	}
+
+	srv.wsGoalCommand(sess.ID, "resume")
+	waitGoalTurnIdle(t, srv, sess.ID)
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.calls) == 0 {
+		t.Error("/goal resume started no turn")
+	}
+}
+
+// waitEventType reads broadcasts off conn until one of the wanted type shows
+// up, skipping the unrelated events (goal_updated, context usage) that share
+// the stream.
+func waitEventType(t *testing.T, conn *wsConn, typ string) map[string]any {
+	t.Helper()
+	for i := 0; i < 32; i++ {
+		if ev := nextEvent(t, conn); ev["type"] == typ {
+			return ev
+		}
+	}
+	t.Fatalf("no %s event in the first 32 broadcasts", typ)
+	return nil
+}
+
+// The web's answer to the TUI's "● Goal …" scrollback: the command's reply
+// lands in the transcript, and the continuation turn it kicks announces itself
+// — without that line the turn's output would read as unprompted, since the
+// continuation prompt is hidden.
+func TestWSGoalCommand_EmitsNotices(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	conn := subscribedConn(t, srv, sess.ID)
+	srv.sender = &goalRoundSender{}
+
+	srv.wsGoalCommand(sess.ID, "ship the release")
+
+	ev := waitEventType(t, conn, "goal_notice")
+	if ev["kind"] != "command" {
+		t.Fatalf("first notice kind = %v, want command", ev["kind"])
+	}
+	if text, _ := ev["text"].(string); !strings.Contains(text, "Goal set") {
+		t.Errorf("command notice text = %q, want the /goal reply", text)
+	}
+
+	// A brand-new goal "starts"; a resumed one would "continue".
+	ev = waitEventType(t, conn, "goal_notice")
+	if ev["kind"] != "start" {
+		t.Errorf("second notice kind = %v, want start", ev["kind"])
+	}
+	if text, _ := ev["text"].(string); text != "" {
+		t.Errorf("start notice carries text %q; the frontend owns that wording", text)
+	}
+
+	waitGoalTurnIdle(t, srv, sess.ID)
+}
+
+// Only genuine transitions are announced. Accounting re-broadcasts the goal on
+// every tick, so a repeated status must stay silent, and the first status a
+// session is seen in is a baseline — a page connecting to an already-blocked
+// goal must not replay the transition that blocked it.
+func TestGoalStatusTransitionNotices(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	conn := subscribedConn(t, srv, sess.ID)
+
+	blocked := agent.Goal{ID: "g1", Objective: "keep going", Status: agent.GoalBlocked}
+	srv.broadcastGoalUpdated(sess.ID, blocked) // baseline — silent
+	srv.broadcastGoalUpdated(sess.ID, blocked) // unchanged — silent
+
+	done := blocked
+	done.Status = agent.GoalComplete
+	done.TokensUsed = 1200
+	srv.broadcastGoalUpdated(sess.ID, done)
+
+	// If either silent broadcast had spoken, this would be the blocked line.
+	ev := waitEventType(t, conn, "goal_notice")
+	if ev["kind"] != "status" {
+		t.Fatalf("kind = %v, want status", ev["kind"])
+	}
+	if text, _ := ev["text"].(string); !strings.Contains(text, "Goal complete") {
+		t.Errorf("text = %q, want the complete line", text)
+	}
+	if ev["level"] != "success" {
+		t.Errorf("level = %v, want success", ev["level"])
+	}
+
+	// Clearing forgets the history: the next goal's first status is a fresh
+	// baseline, not a change away from complete. Blocked is the probe because
+	// it is announceable — a status the silent default branch would swallow
+	// (active, paused) would pass whether or not the history was forgotten.
+	srv.broadcastGoalCleared(sess.ID)
+	limited := agent.Goal{ID: "g2", Objective: "next", Status: agent.GoalBlocked}
+	srv.broadcastGoalUpdated(sess.ID, limited) // baseline — silent
+	limited.Status = agent.GoalBudgetLimited
+	limited.TokensUsed, limited.TokenBudget = 63900, 50000
+	srv.broadcastGoalUpdated(sess.ID, limited)
+
+	ev = waitEventType(t, conn, "goal_notice")
+	if text, _ := ev["text"].(string); !strings.Contains(text, "63.9K/50K tokens") {
+		t.Errorf("text = %q, want the budget line with usage; a blocked line here "+
+			"means the cleared goal's status history outlived it", text)
+	}
+	if ev["level"] != "warning" {
+		t.Errorf("level = %v, want warning", ev["level"])
+	}
+}
+
+// The shared idle-turn helper's contract, tested on the helper rather than
+// through one of its callers: a callback that declines must leave the session
+// exactly as it found it — no turn, no binding held, and whatever queue the
+// callback chose not to consume still intact for the next kick.
+func TestKickIdleTurn_DeclineLeavesNothingHeld(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	srv.enqueueSteer(sess.ID, agent.InboxItem{Text: "still waiting"})
+
+	called := false
+	if srv.kickIdleTurn(sess.ID, func(*agent.Session) (string, []agent.ContentBlock, bool) {
+		called = true
+		return "", nil, false
+	}) {
+		t.Fatal("kickIdleTurn reported a turn started for a declining callback")
+	}
+	if !called {
+		t.Fatal("callback never ran")
+	}
+
+	mu := srv.sessionTurnLock(sess.ID)
+	mu.Lock()
+	running := srv.turnRunning[sess.ID]
+	mu.Unlock()
+	if running {
+		t.Error("turnRunning stayed set after a declined kick")
+	}
+	if !srv.steerPending(sess.ID) {
+		t.Error("the declined kick consumed the steer queue")
+	}
+	// The binding must be released. Probing from another entry, not from web
+	// again: re-acquiring for the entry that already holds it succeeds either
+	// way, so only a foreign entry can tell a released binding from a leaked
+	// one. A leak locks the session away from the TUI until the lease expires.
+	if ok, _, err := srv.acquireSessionBinding(sess.ID, agent.EntryTUI, false); !ok {
+		t.Errorf("the declined kick kept the web binding: %v", err)
+	} else {
+		srv.releaseSessionBinding(sess.ID, agent.EntryTUI)
+	}
+}
+
+// Queued user input outranks the goal: the kick stands down and leaves the
+// message alone, so the turn it starts is the user's, and that turn's end is
+// where the goal picks back up.
+func TestKickIdleGoalTurn_DefersToQueuedSteer(t *testing.T) {
+	srv, sess := goalTestServer(t)
+	if _, err := sess.CreateGoal("keep going", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatal(err)
+	}
+	srv.enqueueSteer(sess.ID, agent.InboxItem{Text: "actually, do this first"})
+	srv.sender = &goalRoundSender{}
+
+	if srv.kickIdleGoalTurn(sess.ID, agent.GoalStartFresh) {
+		t.Error("the goal kicked a turn over queued user input")
+	}
+	if !srv.steerPending(sess.ID) {
+		t.Error("the queued message was consumed by the goal kick")
 	}
 }
 
