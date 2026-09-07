@@ -1,5 +1,12 @@
 package agent
 
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // ContentBlock is a single element of a multi-part message. It unifies the
 // roles a block can play in an LLM conversation:
 //
@@ -30,6 +37,16 @@ type ContentBlock struct {
 	// (type=="tool_use"). Keys and value types are defined by the tool's
 	// JSON Schema Parameters.
 	Input map[string]any `json:"input,omitempty"`
+
+	// InputError is set on a tool_use block whose arguments arrived as
+	// malformed JSON — an unescaped newline or quote inside a string, or an
+	// endpoint that reported the turn complete but delivered half the
+	// arguments. Input is then an empty map (never nil, so
+	// the block still round-trips to the provider as `"input": {}`), and the
+	// agent loop answers the call with this message instead of running the
+	// tool: the model must learn its JSON was broken, not go hunting for a
+	// "missing" parameter.
+	InputError string `json:"input_error,omitempty"`
 
 	// ToolUseID links this result back to its originating tool_use block
 	// (type=="tool_result"). Must equal the ID field of the paired block.
@@ -117,6 +134,52 @@ func NewToolUseBlock(id, name string, input map[string]any) ContentBlock {
 		Name:  name,
 		Input: input,
 	}
+}
+
+// NewToolUseBlockFromJSON builds a tool_use block from the raw argument JSON a
+// provider streamed. Every adapter used to `_ = json.Unmarshal` here and hand
+// the tool a nil map, so a model that emitted broken JSON was told "path is
+// required" and retried the identical broken call. Now the parse failure is
+// kept on the block (InputError) with the offending spot quoted, and Input is
+// an empty — not nil — map so the block is still valid on the wire.
+func NewToolUseBlockFromJSON(id, name, raw string) ContentBlock {
+	b := NewToolUseBlock(id, name, map[string]any{})
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return b
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		b.InputError = describeInputError(raw, err)
+		return b
+	}
+	if input != nil { // "null" parses cleanly into a nil map; keep the empty one
+		b.Input = input
+	}
+	return b
+}
+
+// describeInputError turns a json error into something the model can act on.
+// A syntax error quotes the bytes around the failure; one whose offset is at
+// the very end of the text means the decoder ran out of input, i.e. the
+// arguments arrived incomplete — said explicitly so the model resends the whole
+// call rather than hunting for a typo. Valid JSON of the wrong shape (an array,
+// a bare string) gets a plain-language message instead of Go's type names.
+func describeInputError(raw string, err error) string {
+	var se *json.SyntaxError
+	if errors.As(err, &se) {
+		off := int(se.Offset)
+		if off >= len(raw) {
+			return fmt.Sprintf("%s — the arguments end before the closing brace, so the call arrived incomplete", se.Error())
+		}
+		lo, hi := max(0, off-40), min(len(raw), off+20)
+		return fmt.Sprintf("%s near byte %d: …%s…", se.Error(), off, strings.ToValidUTF8(raw[lo:hi], "?"))
+	}
+	var te *json.UnmarshalTypeError
+	if errors.As(err, &te) {
+		return fmt.Sprintf("arguments must be a single JSON object, got %s", te.Value)
+	}
+	return err.Error()
 }
 
 // NewThinkingBlock creates a ContentBlock with Type=="thinking". The signature
