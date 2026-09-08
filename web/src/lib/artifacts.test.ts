@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { get } from 'svelte/store'
 import { artifacts, artifactSel, panelContent, panelExpanded } from './stores'
-import { observeArtifact, hydrateArtifact, resetArtifacts, selfContainedDocument } from './artifacts'
+import { observeArtifact, hydrateArtifact, resetArtifacts, markArtifactOriginUnavailable, probeArtifactOrigin } from './artifacts'
+import type { Artifact } from './types'
 
 // Nothing a preview document references can authenticate: the srcdoc iframe has
 // no allow-same-origin, so its subresource requests are cross-site and the
@@ -217,141 +218,6 @@ describe('observeArtifact — source files', () => {
 // The Light App view renders through the same rule as the artifact preview,
 // via this one helper — a page the preview strips must not come alive once it
 // is saved and opened as a Light App.
-describe('selfContainedDocument', () => {
-  it('hands back a self-contained page untouched, by identity', () => {
-    const html = '<html><head><style>h1{color:red}</style><script>window.ok=1</script></head><body><h1>hi</h1></body></html>'
-    expect(selfContainedDocument(html)).toBe(html)
-  })
-
-  it('strips external references and adds the banner', () => {
-    const out = selfContainedDocument(
-      '<html><head><script src="https://cdn.example.com/lib.js"></script></head><body><h1>hi</h1></body></html>',
-    )
-    expect(out).not.toContain('lib.js')
-    expect(out).toContain('1 external script/stylesheet was removed')
-    expect(out).toContain('<h1>hi</h1>')
-  })
-
-  it('keeps the DOCTYPE first when the page has no <body> tag', () => {
-    // A <div> ahead of the DOCTYPE would drop the page into quirks mode.
-    const out = selfContainedDocument(
-      '<!DOCTYPE html><html><head><link rel="stylesheet" href="https://cdn/x.css"></head><main>hi</main></html>',
-    )
-    expect(out.startsWith('<!DOCTYPE html>')).toBe(true)
-    expect(out.indexOf('</head>')).toBeLessThan(out.indexOf('removed'))
-    expect(out.indexOf('removed')).toBeLessThan(out.indexOf('<main>'))
-  })
-
-  it('lands the banner inside a <body> that carries attributes', () => {
-    const out = selfContainedDocument(
-      '<html><head><link rel="stylesheet" href="https://cdn/x.css"></head><body class="dark" data-x="1"><p>hi</p></body></html>',
-    )
-    expect(out.indexOf('<body class="dark" data-x="1">')).toBeLessThan(out.indexOf('removed'))
-    expect(out.indexOf('removed')).toBeLessThan(out.indexOf('<p>hi</p>'))
-  })
-
-  it('catches unquoted src/href and uppercase tags', () => {
-    const out = selfContainedDocument(
-      '<HTML><HEAD><SCRIPT SRC=https://cdn/x.js></SCRIPT><LINK REL=stylesheet HREF=https://cdn/x.css></HEAD><BODY></BODY></HTML>',
-    )
-    expect(out).not.toContain('cdn/x.js')
-    expect(out).not.toContain('cdn/x.css')
-    expect(out).toContain('2 external scripts/stylesheets were removed')
-  })
-
-  it('does not mistake a src/href inside another attribute value for a reference', () => {
-    const html =
-      '<html><head><script data-cfg="src=\'https://c/x\'">inline()</script>' +
-      '<link rel="stylesheet" data-href="https://c/x.css"></head><body></body></html>'
-    expect(selfContainedDocument(html)).toBe(html)
-  })
-
-  // The allowlist: scripts and stylesheets from well-known CDN hosts render
-  // rather than being stripped, so artifacts can lean on real libraries.
-  it('keeps allowlisted CDN scripts and stylesheets, by identity', () => {
-    const html =
-      '<html><head>' +
-      '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>' +
-      '<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>' +
-      '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">' +
-      '<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/antd/5.0.0/reset.css">' +
-      '</head><body><h1>hi</h1></body></html>'
-    expect(selfContainedDocument(html)).toBe(html)
-  })
-
-  it('strips the disallowed reference but keeps the allowlisted one beside it', () => {
-    const out = selfContainedDocument(
-      '<html><head>' +
-        '<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>' +
-        '<script src="https://evil.example.com/x.js"></script>' +
-        '</head><body></body></html>',
-    )
-    expect(out).toContain('cdn.jsdelivr.net')
-    expect(out).not.toContain('evil.example.com')
-    expect(out).toContain('1 external script/stylesheet was removed')
-  })
-
-  it('requires https — a plain-http reference to an allowlisted host is stripped', () => {
-    const out = selfContainedDocument(
-      '<html><head><script src="http://cdn.jsdelivr.net/npm/x.js"></script></head><body></body></html>',
-    )
-    expect(out).not.toContain('cdn.jsdelivr.net')
-    expect(out).toContain('removed')
-  })
-
-  it('judges the real hostname, not a lookalike prefix or userinfo trick', () => {
-    const out = selfContainedDocument(
-      '<html><head>' +
-        '<script src="https://cdn.jsdelivr.net.evil.com/x.js"></script>' +
-        '<script src="https://cdn.jsdelivr.net@evil.com/x.js"></script>' +
-        '<link rel="stylesheet" href="https://evilcdn.jsdelivr.net/x.css">' +
-        '</head><body></body></html>',
-    )
-    expect(out).not.toContain('evil')
-    expect(out).toContain('3 external scripts/stylesheets were removed')
-  })
-
-  // The judgment must land on the attribute the browser will actually fetch —
-  // string-scanning for ` src=` once judged a decoy inside another attribute's
-  // quoted value while the real src loaded from anywhere.
-  it('judges the attribute the browser will use, not a decoy inside another attribute value', () => {
-    const out = selfContainedDocument(
-      '<html><head>' +
-        '<script foo="x src=https://cdn.jsdelivr.net/ok.js" src="https://evil.com/x.js"></script>' +
-        '<link title="href=https://cdn.jsdelivr.net/a.css" rel="stylesheet" href="https://evil.com/x.css">' +
-        '</head><body></body></html>',
-    )
-    expect(out).not.toContain('evil.com')
-    expect(out).toContain('2 external scripts/stylesheets were removed')
-  })
-
-  it('is not fooled by a quoted ">" truncating the tag, or a solidus standing in for whitespace', () => {
-    const out = selfContainedDocument(
-      '<html><head>' +
-        '<script data-x="a>b" src="https://evil.com/x.js"></script>' +
-        '<script/src="https://evil.com/y.js"></script>' +
-        '</head><body></body></html>',
-    )
-    expect(out).not.toContain('evil.com')
-  })
-
-  it('judges the first of duplicate src attributes, the one the browser keeps', () => {
-    const out = selfContainedDocument(
-      '<html><head><script src="https://evil.com/x.js" src="https://cdn.jsdelivr.net/ok.js"></script></head><body></body></html>',
-    )
-    expect(out).not.toContain('evil.com')
-    expect(out).toContain('1 external script/stylesheet was removed')
-  })
-
-  it('strips a protocol-relative reference — only an explicit https URL passes', () => {
-    const out = selfContainedDocument(
-      '<html><head><script src="//cdn.jsdelivr.net/npm/x.js"></script></head><body></body></html>',
-    )
-    expect(out).not.toContain('cdn.jsdelivr.net/npm')
-    expect(out).toContain('removed')
-  })
-})
-
 describe('observeArtifact — preview documents', () => {
   it('builds the markdown preview without referencing /api/', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('# hello')))
@@ -458,320 +324,105 @@ describe('observeArtifact — markdown image references', () => {
 
 // An HTML artifact previews as its own document, so the same references need the
 // same treatment.
-describe('observeArtifact — html local references', () => {
-  const png = new Uint8Array([137, 80, 78, 71])
+// HTML artifacts render from the artifact origin: hydration asks the server
+// for a grant instead of building a preview document, and nothing beside the
+// page is ever fetched by the host — the origin serves those files to the
+// frame directly.
+describe('hydrateArtifact — html artifacts on the artifact origin', () => {
+  const html = '<h1>hi</h1><img src="chart.png">'
 
-  function stubFetch(html: string, imageStatus = 200) {
+  function stubFetch(grantStatus = 200) {
     const fetchMock = vi.fn(async (u: string) => {
-      if (u.includes('page.html')) return new Response(html)
-      if (imageStatus !== 200) return new Response('', { status: imageStatus })
-      return imageResponse(png)
+      if (u.endsWith('/artifacts/grant')) {
+        if (grantStatus !== 200) {
+          return new Response(JSON.stringify({ error: 'artifact origin unavailable' }), { status: grantStatus })
+        }
+        return new Response(JSON.stringify({ url: 'http://tok.artifacts.localhost:8088/', expires_at: '2026-01-01T00:00:00Z' }))
+      }
+      return new Response(html)
     })
     vi.stubGlobal('fetch', fetchMock)
     return fetchMock
   }
 
-  it('inlines an <img> and a CSS url(), keeping the doctype', async () => {
-    stubFetch(
-      '<!DOCTYPE html><html><head><style>body{background:url("bg.png")}</style></head>' +
-        '<body><img src="chart.png"></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).toMatch(/^<!DOCTYPE html>/i)
-    expect(entry.preview).not.toContain('chart.png')
-    expect(entry.preview).not.toContain('bg.png')
-    expect(entry.preview.match(/data:image\/png;base64,/g)).toHaveLength(2)
-  })
-
-  it('drops a <picture>\'s <source> so the inlined <img src> actually wins', async () => {
-    stubFetch(
-      '<html><body><picture><source srcset="chart.webp" type="image/webp">' +
-        '<img src="chart.png"></picture></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).toContain('data:image/png;base64,')
-    // A surviving <source> outranks the src, so the browser would go back to
-    // the unreachable relative path and the image would still be broken.
-    expect(entry.preview).not.toContain('chart.webp')
-    expect(entry.preview).not.toContain('<source')
-  })
-
-  it('rewrites an SVG <image href>', async () => {
-    stubFetch('<html><body><svg><image href="d.png" width="10" height="10"></image></svg></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).toContain('data:image/png;base64,')
-    expect(entry.preview).not.toContain('d.png')
-  })
-
-  it('keeps a doctype\'s public and system identifiers', async () => {
-    stubFetch(
-      '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">' +
-        '<html><body><img src="chart.png"></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    // A name-only `<!DOCTYPE html>` would switch this file to standards mode and
-    // the preview would lay out differently from the real thing.
-    expect(get(artifacts)[0].preview).toContain('PUBLIC "-//W3C//DTD HTML 4.01//EN"')
-  })
-
-  it('hands back the exact source when there is nothing to inline', async () => {
-    const html = '<!DOCTYPE html><html><body><h1>hi</h1></body></html>'
-    stubFetch(html)
-
-    await observeHydrated('/tmp/page.html')
-
-    // No parse/serialize round-trip on a document with no local references.
-    expect(get(artifacts)[0].preview).toBe(html)
-  })
-
-  it('strips an unreachable local script and still inlines the image', async () => {
-    stubFetch('<html><head><script src="app.js"></script></head><body><img src="chart.png"></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).not.toContain('app.js')
-    expect(entry.preview).toContain('removed')
-    expect(entry.preview).toContain('data:image/png')
-  })
-})
-
-// Only a <link> whose rel the document needs in order to render gets stripped.
-// A favicon or manifest failing to load changes nothing, and treating those as
-// external references once kept the whole file from rendering and from the
-// image inliner entirely (#1896).
-describe('observeArtifact — link rel discrimination', () => {
-  const png = new Uint8Array([137, 80, 78, 71])
-
-  function stubFetch(html: string) {
-    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
-      if (u.includes('page.html')) return new Response(html)
-      return imageResponse(png)
-    }))
+  function grantCalls(fetchMock: ReturnType<typeof vi.fn>) {
+    return fetchMock.mock.calls.filter(c => String(c[0]).endsWith('/artifacts/grant'))
   }
 
-  it('previews past a favicon link and still inlines the images', async () => {
-    stubFetch(
-      '<html><head><link rel="icon" href="favicon.png"></head>' +
-        '<body><img src="chart.png"></body></html>',
-    )
+  it('records the granted origin URL and builds no preview document', async () => {
+    const fetchMock = stubFetch()
 
     await observeHydrated('/tmp/page.html')
 
     const [entry] = get(artifacts)
-    expect(entry.preview).not.toContain('removed')
-    // The whole point: this file used to skip the inliner along with the preview.
-    expect(entry.preview).toContain('data:image/png;base64,')
+    expect(entry.loaded).toBe(true)
+    expect(entry.originURL).toBe('http://tok.artifacts.localhost:8088/')
+    expect(entry.originUnavailable).toBeFalsy()
+    expect(entry.preview).toBe('')
+    expect(entry.code).toBe(html)
+    expect(entry.rev).toBe(1)
+    const [grant] = grantCalls(fetchMock)
+    expect(grant[0]).toBe(`/api/sessions/${SID}/artifacts/grant`)
+    expect((grant[1] as RequestInit).method).toBe('POST')
+    expect((grant[1] as RequestInit).body).toBe(JSON.stringify({ path: '/tmp/page.html' }))
+    expect(fetchMock.mock.calls.some(c => String(c[0]).includes('chart.png'))).toBe(false)
   })
 
-  it('previews past preconnect, manifest, and canonical links', async () => {
-    const html =
-      '<html><head><link rel="preconnect" href="https://fonts.googleapis.com">' +
-      '<link rel="manifest" href="manifest.json">' +
-      '<link rel="canonical" href="https://example.com/page"></head>' +
-      '<body><h1>hi</h1></body></html>'
-    stubFetch(html)
+  it('marks the origin unavailable when the server refuses the grant, keeping the code view', async () => {
+    stubFetch(409)
 
     await observeHydrated('/tmp/page.html')
 
-    expect(get(artifacts)[0].preview).toBe(html)
+    const [entry] = get(artifacts)
+    expect(entry.loaded).toBe(true)
+    expect(entry.loadFailed).toBeFalsy()
+    expect(entry.originUnavailable).toBe(true)
+    expect(entry.originURL).toBeUndefined()
+    expect(entry.code).toBe(html)
   })
 
-  it('strips an external stylesheet and renders the rest under a banner', async () => {
-    stubFetch('<html><head><link rel="stylesheet" href="https://cdn.example.com/x.css"></head><body><h1>hi</h1></body></html>')
+  it('bumps rev on a re-write so the frame reloads the unchanged origin', () => {
+    stubFetch()
+    observeArtifact(SID, payload('/tmp/page.html'), false)
+    observeArtifact(SID, payload('/tmp/page.html'), false)
+    expect(get(artifacts)).toHaveLength(1)
+    expect(get(artifacts)[0].rev).toBe(2)
+  })
 
+  it('a frame that finds the origin unreachable flips only that entry; later artifacts still ask', async () => {
+    const fetchMock = stubFetch()
     await observeHydrated('/tmp/page.html')
 
-    const { preview } = get(artifacts)[0]
-    expect(preview).not.toContain('cdn.example.com')
-    expect(preview).toContain('<h1>hi</h1>')
-    expect(preview).toContain('1 external script/stylesheet was removed')
-    // The banner sits inside the body, before the page's own content.
-    expect(preview.indexOf('removed')).toBeLessThan(preview.indexOf('<h1>hi</h1>'))
+    markArtifactOriginUnavailable(get(artifacts)[0])
+
+    expect(get(artifacts)[0].originUnavailable).toBe(true)
+    expect(get(artifacts)[0].originURL).toBeUndefined()
+    const before = grantCalls(fetchMock).length
+    await observeHydrated('/tmp/other.html')
+    // A transient failure must not lock the whole page into the notice.
+    expect(grantCalls(fetchMock).length).toBe(before + 1)
+    expect(get(artifacts).at(-1)!.originURL).toBe('http://tok.artifacts.localhost:8088/')
   })
 
-  it('strips a link whose rel attribute is unquoted or trails the href', async () => {
-    stubFetch('<html><head><link href="style.css" rel=stylesheet></head><body></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    const { preview } = get(artifacts)[0]
-    expect(preview).not.toContain('style.css')
-    expect(preview).toContain('removed')
-  })
-
-  it('treats rel="preload" as render-affecting', async () => {
-    // The rel="preload" onload="this.rel='stylesheet'" idiom makes it one.
-    stubFetch('<html><head><link rel="preload" as="style" href="x.css"></head><body></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    const { preview } = get(artifacts)[0]
-    expect(preview).not.toContain('x.css')
-    expect(preview).toContain('removed')
-  })
-
-  it('strips external scripts but keeps inline ones, and counts what it removed', async () => {
-    stubFetch(
-      '<html><head><script src="https://cdn.example.com/lib.js"></script>' +
-        '<script>window.ok = 1</script>' +
-        '<link rel="stylesheet" href="https://cdn.example.com/x.css"></head>' +
-        '<body><p>content</p><script src="app.js"></script></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    const { preview } = get(artifacts)[0]
-    expect(preview).not.toContain('lib.js')
-    expect(preview).not.toContain('app.js')
-    expect(preview).not.toContain('x.css')
-    expect(preview).toContain('<script>window.ok = 1</script>')
-    expect(preview).toContain('<p>content</p>')
-    expect(preview).toContain('3 external scripts/stylesheets were removed')
-  })
-
-  it('still inlines the local images of a page that lost its stylesheet', async () => {
-    // Before, an external reference routed the whole file to a warning page
-    // and the inliner never ran; now the surviving content gets its images.
-    stubFetch('<html><head><link rel="stylesheet" href="https://cdn.example.com/x.css"></head><body><img src="chart.png"></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    expect(get(artifacts)[0].preview).toContain('data:image/png;base64,')
-  })
-
-  it('still puts the banner before the content when the page is a bare fragment', async () => {
-    stubFetch('<link rel="stylesheet" href="https://cdn.example.com/x.css"><h1>hi</h1>')
-
-    await observeHydrated('/tmp/page.html')
-
-    // The DOM round-trip normalizes the fragment into a full document, so the
-    // banner lands inside the generated <body> rather than at the very top.
-    const { preview } = get(artifacts)[0]
-    expect(preview).not.toContain('cdn.example.com')
-    expect(preview).toContain('<h1>hi</h1>')
-    expect(preview.indexOf('removed')).toBeLessThan(preview.indexOf('<h1>hi</h1>'))
-  })
-
-  it('leaves a data: stylesheet alone, same as before', async () => {
-    const html = '<html><head><link rel="stylesheet" href="data:text/css,body{margin:0}"></head><body></body></html>'
-    stubFetch(html)
-
-    await observeHydrated('/tmp/page.html')
-
-    expect(get(artifacts)[0].preview).toBe(html)
-  })
-})
-
-// The #1888 review collected reference kinds the inliner skipped; these pin
-// the client-side-fixable ones (#1892). What stays out: file kinds the
-// artifact endpoint deliberately doesn't serve (video, audio, fonts).
-describe('observeArtifact — inliner gaps (#1892)', () => {
-  const png = new Uint8Array([137, 80, 78, 71])
-
-  function stubFetch(html: string) {
-    const fetchMock = vi.fn(async (u: string) => {
-      if (u.includes('page.html')) return new Response(html)
-      return imageResponse(png)
+  it('probes an origin URL once, and marks the entry when the host does not resolve', async () => {
+    const probe = vi.fn(async (url: string) => {
+      if (url.startsWith('http://dead.')) throw new TypeError('Failed to fetch')
+      return new Response(null, { status: 200 })
     })
-    vi.stubGlobal('fetch', fetchMock)
-    return fetchMock
-  }
+    vi.stubGlobal('fetch', probe)
+    const live = { path: '/tmp/a.html', originURL: 'http://live.artifacts.localhost:8088/' } as Artifact
+    const dead = { path: '/tmp/b.html', originURL: 'http://dead.artifacts.localhost:8088/' } as Artifact
+    artifacts.set([live, dead])
 
-  it('inlines a srcset-only <img> via its first candidate', async () => {
-    const fetchMock = stubFetch('<html><body><img srcset="chart.png 1x, chart@2x.png 2x"></body></html>')
+    probeArtifactOrigin(live)
+    probeArtifactOrigin(live) // a theme switch or re-render: no second fetch
+    probeArtifactOrigin(dead)
+    await new Promise(r => setTimeout(r, 0))
 
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).toContain('src="data:image/png;base64,')
-    expect(entry.preview).not.toContain('srcset')
-    expect(fetchMock).toHaveBeenCalledWith(
-      `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/chart.png')}`,
-    )
-  })
-
-  it('does not second-guess a remote src just because the srcset is local', async () => {
-    const html = '<html><body><img src="https://example.com/c.png" srcset="chart.png 1x"></body></html>'
-    const fetchMock = stubFetch(html)
-
-    await observeHydrated('/tmp/page.html')
-
-    // The remote src is a load the iframe performs fine; replacing it with a
-    // sibling file's bytes would show the wrong image.
-    expect(get(artifacts)[0].preview).toBe(html)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-  })
-
-  it('resolves references against a local <base href>', async () => {
-    const fetchMock = stubFetch(
-      '<html><head><base href="assets/"></head><body><img src="chart.png"></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    expect(get(artifacts)[0].preview).toContain('data:image/png;base64,')
-    expect(fetchMock).toHaveBeenCalledWith(
-      `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/assets/chart.png')}`,
-    )
-  })
-
-  it('inlines nothing under a remote <base href>', async () => {
-    const html = '<html><head><base href="https://cdn.example.com/"></head><body><img src="chart.png"></body></html>'
-    const fetchMock = stubFetch(html)
-
-    await observeHydrated('/tmp/page.html')
-
-    // chart.png resolves against the remote base — again a load the iframe
-    // performs itself — so the document rides through untouched.
-    expect(get(artifacts)[0].preview).toBe(html)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-  })
-
-  it('keeps a comment above <html>', async () => {
-    stubFetch('<!-- built 2026-07-30 --><!DOCTYPE html><html><body><img src="chart.png"></body></html>')
-
-    await observeHydrated('/tmp/page.html')
-
-    const [entry] = get(artifacts)
-    expect(entry.preview).toContain('<!-- built 2026-07-30 -->')
-    expect(entry.preview).toContain('<!DOCTYPE html>')
-    expect(entry.preview).toContain('data:image/png;base64,')
-  })
-
-  it('inlines a quoted CSS url() whose file name contains a parenthesis', async () => {
-    const fetchMock = stubFetch(
-      '<html><head><style>body{background:url("bg (1).png")}</style></head><body></body></html>',
-    )
-
-    await observeHydrated('/tmp/page.html')
-
-    expect(get(artifacts)[0].preview).toContain('data:image/png;base64,')
-    expect(fetchMock).toHaveBeenCalledWith(
-      `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/bg (1).png')}`,
-    )
-  })
-
-  it('leaves a quoted data: url() with parentheses alone', async () => {
-    const html =
-      `<html><head><style>body{background:url("data:image/svg+xml,<svg fill='rgb(1,2,3)'/>")}</style></head><body></body></html>`
-    const fetchMock = stubFetch(html)
-
-    await observeHydrated('/tmp/page.html')
-
-    expect(get(artifacts)[0].preview).toBe(html)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(probe.mock.calls.filter(c => String(c[0]).startsWith('http://live.')).length).toBe(1)
+    expect(get(artifacts)[0].originUnavailable).toBeFalsy()
+    expect(get(artifacts)[1].originUnavailable).toBe(true)
+    expect(get(artifacts)[1].originURL).toBeUndefined()
   })
 })
 
@@ -833,6 +484,8 @@ describe('installArtifactThemeRefresh — theme switch busts baked previews', ()
         loaded: true, code: '# hi', preview: '<h1>hi</h1>' } as any,
       { id: 'a2', name: 'shot.png', path: '/tmp/shot.png', type: 'Image', icon: '',
         loaded: true, src: '/api/x.png', preview: '' } as any,
+      { id: 'a3', name: 'page.html', path: '/tmp/page.html', type: 'HTML', icon: '',
+        loaded: true, code: '<h1>hi</h1>', preview: '', originURL: 'http://t.artifacts.localhost:8088/' } as any,
     ])
 
     document.documentElement.setAttribute('data-theme', 'dark')
@@ -845,5 +498,9 @@ describe('installArtifactThemeRefresh — theme switch busts baked previews', ()
     // to rebuild it, so resetting it would strand a permanent spinner.
     expect(get(artifacts)[1].loaded).toBe(true)
     expect(get(artifacts)[1].src).toBe('/api/x.png')
+    // An HTML entry on the artifact origin has no baked theme: the frame
+    // passes the theme in the URL, so nothing here needs rebuilding.
+    expect(get(artifacts)[2].loaded).toBe(true)
+    expect(get(artifacts)[2].originURL).toBe('http://t.artifacts.localhost:8088/')
   })
 })

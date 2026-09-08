@@ -1,34 +1,20 @@
-// Light App download bridge — makes `<a download>` WORK inside Light Apps.
+// Light App download bridge — the host half.
 //
-// Light Apps render in a sandboxed srcdoc iframe without `allow-downloads`,
-// so the browser drops every download the app starts (Chrome logs "Download
-// is disallowed. The frame initiating or instantiating the download is
-// sandboxed…"). The desktop webview is worse: the octo-served page has no
-// download delegate at all, so even an unsandboxed download would be a silent
-// no-op there (see internal/server/native_handlers.go, SaveFile).
-//
-// Same fix as the storage bridge (laStorage.ts): leave the sandbox alone and
-// let the host do it. The injected script intercepts the standard download
-// idiom — an anchor with a `download` attribute pointing at a blob:/data: URL
-// — reads the bytes into a Blob and posts it to the host, which saves it the
-// way the artifact panel does: the OS save dialog in the desktop shell, a
-// top-level blob download in a browser.
+// A Light App renders from its own origin, so in a browser `<a download>` is a
+// plain download and needs no help. The desktop webview is the exception: the
+// octo-served page has no download delegate at all, so a download there is a
+// silent no-op (see internal/server/native_handlers.go, SaveFile). For that
+// case the server appends a script to the app (internal/server/lightapp_bridge.js,
+// desktop only) that intercepts the standard idiom — an anchor with a `download`
+// attribute pointing at a blob:/data: URL — reads the bytes into a Blob and
+// posts it here, where it is saved the way the artifact panel's Download button
+// saves: the OS save dialog through /api/native/save-file.
 //
 // Light Apps keep writing the textbook pattern
 //   const a = document.createElement('a')
 //   a.href = URL.createObjectURL(blob); a.download = 'report.csv'; a.click()
-// with no special API. Both shapes are covered: a real user click on an
-// in-document anchor (document-level click listener) and the programmatic
-// `.click()` on a detached anchor, whose event never reaches the document
-// (HTMLAnchorElement.prototype.click patch). An app that already called
-// preventDefault() on the click keeps its own handling.
-//
-// Not intercepted: window.open(blobUrl) and location.href = dataUrl. Neither is
-// a download in an unsandboxed page either. Also missed: a click the app
-// stops with stopPropagation() before it reaches the document (without
-// preventDefault) — the browser's default then runs and the sandbox drops it
-// silently. Catching that would mean fetching in the capture phase for every
-// download click, including ones the app is about to cancel; not worth it.
+// with no special API. laStorage.ts owns the frame registry and routes the
+// `download` message to deliverLaDownload below.
 
 import { get } from 'svelte/store'
 import { nativeShell, showToast } from './stores'
@@ -71,7 +57,9 @@ let nativeSaveInFlight = false
 // Saves a blob the Light App handed over. Resolves to whether a file was
 // written (false on a cancelled, failed or dropped native save). The browser
 // path mirrors artifact-actions.ts: an in-document anchor, since a detached
-// anchor's click() has never been reliable in Firefox.
+// anchor's click() has never been reliable in Firefox. It is kept for a server
+// that injects the bridge for every client — the desktop hub is also reachable
+// from a plain browser on the same machine.
 export async function deliverLaDownload(name: string, blob: Blob): Promise<boolean> {
   if (get(nativeShell)) {
     if (nativeSaveInFlight) return false
@@ -96,52 +84,4 @@ export async function deliverLaDownload(name: string, blob: Blob): Promise<boole
   a.remove()
   URL.revokeObjectURL(url)
   return true
-}
-
-// ── iframe-side script ──────────────────────────────────────────────────────
-//
-// Injected alongside the storage shim (withLaBridge). Fire-and-forget: the
-// host never replies to a download (a save dialog can sit open for minutes,
-// and the outcome is shown as a host toast), so the request carries id 0 and
-// the storage shim's reply listener has no pending entry to confuse it with.
-
-// Embed a string as a JS literal that is also inert inside <script> in HTML.
-// Shared with the storage shim in laStorage.ts.
-export function jsLiteral(s: string): string {
-  return JSON.stringify(s).replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
-}
-
-export function buildLaDownloadScript(ns: string): string {
-  return `(function(){
-  if (window.parent === window) return; // not framed — native downloads work here
-  var NS = ${jsLiteral(ns)};
-  function send(name, blob){
-    try { window.parent.postMessage({ __laBridge: 1, id: 0, ns: NS, op: 'download', name: name, blob: blob }, '*'); }
-    catch (e) { console.warn('[octo] download bridge failed', e); }
-  }
-  // Resolve the anchor's target to bytes and hand them to the host. Returns
-  // false when the anchor has nothing to download, so the caller leaves the
-  // event alone.
-  function save(a){
-    if (!a.getAttribute('href')) return false;
-    var name = a.getAttribute('download') || '';
-    fetch(a.href).then(function(r){ return r.blob(); })
-      .then(function(b){ send(name, b); })
-      .catch(function(e){ console.warn('[octo] download failed', e); });
-    return true;
-  }
-  document.addEventListener('click', function(ev){
-    if (ev.defaultPrevented) return;
-    // composedPath so an anchor inside a shadow root is found; target alone
-    // is retargeted to the shadow host.
-    var t = ev.composedPath ? ev.composedPath()[0] : ev.target;
-    var a = t && t.closest ? t.closest('a[download]') : null;
-    if (a && save(a)) ev.preventDefault();
-  });
-  var origClick = HTMLAnchorElement.prototype.click;
-  HTMLAnchorElement.prototype.click = function(){
-    if (!this.isConnected && this.hasAttribute('download') && save(this)) return;
-    return origClick.apply(this, arguments);
-  };
-})();`
 }
