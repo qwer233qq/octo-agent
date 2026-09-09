@@ -55,6 +55,11 @@ type ModelEntry struct {
 	// Headers are extra HTTP headers sent with every request to this entry's
 	// endpoint. Projected from Endpoint.Headers — see projectToModelEntry.
 	Headers map[string]string `yaml:"headers,omitempty"`
+	// RPM and MaxConcurrency are the endpoint's rate limits, projected here so
+	// sender construction sees them without re-reading the endpoint. See
+	// Endpoint.RPM.
+	RPM            int `yaml:"rpm,omitempty"`
+	MaxConcurrency int `yaml:"max_concurrency,omitempty"`
 	// Vision controls whether tools may hand this model images (e.g. the
 	// browser tool's screenshot). It is always recorded: predefined models get
 	// their catalogue value at add time, custom models are answered by the user.
@@ -128,6 +133,17 @@ type Endpoint struct {
 	// that requires a non-standard auth header take over from the client
 	// default. Values are static plaintext; no env-var interpolation.
 	Headers map[string]string `yaml:"headers,omitempty"`
+	// RPM caps how many provider calls octo starts against this endpoint per
+	// rolling 60-second window; MaxConcurrency caps how many may be in flight
+	// at once. Retries within one call don't spend a second permit, so a call
+	// that keeps failing can put up to retry.Default().MaxAttempts requests on
+	// the wire against one permit.
+	// Zero (the default) means unlimited. Both gate every caller sharing the
+	// endpoint — main loop, sub-agents, workflows, title generation, the
+	// vision helper — so a free-tier quota holds no matter how many of them
+	// run at once. There is no UI for these: hand-edit config.yml.
+	RPM            int `yaml:"rpm,omitempty"`
+	MaxConcurrency int `yaml:"max_concurrency,omitempty"`
 	// Models is the list of models offered through this endpoint. Each
 	// carries its own Vision flag (model-level capability, not endpoint-level).
 	Models []EndpointModel `yaml:"models"`
@@ -542,7 +558,24 @@ func projectToModelEntry(ep Endpoint, m EndpointModel) ModelEntry {
 		Protocol: ep.Protocol,
 		Headers:  ep.Headers,
 		Vision:   m.Vision,
+
+		RPM:            ep.RPM,
+		MaxConcurrency: ep.MaxConcurrency,
 	}
+}
+
+// maxRateLimitValue bounds Endpoint.RPM / Endpoint.MaxConcurrency. Far above
+// any real provider quota, low enough that a mistyped extra digit is caught
+// before it sizes an allocation.
+const maxRateLimitValue = 100000
+
+// EntryFor projects an endpoint + one of its models into a ModelEntry. It is
+// the exported face of projectToModelEntry, for callers outside this package
+// that resolved the pair themselves (ParseModelFlag) and would otherwise
+// hand-copy the fields — which is how Headers came to be missing from the IM
+// /model path until the rate-limit fields were added beside it.
+func EntryFor(ep Endpoint, m EndpointModel) ModelEntry {
+	return projectToModelEntry(ep, m)
 }
 
 // Validate reports semantic problems in a config that already parsed cleanly —
@@ -630,6 +663,16 @@ func (c Config) Validate() []string {
 
 		if len(ep.Models) == 0 {
 			problems = append(problems, fmt.Sprintf("endpoint %q has no models", ep.ID))
+		}
+		// The rate-limit knobs have no UI — a hand edit is the only way in, so
+		// a bad value has nothing else to catch it. The upper bound matters
+		// because rpm sizes an allocation in the limiter: a stray extra digit
+		// shouldn't ask for gigabytes.
+		if ep.RPM < 0 || ep.RPM > maxRateLimitValue {
+			problems = append(problems, fmt.Sprintf("endpoint %q has an out-of-range rpm (%d; 0–%d, where 0 means unlimited)", ep.ID, ep.RPM, maxRateLimitValue))
+		}
+		if ep.MaxConcurrency < 0 || ep.MaxConcurrency > maxRateLimitValue {
+			problems = append(problems, fmt.Sprintf("endpoint %q has an out-of-range max_concurrency (%d; 0–%d, where 0 means unlimited)", ep.ID, ep.MaxConcurrency, maxRateLimitValue))
 		}
 		seenModel := make(map[string]bool, len(ep.Models))
 		for j, m := range ep.Models {
@@ -754,15 +797,7 @@ func (c Config) EntryByModel(model string) (ModelEntry, bool) {
 			}
 			for _, m := range ep.Models {
 				if m.Model == modelName {
-					return ModelEntry{
-						Provider: ep.Provider,
-						Model:    m.Model,
-						BaseURL:  ep.BaseURL,
-						APIKey:   ep.APIKey,
-						Protocol: ep.Protocol,
-						Headers:  ep.Headers,
-						Vision:   m.Vision,
-					}, true
+					return projectToModelEntry(ep, m), true
 				}
 			}
 		}
