@@ -702,7 +702,7 @@ func (a *Agent) turn(ctx context.Context, userInput string, finishInterrupt bool
 		return Reply{}, fmt.Errorf("agent: send: %w", err)
 	}
 
-	a.History.Append(assistantReplyMessage(reply))
+	a.History.Append(assistantReplyMessage(reply, false))
 	a.accrueUsage(reply)
 	a.accountGoalUsage(nil)
 	return reply, nil
@@ -784,7 +784,7 @@ func (a *Agent) turnStream(
 		return Reply{}, fmt.Errorf("agent: stream: %w", err)
 	}
 
-	a.History.Append(assistantReplyMessage(reply))
+	a.History.Append(assistantReplyMessage(reply, false))
 	a.accrueUsage(reply)
 	a.accountGoalUsage(handler)
 	return reply, nil
@@ -1334,7 +1334,7 @@ func (a *Agent) runLoop(
 		if content == "" {
 			content = textFromBlocks(reply.Blocks)
 		}
-		a.History.Append(assistantReplyMessage(reply))
+		a.History.Append(assistantReplyMessage(reply, reminderCarry != ""))
 		reply.Content = content
 
 		// A mid-turn steer (text and/or pasted images) arrived while the model
@@ -2182,16 +2182,58 @@ func flattenResults(slices [][]ContentBlock) []ContentBlock {
 // round-tripping those blocks is the same contract already honored for tool-use
 // turns, and the OpenAI adapter ignores the thinking block and falls back to
 // Content. Plain replies with no thinking keep the lightweight Content form.
-func assistantReplyMessage(reply Reply) Message {
+func assistantReplyMessage(reply Reply, carriedText bool) Message {
 	content := reply.Content
 	if content == "" {
 		content = textFromBlocks(reply.Blocks)
+	}
+	if content == "" {
+		logEmptyReply(reply, carriedText)
 	}
 	msg := NewAssistantMessage(content)
 	if hasThinkingBlock(reply.Blocks) {
 		msg.Blocks = reply.Blocks
 	}
 	return msg
+}
+
+// logEmptyReply records a turn whose assistant reply carried no text at all.
+//
+// NewAssistantMessage substitutes a "[no content]" placeholder so the history
+// stays valid for providers that reject empty assistant content, but that
+// placeholder is the only trace such a turn leaves: neither the session file
+// nor the logs record which model produced it, what stop reason came back, or
+// what the call cost. One shape is confirmed in this repo — a stream that
+// drops after the role-only first chunk, which the openai aggregator handles
+// and TestSendStream_RoleOnlyChunk covers — and the fields below are what
+// distinguishes it from the others a report might turn out to involve.
+//
+// carriedText says the user is not looking at a blank bubble: a turn-end
+// reminder is holding earlier text that runLoop re-attaches after this
+// append, so the empty round is the model declining to add to it. Still worth
+// a line — the reminder round bought nothing — but it is not the reported
+// symptom.
+//
+// A round that called tools is not this case at all. runLoop's tool_use
+// branch never reaches here, so this guard is for a provider that returns
+// tool_use blocks under some other stop reason.
+func logEmptyReply(reply Reply, carriedText bool) {
+	for _, b := range reply.Blocks {
+		if b.Type == "tool_use" {
+			return
+		}
+	}
+	slog.Warn("agent: assistant reply carried no text",
+		"model", reply.Model,
+		"stop_reason", reply.StopReason,
+		"blocks", len(reply.Blocks),
+		"has_thinking", hasThinkingBlock(reply.Blocks),
+		"carried_text", carriedText,
+		"input_tokens", reply.InputTokens,
+		"output_tokens", reply.OutputTokens,
+		"cache_read_tokens", reply.CacheReadTokens,
+		"cache_write_tokens", reply.CacheWriteTokens,
+	)
 }
 
 // hasThinkingBlock reports whether blocks carries a reasoning trace worth
