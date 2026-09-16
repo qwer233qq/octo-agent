@@ -125,6 +125,13 @@ type nativeBridge struct {
 	// menu immediately rather than waiting for refreshTrayLoop's next tick.
 	tray atomic.Pointer[application.SystemTray]
 
+	// pet is the desktop-pet window, nil while it is down. An auxiliary window
+	// with no part in the main window's show/hide/revive machinery — see pet.go.
+	pet atomic.Pointer[application.WebviewWindow]
+	// petState is the pet's current animation state, published by setPetState
+	// and read by the pointer loop, whose hit shapes depend on the pose.
+	petState atomic.Pointer[string]
+
 	settingsMu sync.Mutex
 	settings   desktopSettings
 	// geomTimer debounces persistence of the window geometry to disk: a drag
