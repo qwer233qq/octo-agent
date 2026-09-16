@@ -126,24 +126,29 @@ func (s *Server) handleOnboardStatus(w http.ResponseWriter, r *http.Request) {
 func detectOnboardPhase() string {
 	cfg, _ := config.Load()
 
-	// Check if any provider key is available. A keyless Custom endpoint
-	// (local Ollama/vLLM) counts as configured — there is no key to set up.
-	hasKey := false
+	// Look for an endpoint that could actually run. Its key may be stored in
+	// config, may live in the provider's environment variable (senderForEntry
+	// and resolveAPIKey both read the environment first), or may not exist at
+	// all for a keyless Custom endpoint (local Ollama/vLLM).
+	//
+	// The environment is only ever consulted per endpoint, never on its own. A
+	// machine that exports ANTHROPIC_API_KEY or DEEPSEEK_API_KEY for some other
+	// tool — common enough — used to be read as "this install is configured"
+	// and skipped setup entirely, on an install with no endpoint and no model
+	// to run. The user landed on a chat that fails at the first message rather
+	// than on the panel that would have fixed it. A key on its own configures
+	// nothing.
+	configured := false
 	for _, ep := range cfg.Endpoints {
-		if ep.APIKey != "" || app.VendorKeyOptional(ep.Provider) {
-			hasKey = true
+		if ep.APIKey != "" || app.VendorKeyOptional(ep.Provider) || os.Getenv(app.VendorAPIKeyEnvVar(ep.Provider)) != "" {
+			configured = true
 			break
 		}
 	}
-	if !hasKey {
-		for _, v := range app.Registry {
-			if os.Getenv(v.APIKeyEnvVar) != "" {
-				hasKey = true
-				break
-			}
-		}
+	if !configured {
+		configured = envOnlyProviderConfigured(cfg)
 	}
-	if !hasKey {
+	if !configured {
 		return "key_setup"
 	}
 
@@ -160,6 +165,30 @@ func detectOnboardPhase() string {
 	}
 
 	return ""
+}
+
+// envOnlyProviderConfigured reports whether the server can reach a model with
+// no endpoint configured at all. That install really does run — it is the shape
+// packaging/systemd/octo.service and the self-host guide recommend, a key in
+// the environment and nothing in config.yml — so it must not be sent to the
+// setup panel.
+//
+// It resolves exactly what resolveProviderAndModel would: the provider from
+// OCTO_PROVIDER or the anthropic default, a model from that vendor, and the key
+// from that ONE vendor's environment variable. Asking each vendor about its own
+// key is the whole point — scanning every vendor, which is what this used to do,
+// let an ANTHROPIC_API_KEY left behind by another tool stand in for a DeepSeek
+// setup that was never made, and hid the panel from installs that could not run.
+func envOnlyProviderConfigured(cfg config.Config) bool {
+	provName := firstNonEmpty(os.Getenv("OCTO_PROVIDER"), "anthropic")
+	if modelFromEnv(provName) == "" && defaultModelFor(provName) == "" {
+		return false
+	}
+	if app.VendorKeyOptional(provName) {
+		return true
+	}
+	key, err := resolveAPIKey(provName, cfg)
+	return err == nil && key != ""
 }
 
 // identityMissing reports whether dir has neither soul.md nor user.md (nor
