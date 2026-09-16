@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -162,6 +163,11 @@ func (e Endpoint) CompositeID(model string) string {
 	return e.ID + "::" + model
 }
 
+// MinFallbackContextWindow is the floor for fallback_context_window. It exists
+// to catch the unit mistake (writing 32 to mean 32k), which would otherwise put
+// the compaction trigger below a single message. Not a claim about real models.
+const MinFallbackContextWindow = 1000
+
 // Config is the persisted set of CLI defaults. Every field is optional; a
 // missing file (or a missing field) leaves the zero value, and the caller
 // substitutes its built-in default.
@@ -202,6 +208,13 @@ type Config struct {
 	// compacts once the context exceeds this share of the window. Zero means
 	// the built-in default (75%).
 	CompactAutoPct int `yaml:"compact_auto_pct,omitempty"`
+	// FallbackContextWindow is the context window (in tokens) assumed for a
+	// model whose name matches no entry in the built-in table — a self-hosted
+	// or renamed model, where the built-in 128k guess may be far larger than
+	// what the serving process was actually started with. Zero means the
+	// built-in default. A model that DOES match the table keeps the table's
+	// value; this never overrides a known model.
+	FallbackContextWindow int `yaml:"fallback_context_window,omitempty"`
 	// Tools holds opt-in tooling behaviour (Tool Search for MCP, etc.). A
 	// missing block leaves the built-in defaults.
 	Tools ToolsConfig `yaml:"tools,omitempty"`
@@ -446,6 +459,53 @@ func (c Config) EffectiveCoauthor() bool {
 	return true
 }
 
+// EffectiveFallbackContextWindow resolves the window assumed for models the
+// built-in table doesn't know: OCTO_FALLBACK_CONTEXT_WINDOW when set, else the
+// config value, else 0 — which leaves the agent's own built-in default in
+// place. Mirrors EffectiveCoauthor: every caller, CLI or server, resolves the
+// env and config layers identically, so a value that works under `octo` works
+// under `octo serve` (which loads ~/.octo/serve.env into the environment
+// before reading any of this).
+//
+// A value below MinFallbackContextWindow is dropped rather than honored — it is
+// the unit mistake (32 meaning 32k), and 32 tokens would put the compaction
+// trigger below a single message. A rejected layer falls through to the next
+// rather than disabling the feature, so a bad env var still leaves the config
+// file's value in force.
+//
+// Returns the reasons alongside the value because Validate never sees the
+// environment, and Load never calls Validate — without this the only report of
+// a bad value would be `octo doctor`.
+func (c Config) EffectiveFallbackContextWindow() (int, []string) {
+	var problems []string
+	reject := func(src string, n int) {
+		problems = append(problems, fmt.Sprintf("ignoring %s %d — the value is in tokens, so 32k is 32000, not 32", src, n))
+	}
+	if env := strings.TrimSpace(os.Getenv("OCTO_FALLBACK_CONTEXT_WINDOW")); env != "" {
+		switch n, err := strconv.Atoi(env); {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("ignoring OCTO_FALLBACK_CONTEXT_WINDOW %q — not a number", env))
+		case n < 0:
+			problems = append(problems, fmt.Sprintf("ignoring OCTO_FALLBACK_CONTEXT_WINDOW %d — negative", n))
+		case n == 0: // explicit zero means "unset"; fall through to the file
+		case n < MinFallbackContextWindow:
+			reject("OCTO_FALLBACK_CONTEXT_WINDOW", n)
+		default:
+			return n, problems
+		}
+	}
+	switch {
+	case c.FallbackContextWindow < 0:
+		problems = append(problems, fmt.Sprintf("ignoring fallback_context_window %d — negative", c.FallbackContextWindow))
+	case c.FallbackContextWindow == 0:
+	case c.FallbackContextWindow < MinFallbackContextWindow:
+		reject("fallback_context_window", c.FallbackContextWindow)
+	default:
+		return c.FallbackContextWindow, problems
+	}
+	return 0, problems
+}
+
 // ModelVision reports whether the named model accepts image content. When the
 // model matches a configured entry, its recorded Vision value is authoritative
 // (Load backfills legacy entries, so it is always set). A model not present in
@@ -628,6 +688,14 @@ func (c Config) Validate() []string {
 	}
 	if c.CompactAutoPct < 0 || c.CompactAutoPct > 100 {
 		problems = append(problems, fmt.Sprintf("compact_auto_pct %d is out of range (0–100; 0 means the built-in default)", c.CompactAutoPct))
+	}
+	// No upper bound: million-token windows are real. The floor rejects the
+	// mistake that actually happens — writing "32" for 32k, which would put the
+	// compaction trigger below a single message.
+	if c.FallbackContextWindow < 0 {
+		problems = append(problems, fmt.Sprintf("fallback_context_window %d is negative (0 means the built-in default)", c.FallbackContextWindow))
+	} else if c.FallbackContextWindow > 0 && c.FallbackContextWindow < MinFallbackContextWindow {
+		problems = append(problems, fmt.Sprintf("fallback_context_window %d is below the %d-token floor — the value is in tokens, so 32k is 32000, not 32", c.FallbackContextWindow, MinFallbackContextWindow))
 	}
 	if lang := strings.ToLower(strings.TrimSpace(c.Language)); lang != "" && lang != "en" && lang != "zh" {
 		problems = append(problems, fmt.Sprintf("language %q is not one of en, zh", c.Language))

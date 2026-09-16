@@ -468,6 +468,11 @@ func New(cfg Config) (*Server, error) {
 	skillReg.SetDisabled(fileCfg.Tools.DisabledSkills)
 	skillsManifest := tools.SkillsManifest(skillReg)
 	tools.SetSkills(skillReg)
+	// Process-wide, like SetSkills above: the Tool Search budget and the web
+	// UI's context gauge resolve a window from the model name with no Config in
+	// hand. Re-installed per turn below so a config edit lands without a
+	// restart.
+	installFallbackContextWindow(fileCfg, true)
 
 	// Resolve the default workspace dir new web sessions get. cfg.WorkspaceDir
 	// (no `octo serve` flag sets it today) takes precedence so tests can inject
@@ -677,6 +682,22 @@ func (s *Server) syncGoalsEnabled() {
 // unreachable server is logged and skipped. No-op when tools are disabled.
 // mcpCleanup is always set (a no-op when nothing connected) so Shutdown can call
 // it unconditionally.
+// installFallbackContextWindow resolves the env + config layers the same way
+// the CLI does and installs the result process-wide. Called at startup and
+// again per turn, so a config edit lands without a restart.
+//
+// complain is true only for the startup call: the resolver's complaints are
+// about a static config, so repeating them on every turn would be noise.
+func installFallbackContextWindow(cfg config.Config, complain bool) {
+	n, problems := cfg.EffectiveFallbackContextWindow()
+	if complain {
+		for _, p := range problems {
+			slog.Warn("config", "problem", p)
+		}
+	}
+	agent.SetFallbackContextWindow(n)
+}
+
 func (s *Server) enableMCP() {
 	s.mcpCleanup = func() {}
 	if !s.cfg.Tools {
@@ -1334,6 +1355,10 @@ func (s *Server) buildAgent(sess *agent.Session) *agent.Agent {
 		if cfg.CompactAutoPct > 0 {
 			a.CompactAutoFraction = float64(cfg.CompactAutoPct) / 100.0
 		}
+		// Same reason, for the window assumed for models the built-in table
+		// doesn't know. Process-wide rather than per-Agent: the readers that
+		// need it (Tool Search, the context gauge) never see this Agent.
+		installFallbackContextWindow(cfg, false)
 	}
 
 	// Refresh the external memory backend from config before reading
@@ -3520,6 +3545,7 @@ func (s *Server) runChannelTurns(ctx context.Context, sess *channel.Session, ad 
 	if cfg.CompactAutoPct > 0 {
 		sess.Agent.CompactAutoFraction = float64(cfg.CompactAutoPct) / 100.0
 	}
+	installFallbackContextWindow(cfg, false)
 	// The composed system prompt is frozen the first time a turn builds this
 	// channel session (see Session.SetComposedSystem) — every later turn
 	// reuses the identical string instead of recomposing it, matching the web
