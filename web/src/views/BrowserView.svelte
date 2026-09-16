@@ -211,7 +211,7 @@
   .conn-desc { font-size: 12px; color: var(--text-secondary); }
   .conn-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
   .conn-note { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 12px; color: var(--warning); background: var(--warning-bg); }
-  .mono { font-family: ui-monospace, monospace; }
+  .mono { font-family: var(--font-mono); }
   .hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 14px; }
   .muted { color: var(--text-secondary); font-size: 13px; }
   .rec-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -225,7 +225,7 @@
   .ghost-btn.danger { color: var(--error); }
   .ghost-btn.danger:hover { background: var(--error-bg); border-color: var(--error-border); }
   .rec-head-actions { display: flex; align-items: center; gap: 8px; }
-  .primary-btn { display: inline-flex; align-items: center; gap: 5px; background: var(--blue-6); color: #fff; border: none; border-radius: 8px; padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
+  .primary-btn { display: inline-flex; align-items: center; gap: 5px; background: var(--blue-6); color: var(--on-accent); border: none; border-radius: 8px; padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
   .primary-btn:hover:not(:disabled) { background: var(--blue-5); }
   .primary-btn:disabled { opacity: 0.6; cursor: default; }
   .modal-overlay {

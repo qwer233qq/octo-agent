@@ -1,5 +1,6 @@
 <script lang="ts">
   import Segment from '../ui/Segment.svelte'
+  import ThemePackPicker from '../ui/ThemePackPicker.svelte'
   import Switch from '../ui/Switch.svelte'
   import EndpointsSection from '../settings/EndpointsSection.svelte'
   import QrCode from '../ui/QrCode.svelte'
@@ -519,6 +520,15 @@
             </div>
             <Segment options={['Small', 'Medium', 'Large']} labels={{ Small: $t('settings.fs_small'), Medium: $t('settings.fs_medium'), Large: $t('settings.fs_large') }} bind:value={fontSize} />
           </div>
+          <!-- Theme before Appearance: the pack is the bigger choice, and
+               appearance reads as a modifier of it rather than the reverse. -->
+          <div class="setrow">
+            <div class="seti">
+              <span class="setl">{$t('settings.pack')}</span>
+              <span class="setd">{$t('settings.pack_desc')}</span>
+            </div>
+            <ThemePackPicker />
+          </div>
           <div class="setrow">
             <div class="seti">
               <span class="setl">{$t('settings.theme')}</span>
@@ -884,7 +894,7 @@ select.sinput { cursor: pointer; }
 .mobile-meta > div { min-width: 0; }
 .mobile-info .btns { align-self: flex-start; }
 .mobile-disabled { padding: 28px 16px; text-align: center; font-size: 13px; color: var(--text-tertiary); }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 
 /* ── data management ─────────────────────────────────────────────────────── */
 .data-row {

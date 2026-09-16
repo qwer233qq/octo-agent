@@ -229,7 +229,7 @@
   border-top: 1px solid var(--border-table);
 }
 .script-view {
-  margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.6;
+  margin: 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6;
   color: var(--text); white-space: pre-wrap; word-break: break-word;
 }
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
@@ -237,7 +237,7 @@
 h2 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; color: var(--text-heading); }
 p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 60ch; }
 .header-actions { display: flex; align-items: center; gap: 8px; }
-.btn-primary { height: 32px; padding: 0 14px; border: none; background: var(--blue-6); border-radius: 8px; font-size: 13px; font-weight: 600; color: #fff; cursor: pointer; font-family: inherit; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
+.btn-primary { height: 32px; padding: 0 14px; border: none; background: var(--blue-6); border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--on-accent); cursor: pointer; font-family: inherit; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
 .btn-primary:hover { background: var(--blue-5); }
 .btn-secondary { height: 32px; padding: 0 12px; border: 1px solid var(--border); background: var(--bg-container); border-radius: 8px; font-size: 13px; font-weight: 500; color: var(--text); cursor: pointer; font-family: inherit; }
 .btn-secondary:hover { background: var(--hover-neutral); border-color: var(--text-quaternary); }
@@ -258,7 +258,7 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
   width: 28px; height: 28px; flex: 0 0 28px; border-radius: 9999px;
   background: var(--blue-1); color: var(--blue-6); display: flex; align-items: center; justify-content: center;
 }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 .name { font-size: 14px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .desc { font-size: 13px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }

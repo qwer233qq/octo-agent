@@ -439,7 +439,7 @@ p  { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 .btn-primary {
   height: 32px; padding: 0 14px; border: none; background: var(--blue-6);
-  border-radius: 8px; font-size: 13px; font-weight: 600; color: #fff; cursor: pointer;
+  border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--on-accent); cursor: pointer;
   font-family: inherit; display: flex; align-items: center; gap: 8px;
   box-shadow: 0 1px 2px rgba(0,122,255,0.35);
 }
@@ -518,7 +518,7 @@ p  { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 
 }
 
 /* ── utilities ───────────────────────────────────────────────────────────── */
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; display: inline-block; }

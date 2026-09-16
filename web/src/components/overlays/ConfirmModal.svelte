@@ -183,7 +183,7 @@
   background: var(--terminal-bg); color: var(--terminal-text);
   border-radius: 6px;
   font-size: 12px; line-height: 1.6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   overflow-x: auto; overflow-y: auto; max-height: 220px;
   white-space: pre-wrap; word-break: break-all;
 }
@@ -198,7 +198,7 @@
   border: 1px solid var(--border); border-radius: 6px;
   overflow: hidden; overflow-y: auto; max-height: 220px;
   font-size: 12px; line-height: 1.6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
 }
 .diff-hdr { padding: 4px 10px; color: var(--text-tertiary); }
 .diff-line { padding: 1px 10px; white-space: pre-wrap; word-break: break-all; }
@@ -233,7 +233,7 @@
   border: none; background: var(--blue-6);
   border-radius: 6px;
   display: flex; align-items: center; gap: 6px;
-  font-size: 13px; color: #fff;
+  font-size: 13px; color: var(--on-accent);
   cursor: pointer; font-family: inherit;
 }
 .btn-primary:hover { background: var(--blue-5); }

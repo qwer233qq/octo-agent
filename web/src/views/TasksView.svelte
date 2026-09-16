@@ -245,7 +245,7 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
 /* ── buttons ─────────────────────────────────────────────────────────────────── */
 .btn-primary {
   height: 32px; padding: 0 14px; border: none; background: var(--blue-6);
-  border-radius: 8px; font-size: 13px; font-weight: 600; color: #fff; cursor: pointer;
+  border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--on-accent); cursor: pointer;
   font-family: inherit; display: inline-flex; align-items: center; gap: 6px;
   box-shadow: 0 1px 2px rgba(0,122,255,0.35);
 }
@@ -283,7 +283,7 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
 .task-name-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding-right: 16px; }
 .task-name { font-size: 14px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-target { font-size: 12px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 .cron { font-size: 13px; color: var(--text-secondary); }
 .run-times-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .run-line { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

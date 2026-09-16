@@ -105,7 +105,7 @@
   border: 1px solid var(--border); background: var(--bg-base);
   border-radius: 6px;
   font-size: 13px; color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
 }
 .key-input:focus {
   outline: none; border-color: var(--blue-5);
@@ -129,7 +129,7 @@
   border: none; background: var(--blue-6);
   border-radius: 6px;
   display: flex; align-items: center; gap: 6px;
-  font-size: 13px; color: #fff;
+  font-size: 13px; color: var(--on-accent);
   cursor: pointer; font-family: inherit;
 }
 .btn-primary:hover:not(:disabled) { background: var(--blue-5); }

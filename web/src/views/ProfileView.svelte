@@ -293,7 +293,7 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
 :global(.md-content ul), :global(.md-content ol) { margin: 8px 0; padding-left: 20px; }
 :global(.md-content li) { margin: 3px 0; }
 :global(.md-content code) {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  font-family: var(--font-mono); font-size: 12.5px;
   background: var(--bg-table-header); border: 1px solid var(--border-table); border-radius: 4px; padding: 1px 5px;
 }
 :global(.md-content pre) {
@@ -320,7 +320,7 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
   padding: 16px 24px; border-top: 1px dashed var(--border-secondary);
 }
 .footer-hint { font-size: 13px; color: var(--text-tertiary); flex: 1; min-width: 0; }
-.btn-primary { height: 32px; padding: 0 14px; border: none; background: var(--blue-6); border-radius: 8px; font-size: 13px; font-weight: 600; color: #fff; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
+.btn-primary { height: 32px; padding: 0 14px; border: none; background: var(--blue-6); border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--on-accent); cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 1px 2px rgba(0,122,255,0.35); }
 .btn-primary:hover { background: var(--blue-5); }
 .mem-count { font-size: 12px; color: var(--text-tertiary); }
 .auto-badge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-tertiary); margin-left: auto; }
@@ -350,5 +350,5 @@ p { margin: 4px 0 0; font-size: 13px; color: var(--text-secondary); max-width: 6
   color: var(--text-secondary); cursor: pointer; font-family: inherit;
 }
 .forget-btn:hover { background: var(--error-bg); color: var(--error); }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 </style>

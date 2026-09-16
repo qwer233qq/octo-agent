@@ -136,7 +136,7 @@
 label { font-size: 12px; color: var(--text-secondary); }
 .json-area {
   width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
-  font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; font-family: var(--font-mono);
   color: var(--text); outline: none; background: var(--bg-container); box-sizing: border-box;
   resize: vertical; line-height: 1.6;
 }
@@ -166,7 +166,7 @@ label { font-size: 12px; color: var(--text-secondary); }
 .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary {
   height: 32px; padding: 0 14px; border: none; background: var(--blue-6);
-  border-radius: 6px; font-size: 14px; color: #fff; cursor: pointer; font-family: inherit;
+  border-radius: 6px; font-size: 14px; color: var(--on-accent); cursor: pointer; font-family: inherit;
 }
 .btn-primary:hover:not(:disabled) { background: var(--blue-5); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
