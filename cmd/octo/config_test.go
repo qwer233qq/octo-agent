@@ -104,7 +104,9 @@ func TestResolveProviderModel_Precedence(t *testing.T) {
 		{"flag beats config", "anthropic", "flag-model", cfg, "anthropic", "flag-model", true},
 		{"config beats default", "", "", cfg, "openai", "cfg-model", true},
 		{"flag provider, default model", "openai", "", config.Config{}, "openai", "gpt-5.4", true},
-		{"empty everything → anthropic default", "", "", config.Config{}, "anthropic", "claude-sonnet-4-6", true},
+		// Nothing names a vendor: octo no longer picks one. A key in the
+		// environment says which vendors are reachable, not which was meant.
+		{"empty everything → nothing chosen", "", "", config.Config{}, "", "", false},
 		{"config provider, builtin model", "", "", oneEntryConfig(config.ModelEntry{Provider: "openai"}), "openai", "gpt-5.4", true},
 		{"flag provider overrides config provider — no model contamination", "anthropic", "", cfg, "anthropic", "claude-sonnet-4-6", true},
 		{"unknown provider, no model → not ok", "bogus", "", config.Config{}, "bogus", "", false},

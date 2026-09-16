@@ -139,7 +139,7 @@ func TestOnboardAttempt_StopsSoulSetupNudge(t *testing.T) {
 	})
 	srv := mustServer(t, Config{Addr: "127.0.0.1:0"})
 
-	if got := detectOnboardPhase(); got != "soul_setup" {
+	if got := detectOnboardPhase(""); got != "soul_setup" {
 		t.Fatalf("detectOnboardPhase = %q before any attempt, want soul_setup", got)
 	}
 
@@ -151,7 +151,7 @@ func TestOnboardAttempt_StopsSoulSetupNudge(t *testing.T) {
 	if !config.OnboardAttempted() {
 		t.Fatal("config.OnboardAttempted() = false after POST /api/onboard/attempt")
 	}
-	if got := detectOnboardPhase(); got != "" {
+	if got := detectOnboardPhase(""); got != "" {
 		t.Fatalf("detectOnboardPhase = %q after attempt (identity still missing), want \"\" (no repeat nudge)", got)
 	}
 
@@ -167,7 +167,7 @@ func TestOnboardAttempt_StopsSoulSetupNudge(t *testing.T) {
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if got := detectOnboardPhase(); got != "" {
+	if got := detectOnboardPhase(""); got != "" {
 		t.Fatalf("detectOnboardPhase = %q after a later config.yml Save, want \"\" (marker must survive)", got)
 	}
 }
@@ -193,7 +193,7 @@ func TestDetectOnboardPhase_ExistingIdentitySkipsNudge(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(octo, name), []byte("# identity"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if got := detectOnboardPhase(); got != "" {
+			if got := detectOnboardPhase(""); got != "" {
 				t.Fatalf("detectOnboardPhase = %q with %s present, want \"\" (no nudge when identity exists)", got, name)
 			}
 		})
@@ -1531,7 +1531,7 @@ func TestDetectOnboardPhase_UnrelatedEnvKeyStillNeedsSetup(t *testing.T) {
 	t.Setenv("OCTO_PROVIDER", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("DEEPSEEK_API_KEY", "sk-from-some-other-tool")
-	if got := detectOnboardPhase(); got != "key_setup" {
+	if got := detectOnboardPhase(""); got != "key_setup" {
 		t.Fatalf("detectOnboardPhase = %q with only an unrelated vendor key, want key_setup", got)
 	}
 }
@@ -1550,21 +1550,49 @@ func TestDetectOnboardPhase_EndpointWithoutItsOwnKeyNeedsSetup(t *testing.T) {
 		},
 		Default: "ep-a::claude-sonnet-4-6",
 	})
-	if got := detectOnboardPhase(); got != "key_setup" {
+	if got := detectOnboardPhase(""); got != "key_setup" {
 		t.Fatalf("detectOnboardPhase = %q; the endpoint's own vendor has no key anywhere, want key_setup", got)
 	}
 }
 
-// The deployment packaging/systemd/octo.service and the self-host guide
-// recommend: a key in the environment, nothing in config.yml. It runs —
-// resolveProviderAndModel falls back to anthropic and its default model — so it
-// must not be pushed through the setup panel.
-func TestDetectOnboardPhase_EnvOnlyInstallIsConfigured(t *testing.T) {
+// A key on its own no longer configures anything: without OCTO_PROVIDER nothing
+// has named a vendor, so there is nothing to run and setup is still needed.
+// octo used to default to anthropic here and call a vendor the user never chose.
+func TestDetectOnboardPhase_EnvKeyWithoutProviderNeedsSetup(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-but-nobody-asked-for-anthropic")
+	if got := detectOnboardPhase(""); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; a key alone names no vendor, want key_setup", got)
+	}
+}
+
+// The env-only deployment as it must now be written: OCTO_PROVIDER names the
+// vendor, its key sits in the environment, config.yml is empty. That runs, so
+// it must not be pushed through the setup panel.
+func TestDetectOnboardPhase_EnvOnlyWithProviderIsConfigured(t *testing.T) {
+	setTestHome(t)
+	t.Setenv("OCTO_PROVIDER", "anthropic")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-env-only-deployment")
+	if got := detectOnboardPhase(""); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q; an env-only install that names its vendor runs, want anything but key_setup", got)
+	}
+}
+
+// `octo serve --provider X` names the vendor just as OCTO_PROVIDER does, and
+// that server resolves a sender and runs. Reading only the environment left it
+// staring at a setup panel it could never need.
+func TestDetectOnboardPhase_ServeProviderFlagCounts(t *testing.T) {
 	setTestHome(t)
 	t.Setenv("OCTO_PROVIDER", "")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-env-only-deployment")
-	if got := detectOnboardPhase(); got == "key_setup" {
-		t.Fatalf("detectOnboardPhase = %q; an env-only install reaches a model, want anything but key_setup", got)
+	if got := detectOnboardPhase("anthropic"); got == "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q with serve --provider anthropic and its key, want anything but key_setup", got)
+	}
+	// The flag names a vendor; it does not conjure a key for one that has none.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if got := detectOnboardPhase("anthropic"); got != "key_setup" {
+		t.Fatalf("detectOnboardPhase = %q with a named vendor but no key, want key_setup", got)
 	}
 }
 
@@ -1575,7 +1603,7 @@ func TestDetectOnboardPhase_EnvOnlyHonoursOctoProvider(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("OCTO_PROVIDER", "deepseek")
 	t.Setenv("DEEPSEEK_API_KEY", "sk-env-only-deployment")
-	if got := detectOnboardPhase(); got == "key_setup" {
+	if got := detectOnboardPhase(""); got == "key_setup" {
 		t.Fatalf("detectOnboardPhase = %q; OCTO_PROVIDER picks the vendor whose key counts", got)
 	}
 }
@@ -1592,7 +1620,7 @@ func TestDetectOnboardPhase_EndpointKeyFromEnvIsConfigured(t *testing.T) {
 		},
 		Default: "ep-a::claude-sonnet-4-6",
 	})
-	if got := detectOnboardPhase(); got == "key_setup" {
+	if got := detectOnboardPhase(""); got == "key_setup" {
 		t.Fatalf("detectOnboardPhase = %q; an endpoint keyed from the environment is configured", got)
 	}
 }
