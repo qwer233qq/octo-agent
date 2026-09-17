@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-octo/octo-agent/internal/config"
 	"github.com/open-octo/octo-agent/internal/upgrade"
 	"github.com/open-octo/octo-agent/internal/version"
 )
@@ -90,8 +91,26 @@ func (s *Server) upgradeMode() string {
 
 // latestVersion resolves the latest released version through the cache.
 // The update check is opt-in via Config.UpdateCheck (set only by `octo
-// serve`), so every other Server constructor — the test suite included —
-// performs no outbound calls and degrades to "current is latest".
+// serve` and the desktop hub), so every other Server constructor — the test
+// suite included — performs no outbound calls and degrades to "current is
+// latest".
+//
+// On top of that build-level gate sits the user's `update_check` preference,
+// read fresh from config rather than baked into s.cfg, so turning the toggle
+// off in Settings silences the lookup without a restart.
+//
+// That read sits AFTER the cache gate, not before it. /api/version is
+// unauthenticated and the cache is what keeps a request flood from becoming
+// an outbound-request flood — a config.Load() ahead of it would put a disk
+// read and a YAML parse on every unauthenticated request. The cost is that
+// the badge can keep showing a cached `latest` for up to one TTL after the
+// toggle is flipped; what the toggle promises is that no request is sent,
+// and that holds exactly.
+//
+// LoadCached, not Load: a hand-edit that leaves config.yml unparseable must
+// not silently re-enable the check. LoadCached keeps serving the last config
+// that parsed, so `update_check: false` survives a broken edit. Only a config
+// that has never once loaded falls back to the built-in default (enabled).
 func (s *Server) latestVersion() (string, bool) {
 	current := strings.TrimPrefix(version.Version, "v")
 	if !s.cfg.UpdateCheck {
@@ -108,6 +127,9 @@ func (s *Server) latestVersion() (string, bool) {
 		return s.versionLatest, needsUpdate(current, s.versionLatest)
 	}
 	if !s.versionFailedAt.IsZero() && now.Sub(s.versionFailedAt) < versionCheckBackoff {
+		return current, false
+	}
+	if cfg, err := config.LoadCached(); err == nil && !cfg.UpdateCheckEnabled() {
 		return current, false
 	}
 
