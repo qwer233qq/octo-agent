@@ -95,6 +95,31 @@ func NewDefaultRegistryWithTracker(tracker *ReadTracker) DefaultRegistry {
 	return DefaultRegistry{tracker: tracker}
 }
 
+// TrackerForking is implemented by executors that can hand out a copy of
+// themselves carrying independent read-before-write state. The spawner uses it
+// to give every sub-agent its own tracker, and falls back to sharing the
+// executor when it isn't implemented — so a decorator wrapped around
+// DefaultRegistry must forward this method or sub-agent isolation quietly
+// disappears. Named (rather than asserted inline) so that requirement is
+// greppable from the wrapper's side.
+type TrackerForking interface {
+	WithFreshTracker() agent.ToolExecutor
+}
+
+// WithFreshTracker returns a copy of the registry whose read-before-write
+// state starts empty and is independent of this one's. The spawner calls it
+// per sub-agent: the gate's promise is "this context has seen these bytes",
+// and a child runs on its own history, so inheriting the parent's reads would
+// let it overwrite a file it never looked at.
+//
+// A registry with enforcement disabled (the zero value) stays disabled.
+func (r DefaultRegistry) WithFreshTracker() agent.ToolExecutor {
+	if r.tracker == nil {
+		return r
+	}
+	return DefaultRegistry{tracker: NewReadTracker()}
+}
+
 // Execute implements agent.ToolExecutor.
 func (r DefaultRegistry) Execute(ctx context.Context, name string, input map[string]any) (agent.ToolResult, error) {
 	return r.ExecuteStream(ctx, name, input, nil)

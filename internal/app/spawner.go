@@ -128,7 +128,18 @@ func (s *Spawner) Spawn(ctx context.Context, req tools.SpawnRequest) (tools.Spaw
 		}
 	}
 
-	lc := &liveChild{agent: child, tools: childTools, executor: s.executor, sessionDir: req.SessionDir}
+	// Each child gets its own read-before-write state. The gate means "this
+	// context has seen these bytes", and a child reasons over its own history:
+	// sharing the parent's tracker (or the previous child's) would let it
+	// write_file over a file nobody in its context ever read. The executor is
+	// kept on the liveChild, so a later Continue resumes with the reads the
+	// child itself made.
+	executor := s.executor
+	if fresh, ok := executor.(tools.TrackerForking); ok {
+		executor = fresh.WithFreshTracker()
+	}
+
+	lc := &liveChild{agent: child, tools: childTools, executor: executor, sessionDir: req.SessionDir}
 	id := s.reg.put(lc)
 
 	if req.SessionDir != "" {
