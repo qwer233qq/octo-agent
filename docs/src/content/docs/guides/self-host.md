@@ -14,6 +14,22 @@ octo serve -addr :8088          # expose on the LAN
 
 The paths below are for the default profile, whose service data is stored in `~/.octo`. Launch `octo serve --profile work` to use the isolated `work` profile-data root `~/.octo-work`; machine-managed helper tooling stays shared in `~/.octo/bin`.
 
+The default profile always binds `127.0.0.1:8088` — the number every client ships with. A named profile can't share it, so the first `octo serve --profile work` takes the lowest free port from 8089 up and records it in `~/.octo-work/serve.addr`. Every later start reuses that exact address, so a phone, an Obsidian plugin or a VS Code window only has to be told the port once:
+
+```bash
+octo serve --profile work -d
+# octo serve daemon started (pid 41288), ready at http://127.0.0.1:8089
+
+octo serve --profile work status
+# octo serve daemon: running (pid 41288) at http://127.0.0.1:8089
+```
+
+If something else has taken the recorded port, `octo serve` stops and says so rather than moving to the next one — a backend that silently relocates is a backend none of your clients can find. Free the port, or move the profile on purpose with `--addr`, which re-records it:
+
+```bash
+octo serve --profile work --addr 127.0.0.1:9100
+```
+
 ## Environment variables
 
 Configuring octo entirely through the environment — nothing in `config.yml` — takes **two**
@@ -126,6 +142,10 @@ WantedBy=default.target
 `--no-supervisor` lets your init system own restarts instead of octo's own self-restart supervisor
 duplicating that job. The unit above is for the default profile; for `work`, set
 `EnvironmentFile=%h/.octo-work/serve.env` and use `ExecStart=/usr/local/bin/octo serve --profile work --no-supervisor`.
+Port selection happens in that same top-level process, so a named-profile unit binds the port
+recorded in `~/.octo-work/serve.addr` with no extra flags — add `--addr` only to choose it yourself.
+(`OCTO_SERVE_WORKER` is internal to octo's own supervisor; setting it in a unit skips port
+resolution entirely and the profile would collide with the default on 8088.)
 On macOS, a `launchd` plist with the equivalent `ProgramArguments` and `KeepAlive` works the same
 way — and is exactly what the `.pkg` installer registers automatically.
 

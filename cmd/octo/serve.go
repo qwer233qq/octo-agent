@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/open-octo/octo-agent/internal/datahome"
+	"github.com/open-octo/octo-agent/internal/serveproc"
 	"github.com/open-octo/octo-agent/internal/server"
 )
 
@@ -91,6 +92,33 @@ func runServe(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if *status {
 		return statusDaemon(stdout, stderr)
 	}
+	// A named profile can't share 8088 with the default one, so pick its port
+	// here — once, in the top-level process — and hand the answer down through
+	// --addr. The daemon child and the supervisor's worker must bind exactly
+	// what this process announced, not repeat the search and land elsewhere.
+	profile := strings.TrimSpace(os.Getenv(datahome.ProfileEnv))
+	if *daemon {
+		// Refuse a second daemon before resolving: an explicit --addr re-pins
+		// the profile, and a refusal after that would leave the pin pointing
+		// at an address nothing is listening on. startDaemon checks again as
+		// the authoritative gate; this one just keeps the pin truthful.
+		if pid, ok := serveproc.Running(); ok {
+			fmt.Fprintf(stderr, "octo serve: daemon already running (pid %d)\n", pid)
+			return 1
+		}
+	}
+	if os.Getenv(serveWorkerEnv) != "1" {
+		resolved, err := serveproc.ResolveAddr(profile, flagWasSet(fs, "addr"), *addr)
+		if err != nil {
+			fmt.Fprintf(stderr, "octo serve: %v\n", err)
+			return 1
+		}
+		if resolved != *addr {
+			*addr = resolved
+			args = withAddrArg(args, resolved)
+		}
+	}
+
 	if *daemon {
 		return startDaemon(filterDaemonFlags(args), stdout, stderr)
 	}
@@ -149,7 +177,7 @@ func runServe(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		host = "localhost" + host
 	}
 	fmt.Fprintf(stdout, "octo server listening on http://%s\n", host)
-	if profile := strings.TrimSpace(os.Getenv(datahome.ProfileEnv)); profile != "" {
+	if profile != "" {
 		fmt.Fprintf(stdout, "profile: %s\n", profile)
 	}
 	if dir, err := datahome.Dir(); err != nil {
