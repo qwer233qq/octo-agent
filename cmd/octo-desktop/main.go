@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -29,7 +30,6 @@ import (
 	"time"
 
 	"github.com/mattn/go-isatty"
-	"github.com/open-octo/octo-agent/internal/config"
 	"github.com/open-octo/octo-agent/internal/crashlog"
 	"github.com/open-octo/octo-agent/internal/logfile"
 	"github.com/open-octo/octo-agent/internal/serveenv"
@@ -513,82 +513,122 @@ func startHub(app *application.App, bridge *nativeBridge, settings desktopSettin
 // always reports its result.
 func checkForUpdates(bridge *nativeBridge) { runUpdateCheck(bridge, true) }
 
-// autoUpdateLoop checks for a newer release on its own, so the tray can show one
-// without the user asking. A delayed first check keeps startup uncontended, then
-// a daily cadence. Auto checks are silent unless they turn up a new version, and
-// even then only when it differs from the one already surfaced — the tray item,
-// not a daily toast, is the standing reminder.
+// trayReadInterval is how often the tray re-reads the hub's version cache.
+// A read is free — it never touches the network — so this is short on purpose:
+// the web badge re-reads on its own short cadence too, and both showing the
+// same cached answer at the same time is what stops the tray item and the
+// badge from contradicting each other. How often a lookup ACTUALLY leaves the
+// machine is the server's business (versionRefreshInterval), not this loop's.
+const trayReadInterval = time.Minute
+
+// trayCheckTimeout budgets one tray-initiated lookup. It matches the server's
+// own versionCheckTimeout: upgrade.Check walks GitHub plus the mirrors on a
+// parent-bounded budget, and anything much shorter never reaches a mirror.
+const trayCheckTimeout = 10 * time.Second
+
+// errHubNotBound reports that there is no in-process server to read the shared
+// version cache from yet.
+var errHubNotBound = errors.New("hub not bound")
+
+// autoUpdateLoop keeps the tray item in step with the hub's shared version
+// cache, so the tray can show an update without the user asking. A delayed
+// first read keeps startup uncontended.
 //
 // The loop keeps ticking even when `update_check` is off: the preference is
-// consulted per tick (in runUpdateCheck), so switching it back on in Settings
+// consulted where the lookup happens, so switching it back on in Settings
 // takes effect without restarting the app.
 func autoUpdateLoop(bridge *nativeBridge) {
 	time.Sleep(30 * time.Second)
-	runUpdateCheck(bridge, false)
-	t := time.NewTicker(24 * time.Hour)
+	t := time.NewTicker(trayReadInterval)
 	defer t.Stop()
-	for range t.C {
+	for {
 		runUpdateCheck(bridge, false)
+		<-t.C
 	}
 }
 
-// autoCheckAllowed reports whether the unattended cadence may reach out:
-// `update_check: false` silences it, the whole point being that an idle
-// install makes no outbound request of its own.
+// runUpdateCheck reconciles the tray with one lookup and records the outcome
+// on the bridge so the tray can show a persistent, clickable "download" item —
+// the durable signal, since macOS suppresses the toast while the app is
+// foreground (exactly when a manual check runs). It runs on a background
+// goroutine (never the UI thread) so a manual check's network round-trip can't
+// freeze the menu.
 //
-// A config that won't load counts as "not allowed" rather than falling
-// through to the built-in default. Failing open would let a stray YAML typo
-// silently re-enable the very request the user switched off; failing closed
-// costs one missed check on a cadence that repeats daily.
-func autoCheckAllowed() bool {
-	cfg, err := config.Load()
-	return err == nil && cfg.UpdateCheckEnabled()
-}
-
-// runUpdateCheck performs one update lookup and records the outcome on the
-// bridge so the tray can show a persistent, clickable "download" item — the
-// durable signal, since macOS suppresses the toast while the app is foreground
-// (exactly when a manual check runs). It runs on a background goroutine (never
-// the UI thread) so the network round-trip can't freeze the menu.
+// manual checks always report via an OS toast (failure, already-current, or
+// the actionable "update available" toast whose button and body tap open the
+// download page). auto ticks stay silent except when they surface a version
+// not already shown. Toasts are best-effort — on a build without the
+// notification service (an unbundled macOS binary) they no-op, matching the
+// version badge's own silence there.
 //
-// manual checks always report via an OS toast (failure, already-current, or the
-// actionable "update available" toast whose button and body tap open the
-// download page). auto checks stay silent except when they surface a version
-// not already shown, so the daily cadence doesn't nag. Toasts are best-effort —
-// on a build without the notification service (an unbundled macOS binary) they
-// no-op, matching the version badge's own silence there.
+// The tray is only rebuilt when the answer actually changed: this now runs
+// every minute, and refreshing the menu on every tick would rebuild it 1440
+// times a day for nothing.
 func runUpdateCheck(bridge *nativeBridge, manual bool) {
-	// A manual check is the user asking, so it always runs; only the automatic
-	// cadence answers to the preference.
-	if !manual && !autoCheckAllowed() {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	latest, err := upgrade.Check(ctx)
+	latest, needs, err := trayLookup(bridge, manual)
 	if err != nil {
 		if manual {
 			bridge.Notify(L().updTitle, L().updFailed)
 		}
 		return
 	}
-	current := strings.TrimPrefix(version.Version, "v")
-	// Eligible() != nil means a dev/unbundled build that never claims to be
-	// behind (matching the badge); report status without offering a download.
-	if upgrade.Eligible() != nil || upgrade.CompareVersions(current, latest) >= 0 {
-		bridge.updateAvailable.Store(nil)
-		bridge.refreshTray()
+	prev := bridge.updateAvailable.Load()
+	// needs already folds in the eligibility rule — a dev/unbundled build never
+	// claims to be behind — via upgrade.NeedsUpdate, the same function the web
+	// badge's answer goes through. One rule, one copy.
+	if !needs {
+		if prev != nil {
+			bridge.updateAvailable.Store(nil)
+			bridge.refreshTray()
+		}
 		if manual {
-			bridge.Notify(L().updTitle, fmt.Sprintf(L().updLatestFmt, current))
+			bridge.Notify(L().updTitle, fmt.Sprintf(L().updLatestFmt, strings.TrimPrefix(version.Version, "v")))
 		}
 		return
 	}
-	prev := bridge.updateAvailable.Load()
-	bridge.updateAvailable.Store(&latest)
-	bridge.refreshTray()
-	if manual || prev == nil || *prev != latest {
+	changed := prev == nil || *prev != latest
+	if changed {
+		bridge.updateAvailable.Store(&latest)
+		bridge.refreshTray()
+	}
+	if manual || changed {
 		bridge.NotifyUpdateAvailable(L().updTitle, fmt.Sprintf(L().updAvailableFmt, latest))
 	}
+}
+
+// trayLookup answers "is there a newer release" from the hub's version cache —
+// the same one GET /api/version serves — so the tray item and the web badge
+// are always reporting the same lookup.
+//
+// An auto tick only ever reads the cache; it never performs a lookup itself,
+// and it does nothing at all before the hub is bound. Reading is what makes
+// the minute cadence affordable, and without a hub there is no badge to stay
+// in step with anyway.
+//
+// A manual check forces a fresh lookup and seeds the cache with it, so the
+// badge catches up too. It is also the one path that will reach the network
+// directly when no hub is bound (a takeover that failed): the user asked, and
+// a one-shot lookup is not a cadence.
+func trayLookup(bridge *nativeBridge, manual bool) (string, bool, error) {
+	srv := bridge.srv.Load()
+	if !manual {
+		if srv == nil {
+			return "", false, errHubNotBound
+		}
+		latest, needs := srv.LatestVersion()
+		return latest, needs, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), trayCheckTimeout)
+	defer cancel()
+	if srv == nil {
+		latest, err := upgrade.Check(ctx)
+		if err != nil {
+			return "", false, err
+		}
+		return latest, upgrade.NeedsUpdate(strings.TrimPrefix(version.Version, "v"), latest), nil
+	}
+	return srv.RefreshLatestVersion(ctx)
 }
 
 // listenHub binds addr, retrying for up to grace so a just-stopped daemon has

@@ -68,6 +68,22 @@ const maxArchiveSize = 512 << 20
 // run steals it (a crashed upgrade never removed its lock).
 const lockStaleAfter = 10 * time.Minute
 
+// NeedsUpdate reports whether `current` should be offered an upgrade to
+// `latest`. A dev or unbundled build never is — it would be offered an upgrade
+// that Run itself refuses. The single rule both the web badge and the desktop
+// tray apply; keeping a second copy anywhere is how the two started disagreeing.
+func NeedsUpdate(current, latest string) bool {
+	if Eligible() != nil {
+		return false
+	}
+	return CompareVersions(current, latest) < 0
+}
+
+// CheckAttemptWindow is how long one base URL attempt may take. Callers that
+// set their own Check budget use it to size that budget: a budget below this
+// window buys exactly one attempt, so the mirrors are unreachable.
+func CheckAttemptWindow() time.Duration { return checkAttemptTimeout }
+
 // ErrUpToDate reports that the installed version is already the latest.
 // Callers treat it as success, not failure.
 var ErrUpToDate = errors.New("already up to date")
@@ -92,7 +108,14 @@ func (o Options) log(format string, args ...any) {
 // checkAttemptTimeout caps how long each individual base URL attempt
 // (GitHub or a mirror) may take. A slow primary URL must not starve the
 // mirrors of their timeout budget — each one gets a full window.
-const checkAttemptTimeout = 5 * time.Second
+//
+// The sub-context is still bounded by the caller's parent, so a caller whose
+// own budget is below this value gets exactly one attempt and never reaches a
+// mirror. Callers must budget for this window times the number of bases they
+// want reachable. A var so tests can shrink it instead of spending real
+// seconds proving that relationship — which also means no test in this
+// package may call t.Parallel() while it does so.
+var checkAttemptTimeout = 5 * time.Second
 
 // checkBodyCap limits how much of a 200 (non-redirect) response body gets
 // read when hunting for the release tag in HTML — a real release page is

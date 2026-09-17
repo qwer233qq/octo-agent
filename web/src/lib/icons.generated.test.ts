@@ -11,6 +11,13 @@ import { buildBundle, collectCandidates } from '../../scripts/gen-icons.mjs'
 import { iconCollections } from './icons.generated'
 
 describe('bundled icon data', () => {
+  it('has the icon collections available to check against', () => {
+    // Without the @iconify-json devDeps the generator resolves nothing, and
+    // every assertion below would report the bundle as stale — which is a
+    // thoroughly misleading way to say "run npm ci".
+    expect(buildBundle().resolved.length).toBeGreaterThan(0)
+  })
+
   it('is up to date with the source tree', () => {
     const { resolved } = buildBundle()
     // Compared as JSON: this is generated data, and the point is byte equality
