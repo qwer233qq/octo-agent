@@ -540,6 +540,104 @@ func TestListSessions(t *testing.T) {
 	}
 }
 
+// TestListSessions_SkipsAgentEventsSidecar: the server writes a sub-agent
+// event trail beside each transcript as <id>.agent-events.jsonl. It shares the
+// extension, so a bare suffix test lists it as a session in its own right —
+// one whose first line is an event rather than a meta record, so it loads with
+// no title and renders as a ghost "*Octo Agent" row next to the real session.
+func TestListSessions_SkipsAgentEventsSidecar(t *testing.T) {
+	setTempHome(t)
+	s := seedSession(t, "20260101-000000-aaaaaaaa")
+
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(dir, s.ID+AgentEventsSuffix)
+	if err := os.WriteFile(sidecar, []byte(`{"kind":"tool","agent_id":"agent_1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Newer mtime than the transcript: if it were listed it would sort first,
+	// which is exactly how it surfaced at the top of the sidebar.
+	mod := time.Now().Add(time.Hour)
+	if err := os.Chtimes(sidecar, mod, mod); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := ListSessions(10)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != s.ID {
+		var got []string
+		for _, sess := range sessions {
+			got = append(got, sess.ID)
+		}
+		t.Fatalf("ListSessions = %v, want just %q", got, s.ID)
+	}
+
+	ids, err := listSessionIDs()
+	if err != nil {
+		t.Fatalf("listSessionIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != s.ID {
+		t.Errorf("listSessionIDs = %v, want just %q", ids, s.ID)
+	}
+
+	// "last" resolves by mtime, so the sidecar would win it outright.
+	last, err := ResolveSessionID("last")
+	if err != nil {
+		t.Fatalf("ResolveSessionID(last): %v", err)
+	}
+	if last != s.ID {
+		t.Errorf("ResolveSessionID(last) = %q, want %q", last, s.ID)
+	}
+}
+
+// TestSidecarIDIsNotAddressable: the containment rules on a caller-supplied id
+// only stop it escaping the sessions directory, and "<id>.agent-events" escapes
+// nothing — it is a plain stem that lands squarely on another session's event
+// trail. Reading one back as a session is merely wrong; deleting or rewriting
+// one is destruction, and these ids reach the path layer straight from HTTP.
+func TestSidecarIDIsNotAddressable(t *testing.T) {
+	setTempHome(t)
+	real := seedSession(t, "20260101-000000-aaaaaaaa")
+
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(dir, real.ID+AgentEventsSuffix)
+	if err := os.WriteFile(sidecar, []byte(`{"kind":"tool","agent_id":"agent_1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ghost := real.ID + ".agent-events"
+	if _, err := LoadSession(ghost); err == nil {
+		t.Errorf("LoadSession(%q) succeeded; a sidecar is not a session", ghost)
+	}
+	if err := DeleteSession(ghost); err == nil {
+		t.Errorf("DeleteSession(%q) succeeded", ghost)
+	}
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Errorf("sidecar gone after a rejected delete: %v", err)
+	}
+	if got, err := ResolveSessionID(ghost); err == nil {
+		t.Errorf("ResolveSessionID(%q) = %q, want an error", ghost, got)
+	}
+
+	// The real session stays reachable by every one of those routes.
+	if _, err := LoadSession(real.ID); err != nil {
+		t.Errorf("LoadSession(%q): %v", real.ID, err)
+	}
+	if got, err := ResolveSessionID(real.ID); err != nil || got != real.ID {
+		t.Errorf("ResolveSessionID(%q) = %q, %v", real.ID, got, err)
+	}
+	if err := DeleteSession(real.ID); err != nil {
+		t.Errorf("DeleteSession(%q): %v", real.ID, err)
+	}
+}
+
 func TestListSessions_Limit(t *testing.T) {
 	setTempHome(t)
 
