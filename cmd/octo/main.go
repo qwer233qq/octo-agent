@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/open-octo/octo-agent/internal/datahome"
 	"github.com/open-octo/octo-agent/internal/sandbox"
 	"github.com/open-octo/octo-agent/internal/serveenv"
 	"github.com/open-octo/octo-agent/internal/shellpath"
@@ -30,6 +31,24 @@ func main() {
 // run is the testable entry point. Splitting it out keeps main thin and
 // lets the test harness drive the CLI without spawning a subprocess.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "__complete" {
+		// The words after __complete are the user's command line, not ours, so
+		// they must reach runComplete untouched — stripping --profile out of
+		// them shifts every position the candidate routing depends on. Adopt
+		// the profile they name anyway, best-effort, so session and agent
+		// candidates come from the right data root; a half-typed profile is
+		// not worth turning a TAB into a diagnostic.
+		_, _ = datahome.ConfigureFromArgs(args[1:])
+		return runComplete(args[1:], stdout)
+	}
+
+	var err error
+	args, err = datahome.ConfigureFromArgs(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "octo: invalid --profile: %v\n", err)
+		return 2
+	}
+
 	// GUI-/service-launched processes (macOS GUI/launchd, Linux .desktop/systemd)
 	// inherit a minimal PATH that misses common user directories (e.g.
 	// ~/.local/bin, /opt/homebrew/bin). Sync once at startup so stdio MCP servers
@@ -55,7 +74,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// fast no-op/pass once current; skipped for the internal fast-path commands.
 	// Done before the len(args)==0 REPL early-return so a bare `octo` (the common
 	// launch on Linux) still populates the defaults before Discover() runs.
-	if len(args) == 0 || (args[0] != "__sandboxed-exec" && args[0] != "__complete") {
+	if len(args) == 0 || args[0] != "__sandboxed-exec" {
 		_ = skills.MaterializeDefaults(version.Version)
 		_ = tools.MaterializeDefaultWorkflows(version.Version)
 		_ = workflow.PruneJournals()
@@ -150,11 +169,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Common flags:")
 	fmt.Fprintln(w, "  -c, --continue [id]      Resume a session — 'last', short ID, or substring; no ID = pick from a list")
 	fmt.Fprintln(w, "  --take-over              When resuming, take over a session bound to another entry")
-	fmt.Fprintln(w, "  --agent <id>             Start the session bound to a specific agent (from ~/.octo/agents)")
+	fmt.Fprintln(w, "  --profile <name>         Use an isolated user-data profile (~/.octo-<name>)")
+	fmt.Fprintln(w, "  --agent <id>             Start the session bound to a specific agent (from the profile's agents directory)")
 	fmt.Fprintln(w, "  --no-tools               Disable built-in tools (terminal, edit_file, …) + MCP/skills")
 	fmt.Fprintln(w, "  --provider <name>        anthropic | openai | … (else `octo config` / OCTO_PROVIDER)")
 	fmt.Fprintln(w, "  --model <name>           Override the default model for the provider")
-	fmt.Fprintln(w, "  --no-save                Don't auto-save the session to ~/.octo/sessions")
+	fmt.Fprintln(w, "  --no-save                Don't auto-save the session to the profile's sessions directory")
 	fmt.Fprintln(w, "  --no-memory              Disable cross-session memory injection")
 	fmt.Fprintln(w, "  --sandbox                OS-enforced confinement for terminal commands (macOS/Linux)")
 	fmt.Fprintln(w, "  --permission-mode <m>    interactive (default; prompts on ask) | strict | auto")

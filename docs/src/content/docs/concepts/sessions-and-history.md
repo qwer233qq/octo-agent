@@ -4,7 +4,8 @@ description: Persistence, resume, and crash durability.
 ---
 
 Every interactive conversation is a session, persisted as JSONL (one record per line, a meta
-header first) under `~/.octo/sessions/` after each round.
+header first) under `~/.octo/sessions/` after each round. `--profile NAME` stores them under
+`~/.octo-NAME/sessions/` instead.
 
 ```bash
 octo sessions        # list this directory's sessions

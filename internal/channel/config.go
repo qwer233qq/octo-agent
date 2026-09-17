@@ -7,11 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/open-octo/octo-agent/internal/datahome"
 	"gopkg.in/yaml.v3"
 )
-
-// ConfigDir is the user-level config directory.
-const ConfigDir = ".octo"
 
 // ConfigFile is the channel credentials file.
 const ConfigFile = "channels.yml"
@@ -68,11 +66,7 @@ type Config struct {
 
 // ConfigPath returns the absolute path to channels.yml.
 func ConfigPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ConfigDir, ConfigFile), nil
+	return datahome.Path(ConfigFile)
 }
 
 // LoadConfig reads ~/.octo/channels.yml. A missing file returns an empty

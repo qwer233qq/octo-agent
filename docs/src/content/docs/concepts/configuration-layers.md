@@ -13,6 +13,8 @@ octo composes its system prompt from several optional layers — later overrides
 | `.octorules` | per-repo | project conventions, committed with the repo |
 | `--system "..."` | one-off | override for a single run |
 
+Running with `--profile NAME` reads all of these from `~/.octo-NAME` instead, keeping a second set of identity, rules, sessions and config side by side with the default one. Octo-managed helper binaries stay shared in `~/.octo/bin` either way.
+
 Generate a starting `.octorules` for the current repo with `octo init` (or `/init` in the TUI) —
 it inspects the codebase and drafts conventions rather than leaving you with a blank file.
 

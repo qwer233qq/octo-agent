@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/open-octo/octo-agent/internal/datahome"
 	"github.com/open-octo/octo-agent/internal/executil"
 	"github.com/open-octo/octo-agent/internal/sandbox"
 	"github.com/open-octo/octo-agent/internal/trash"
@@ -155,7 +155,9 @@ func shellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
 		projectDir := WorkingDirOrCWD(ctx)
 		env := scrubGuardEnv(os.Environ())
 		if projectDir != "" {
-			env = append(env, "OCTO_TRASH_DIR="+trash.ProjectDir(projectDir))
+			if trashDir, err := trash.ProjectDir(projectDir); err == nil {
+				env = append(env, "OCTO_TRASH_DIR="+trashDir)
+			}
 		}
 		env = append(env, guardEnv()...)
 		wrapped := posixKillGuardWrapper + fmt.Sprintf(safeRmWrapper, command)
@@ -178,11 +180,10 @@ func shellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
 // this directory, so the empty-string case is the normal, silent no-op path
 // for them — not an error.
 func bundledBinDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	dir, err := datahome.BinDir()
+	if err != nil {
 		return ""
 	}
-	dir := filepath.Join(home, ".octo", "bin")
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return ""
 	}

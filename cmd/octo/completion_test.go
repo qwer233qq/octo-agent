@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestCompletionCandidates_TopLevel(t *testing.T) {
 func TestCompletionCandidates_ChatFlags(t *testing.T) {
 	// A positional message followed by a new word still completes session flags.
 	got := completionCandidates([]string{"octo", "fix the bug", ""})
-	for _, want := range []string{"-c", "--continue", "--tools", "--provider", "--quiet", "--verbose"} {
+	for _, want := range []string{"-c", "--continue", "--tools", "--provider", "--profile", "--quiet", "--verbose"} {
 		if !sliceContains(got, want) {
 			t.Errorf("chat flag completion missing %q; got %v", want, got)
 		}
@@ -261,6 +262,45 @@ func TestRun_CompleteViaMain(t *testing.T) {
 	for _, want := range []string{"config", "memory"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestRun_CompleteAdoptsProfile checks that a complete --profile on the line
+// being completed selects that data root, so `octo --profile work -c <TAB>`
+// offers the work profile's sessions rather than the default one's — while the
+// words themselves still reach the candidate routing in their original
+// positions.
+func TestRun_CompleteAdoptsProfile(t *testing.T) {
+	t.Setenv("OCTO_PROFILE", "")
+	var stdout, stderr bytes.Buffer
+	args := []string{"__complete", "octo", "--profile", "work", "--permission-mode", ""}
+	if code := run(args, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(%q) exit = %d, stderr=%q", args, code, stderr.String())
+	}
+	if got := os.Getenv("OCTO_PROFILE"); got != "work" {
+		t.Errorf("OCTO_PROFILE = %q, want %q", got, "work")
+	}
+	// Positions survived: --permission-mode is still the previous word, so its
+	// fixed value set is what gets offered.
+	if got := stdout.String(); !strings.Contains(got, "interactive") {
+		t.Errorf("candidates should be the --permission-mode values; got %q", got)
+	}
+}
+
+func TestRun_CompletePreservesPartialProfileWords(t *testing.T) {
+	for _, words := range [][]string{
+		{"octo", "--profile", ""},
+		{"octo", "--profile="},
+	} {
+		t.Setenv("OCTO_PROFILE", "inherited")
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"__complete"}, words...)
+		if code := run(args, nil, &stdout, &stderr); code != 0 {
+			t.Fatalf("run(%q) exit = %d, stderr=%q", args, code, stderr.String())
+		}
+		if got := os.Getenv("OCTO_PROFILE"); got != "inherited" {
+			t.Errorf("run(%q) changed OCTO_PROFILE to %q", args, got)
 		}
 	}
 }
