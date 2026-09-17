@@ -142,6 +142,43 @@ child.MaxTurns = childMaxTurns              // child 专属 loop 预算
 | `SessionTokens` 是累计值,多轮 accrue 会双计 | `liveChild.accruedIn/Out` 记上次累计,每轮只把增量 `AccrueChildUsage` 进父 |
 | 续话漏打递归 marker | `runChild` 统一 `WithSubAgentMarker(ctx)` |
 
+### 预算停机的收尾
+
+`max_turns`、`max_tokens`、stuck(重复 tool call)三种停机由 agent loop 的 `budgetStop` 收场,它
+**用一句合成提示替换掉模型文本**——直接透给父 agent 就只剩一个停机原因,子 agent 那一路干的活全丢。
+`runChild` 因此在这三种 stop reason 上回溯 child history,把最后一段有内容的 assistant 文本接在提示
+前面(`carryPartialWork`);child 全程只调工具、没出过文本时保持原样。被中断(`interrupted`)走不到这里
+——那条路径连带返回 ctx 错误,`runChild` 提前 return。
+
+回溯**钉在本轮起点**:向上遇到第一条不含 tool_result block 的 RoleUser 消息就停(`roundStart`)。
+不钉的话,一个上轮干净收尾、本轮只调工具就 stuck 的 child 会把**上一轮已经交付过的答案**当成本轮
+半成品捞回来。loop 自己插的中途 user 消息(截断续跑、compaction 摘要)也算边界,只会让回溯更保守。
+
+捞回来的文本带标签(`carriedWorkLabel`)说明它是"被切断前的最后一条消息"——它可能是完整总结,也可能
+是几十轮前的一句"我看一下",不打标签等于让停机提示替它背书。
+
+`sub_agent` / `sub_agent_send` / 异步完成通知(`FormatSubAgentNote`)共用 `incompleteNote` 给结果加
+一条 `[INCOMPLETE: …]`,说明它是半成品、还能用 `sub_agent_send` 带 id 续,并针对 stuck 明确要求换路子
+而不是重下同一条指令。TUI 和 Web 的状态词同样把 stuck 归到"incomplete / warning",不报 completed。
+
+### 状态查询(`ChildInspector`)
+
+同步 spawn 的 child 在 manager 里**不留痕**(`RunSync` 返回即刈掉那条 entry),但它在
+`childRegistry` 里仍然活着可续。`Spawner` 因此实现 `tools.ChildInspector`
+(`InspectChild` / `ListChildren`),把 registry 里的最后一轮状态(stop reason 或失败原因、回复、轮数、
+空闲时长、是否在跑)暴露给 `sub_agent_status`。
+
+- **在跑的 child 不算可续**:registry 从第一轮之前就持有 child(`Spawn` 先 `put` 再跑),所以
+  `runChild` 进出时翻 `busy`。busy 的 child 不进"可续"列表(manager 自己的列表已经在报它),单独查它
+  时明确说"working right now"——说成可续会招来一条续话,而那条续话只会阻塞在 `liveChild.mu` 上直到
+  本轮跑完。
+- **失败轮覆盖快照**:`setSnapErr` 清掉上一轮的 reply 并记下错误。不覆盖的话,查状态会把一轮已经被
+  失败取代的结果当成"最新一轮"报出去。
+- **锁与拷贝**:registry 读取走 `snapshot` 而非 `get`——查询是读,不刷新 LRU 站位;last-round 字段另用
+  `snapMu` 守,不跟着 `liveChild.mu` 一起被整轮占住,否则查状态会阻塞在跑着的 child 后面;列表路径不带
+  `Reply`(渲染用不到,拷贝还发生在 registry 锁里),保留的 reply 按 manager 同样的上限截断。
+
+
 ## 异步执行与通知(SubAgentManager)
 
 `SubAgentManager` 把执行层包成异步,对外句柄是顺序编号 `agent_1` / `agent_2` / …
@@ -150,7 +187,7 @@ child.MaxTurns = childMaxTurns              // child 专属 loop 预算
 - **`Send(agentID, msg)`**:起 goroutine 跑 `Continue`,立即返回。
 - **busy / pending 队列**:一个子 agent 同时只处理一个请求。`Send` 时它 busy 则存进 `pending`(深度
   1);已有 pending 则报 `already has a pending message`;当前请求结束后自动发 pending。
-- **并发上限**:`maxConcurrentSubAgents`(8)限制同时在跑的 async spawn——模型一次发一大批
+- **并发上限**:`maxConcurrentSubAgents`(16)限制同时在跑的 async spawn——模型一次发一大批
   `run_in_background:true` 也不会起无界个并发 agent loop。超限的新 spawn 被明确拒绝(让模型等),
   续话(`Send`/`Continue`)轮不计入此上限(受 live-child 上限约束)。`activeAsync` 在 manager 锁下
   计数,每个 spawn goroutine 结束时递减。
@@ -159,12 +196,23 @@ child.MaxTurns = childMaxTurns              // child 专属 loop 预算
 - **`Read(id)` / `ListRunning()`**:供 UI(TUI 面板)、关停查询与 `sub_agent_status` 工具。完成但
   未 kill 的 async 子 agent 仍留在列表里(idle)——它是活的、可被 `sub_agent_send` 续话的句柄。
 
-### `sub_agent_send` 的双 ID 命名空间
+### 双 ID 命名空间
 
 模型实际见到两种句柄:async spawn 返回 manager 侧的 `agent_N`;sync spawn 的回复带 spawner 侧的
-`[agent <id>]` 标签。`sub_agent_send` 先试 `Send(agent_N)`(异步投递,回复走通知);manager 不识别
-的 id 退到 `ContinueSync`(同步续跑,回复随 tool_result 返回)。killed/pending 错误原样返回,不误判
-为路由失败。子 agent 自身不能调用 send/kill(与防递归同级的 `IsSubAgent` 守卫)。
+`[agent <id>]` 标签。两个 followup 工具都要吃下这两种:
+
+- `sub_agent_send` 先试 `Send(agent_N)`(异步投递,回复走通知);manager 不识别的 id 退到
+  `ContinueSync`(同步续跑,回复随 tool_result 返回)。killed/pending 错误原样返回,不误判为路由失败。
+- `sub_agent_status` 先试 `Read(agent_N)`;manager 不识别的 id 退到 `ChildInspector`,查到就报状态,
+  查不到才判未知。
+- 模型常把 `[agent dbb7aa4b]` 回抄成 `agent_dbb7aa4b`(两种句柄形似),所以两条回退路径都会剥掉
+  `agent_` 前缀再试一次(`bareChildID`),status 的回话里只给 `sub_agent_send` 真正认的那个裸 id。
+  spawner 侧 id 是 8 位 hex,`agent_1` 剥成 `"1"` 永远匹配不到,不会误伤真的 `agent_N` 句柄。
+
+不传 id 的 `sub_agent_status` 列表把两边并起来:manager 的 `ListRunning()`,加上 registry 里
+manager 未跟踪的那些(按 `TrackedBackingIDs()` 去重,避免异步 child 在两处各列一遍)。
+
+子 agent 自身不能调用 send/kill(与防递归同级的 `IsSubAgent` 守卫)。
 
 ### 通知投递
 

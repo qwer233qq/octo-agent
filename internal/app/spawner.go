@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -291,6 +292,18 @@ func (s *Spawner) Continue(ctx context.Context, agentID, message string) (tools.
 	}, nil
 }
 
+// InspectChild implements tools.ChildInspector. It answers for the ids a
+// synchronous sub-agent reports ("[agent <id>]"), which SubAgentManager stops
+// tracking as soon as the blocking tool call returns.
+func (s *Spawner) InspectChild(id string) (tools.ChildSnapshot, bool) {
+	return s.reg.snapshot(id)
+}
+
+// ListChildren implements tools.ChildInspector.
+func (s *Spawner) ListChildren() []tools.ChildSnapshot {
+	return s.reg.snapshots()
+}
+
 // runChild is the shared body of Spawn and Continue. It serializes calls to a
 // single child (a child's history can't take two interleaved turns), re-stamps
 // the sub-agent context marker so the child can't recurse, and accrues only the
@@ -306,6 +319,14 @@ func (s *Spawner) Continue(ctx context.Context, agentID, message string) (tools.
 func (s *Spawner) runChild(ctx context.Context, lc *liveChild, prompt string) (reply string, in, out int, stopReason string, turns int, err error) {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
+
+	// A round in flight must not be advertised as a finished, resumable child:
+	// the registry holds the child from before its first round (Spawn registers
+	// it, then runs), so without this a running sub-agent would be listed as
+	// idle — and a follow-up addressed to it would block on lc.mu for the rest
+	// of the round.
+	lc.setBusy(true)
+	defer lc.setBusy(false)
 
 	childCtx := tools.WithSubAgentMarker(ctx)
 
@@ -365,12 +386,162 @@ func (s *Spawner) runChild(ctx context.Context, lc *liveChild, prompt string) (r
 	lc.accruedCacheRead, lc.accruedCacheWrite = totCR, totCW
 
 	if err != nil {
+		// Record the failure too. The child stays resumable, so a status query
+		// that reported the previous round as the latest one would describe a
+		// round that has since been superseded by a failure.
+		lc.setSnapErr(err, turns)
 		return "", in, out, "", turns, err
 	}
 
 	lc.syncSession()
-	s.fireSubagentStop(r.Content)
-	return r.Content, in, out, r.StopReason, turns, nil
+
+	// A loop-budget stop replaces the model's text with the agent loop's own
+	// notice, so carry the work the child had already produced (see
+	// carryPartialWork) — otherwise the round reaches the parent as a stop
+	// reason and nothing else.
+	reply = r.Content
+	if budgetNoticeOnly(r.StopReason) {
+		reply = carryPartialWork(lc.agent.History, reply)
+	}
+	lc.setSnap(reply, r.StopReason, turns)
+
+	s.fireSubagentStop(reply)
+	return reply, in, out, r.StopReason, turns, nil
+}
+
+// maxChildSnapshotReply caps the retained reply, matching what the manager
+// keeps per async sub-agent (tools.maxSubAgentResultBytes). A child's reply is
+// bounded by the model's output cap in practice, but the registry holds several
+// children for the life of the session, so the bound is explicit.
+const maxChildSnapshotReply = 1 << 20
+
+// setSnap records the outcome of the round that just finished, for
+// sub_agent_status to read off a child the manager no longer tracks.
+func (lc *liveChild) setSnap(reply, stopReason string, turns int) {
+	if len(reply) > maxChildSnapshotReply {
+		reply = reply[:maxChildSnapshotReply] + "\n...[truncated]"
+	}
+	lc.snapMu.Lock()
+	defer lc.snapMu.Unlock()
+	lc.lastReply = reply
+	lc.lastStop = stopReason
+	lc.lastErr = ""
+	lc.lastTurns = turns
+}
+
+// setSnapErr records a round that failed outright. It clears the previous
+// round's reply: keeping it would let a status query present stale text as the
+// child's latest word.
+func (lc *liveChild) setSnapErr(err error, turns int) {
+	lc.snapMu.Lock()
+	defer lc.snapMu.Unlock()
+	lc.lastReply = ""
+	lc.lastStop = ""
+	lc.lastErr = err.Error()
+	lc.lastTurns = turns
+}
+
+func (lc *liveChild) setBusy(v bool) {
+	lc.snapMu.Lock()
+	defer lc.snapMu.Unlock()
+	lc.busy = v
+}
+
+// snapshot renders the child's last-round state for the tools layer. withReply
+// is false for listings, which render only the header fields — copying every
+// child's full reply to discard it is pure waste, and it happens under the
+// registry lock.
+func (lc *liveChild) snapshot(id string, idle time.Duration, withReply bool) tools.ChildSnapshot {
+	lc.snapMu.Lock()
+	defer lc.snapMu.Unlock()
+	snap := tools.ChildSnapshot{
+		ID:         id,
+		StopReason: lc.lastStop,
+		Err:        lc.lastErr,
+		Turns:      lc.lastTurns,
+		Idle:       idle,
+		Busy:       lc.busy,
+	}
+	if withReply {
+		snap.Reply = lc.lastReply
+	}
+	return snap
+}
+
+// budgetNoticeOnly reports whether the agent loop ended the round with a
+// synthetic explanation in place of model text. budgetStop does that at all
+// three of its call sites — the turn cap, the output-token cap, and the
+// stuck-loop detector — which is exactly when the caller most needs to see how
+// far the child got. An interrupted round doesn't reach here: it comes back as
+// a context error.
+func budgetNoticeOnly(stopReason string) bool {
+	return stopReason == agent.StopReasonMaxTurns ||
+		stopReason == agent.StopReasonStuck ||
+		stopReason == agent.StopReasonMaxTokens
+}
+
+// carriedWorkLabel marks text that carryPartialWork recovered. It says where
+// the text came from because the last thing a child said can be anything from
+// a finished summary to an opening "let me look" many rounds back — labelled,
+// the parent can judge it; unlabelled, the stop notice's "partial result"
+// would vouch for it.
+const carriedWorkLabel = "[partial — the sub-agent's last message before it was cut off]"
+
+// carryPartialWork prefixes a budget-stop notice with the child's last
+// substantive assistant text, pulled back out of its history. Returns the
+// notice unchanged when the child produced no text before it was cut off —
+// a run that only ever called tools has nothing to carry.
+func carryPartialWork(h *agent.History, notice string) string {
+	msgs := h.Snapshot()
+	// The notice is the message budgetStop just appended; start above it.
+	for i := len(msgs) - 2; i >= 0; i-- {
+		if roundStart(msgs[i]) {
+			// Walked back past this round's prompt. Anything earlier belongs to
+			// a previous round the caller already received — carrying it would
+			// label a delivered answer as this round's partial work.
+			return notice
+		}
+		if msgs[i].Role != agent.RoleAssistant {
+			continue
+		}
+		if text := strings.TrimSpace(assistantText(msgs[i])); text != "" {
+			return carriedWorkLabel + "\n" + text + "\n\n" + notice
+		}
+	}
+	return notice
+}
+
+// roundStart reports whether m opens a round: a plain user message, as opposed
+// to the tool_result messages that carry a round forward. Both are RoleUser, so
+// the blocks decide. A mid-round user message the loop injects itself (a
+// truncation resume, a compaction summary) reads as a boundary too, which only
+// makes the carry more conservative.
+func roundStart(m agent.Message) bool {
+	if m.Role != agent.RoleUser {
+		return false
+	}
+	for _, b := range m.Blocks {
+		if b.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
+}
+
+// assistantText is the plain text of an assistant message: the joined text
+// blocks when it carries any (a reply that also called tools keeps its prose
+// there), else the plain Content field.
+func assistantText(m agent.Message) string {
+	if len(m.Blocks) == 0 {
+		return m.Content
+	}
+	var sb strings.Builder
+	for _, b := range m.Blocks {
+		if b.Type == "text" {
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
 }
 
 // fireSubagentStop dispatches the parent's SubagentStop hook after a child round
@@ -466,6 +637,16 @@ type liveChild struct {
 
 	mu sync.Mutex // serializes runChild on this child
 
+	// snapMu guards the last-round fields below. Deliberately not mu: mu is
+	// held for the whole round, and sub_agent_status must be answerable while
+	// the child is mid-run rather than blocking behind it.
+	snapMu    sync.Mutex
+	busy      bool
+	lastReply string
+	lastStop  string
+	lastErr   string
+	lastTurns int
+
 	// accruedIn/accruedOut/accruedCacheRead/accruedCacheWrite track how much
 	// of the child's cumulative SessionTokens/SessionCacheTokens has already
 	// been folded into the parent, so each round accrues only its delta.
@@ -522,6 +703,34 @@ func (r *childRegistry) get(id string) (*liveChild, bool) {
 		r.touchLocked(lc)
 	}
 	return lc, ok
+}
+
+// snapshot reports one child's state without refreshing its standing — a
+// status query is a read, not a use. Expired children are reaped first, so an
+// idle-expired id correctly reports as gone.
+func (r *childRegistry) snapshot(id string) (tools.ChildSnapshot, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked()
+	lc, ok := r.m[id]
+	if !ok {
+		return tools.ChildSnapshot{}, false
+	}
+	return lc.snapshot(id, r.now().Sub(lc.lastUsed), true), true
+}
+
+// snapshots reports every live child, most recently used first.
+func (r *childRegistry) snapshots() []tools.ChildSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evictLocked()
+	now := r.now()
+	out := make([]tools.ChildSnapshot, 0, len(r.m))
+	for id, lc := range r.m {
+		out = append(out, lc.snapshot(id, now.Sub(lc.lastUsed), false))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Idle < out[j].Idle })
+	return out
 }
 
 // touchLocked stamps a child as most-recently-used. Caller holds r.mu.
