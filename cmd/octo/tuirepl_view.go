@@ -18,6 +18,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	rw "github.com/mattn/go-runewidth"
+	"github.com/muesli/reflow/truncate"
 	"github.com/open-octo/octo-agent/internal/agent"
 	"github.com/open-octo/octo-agent/internal/agentprofile"
 	"github.com/open-octo/octo-agent/internal/config"
@@ -2012,7 +2013,7 @@ func (m *tuiModel) View() string {
 	// still on screen instead of a bare full-screen dialog.
 	if m.modal != nil {
 		b.WriteString(m.modalView())
-		return b.String()
+		return m.frame(b.String())
 	}
 
 	// Quit confirmation: a first Ctrl+D or idle Ctrl+C arms the quit and shows
@@ -2035,7 +2036,33 @@ func (m *tuiModel) View() string {
 	b.WriteString(m.renderInputBox())
 	b.WriteByte('\n')
 	b.WriteString(m.renderStatusBar())
-	return b.String()
+	return m.frame(b.String())
+}
+
+// frame truncates every line of the live frame one cell short of the
+// terminal width, so no rendered line can fill the last cell. A full-cell line
+// leaves the terminal in wrap-pending state, and a line whose width the
+// renderer and the terminal disagree on (CJK, emoji, ambiguous-width symbols)
+// physically wraps while counting as one — the next repaint then undershoots
+// its cursor-up and the old frame's top line is never overwritten, which is
+// how a duplicate input box ends up stuck on screen. The bubbletea renderer
+// already truncates at width; one cell of slack absorbs the disagreement.
+// (One cell absorbs a ±1 disagreement; a pathological run of ambiguous-width
+// glyphs can still disagree by more — this is a mitigation, not a guarantee.)
+//
+// reflow/truncate, not lipgloss MaxWidth: Style.Render left-aligns by padding
+// every line to the widest with trailing spaces — trailing whitespace in
+// selections and more cells written per repaint for zero benefit here.
+func (m *tuiModel) frame(s string) string {
+	if m.width < 2 {
+		return s
+	}
+	w := uint(m.width - 1)
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = truncate.String(line, w)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // updateTextAreaHeight sets the textarea height to match the number of lines
