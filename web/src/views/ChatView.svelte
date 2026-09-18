@@ -327,8 +327,9 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
   function fmtTokens(n: number): string {
     return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
   }
-  // HH:MM for the message meta row; only optimistic sends carry createdAt, so
-  // the row simply omits the time for replayed history.
+  // HH:MM for the message meta row. Replayed history carries the persisted
+  // created_at; only sessions that predate per-message CreatedAt fall back to
+  // the reload time.
   function fmtTime(ts: number): string {
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
@@ -366,7 +367,9 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
         type: 'assistant',
         content: ev.content ?? '',
         thinking: ev.thinking ?? '',
-        createdAt: Date.now(),
+        // Persisted message timestamp; absent on sessions that predate
+        // per-message CreatedAt, where the reload time is the best we have.
+        createdAt: ev.created_at ?? Date.now(),
         streaming: false,
         tools: [],
         todos: [],
@@ -2644,7 +2647,8 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
           <!-- Meta row for an assistant turn: rendered on the first assistant
                chunk after a user message (text/thinking/tools are separate
                entries, so later chunks of the same turn skip it). Time shows
-               only when the entry carries createdAt — replayed history doesn't. -->
+               only when the entry carries createdAt; replayed history carries
+               the persisted created_at. -->
           {#snippet agentMeta(show: boolean, ts?: number)}
             {#if show}
               <div class="msg-meta">
