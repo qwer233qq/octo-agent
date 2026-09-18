@@ -130,7 +130,7 @@ func definitionFor(sessionModel string, store *agentprofile.Store) agent.ToolDef
 				"tools": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional tool-name allowlist for the sub-agent. Omit to inherit your tools (minus sub_agent itself — no recursion).",
+					"description": "Optional tool-name allowlist for the sub-agent. Omit to inherit your tools (minus sub_agent itself — no recursion). An empty array is not the same as omitting: it means the sub-agent gets NO tools, and it also discards the agent type's own allowlist. Only pass [] when you want a sub-agent that cannot act.",
 				},
 			},
 			"required": []string{"description", "prompt", "subagent_type"},
@@ -331,7 +331,9 @@ func (AgentTool) Execute(ctx context.Context, _ string, input map[string]any) (a
 	req.ReadOnly = profile.ReadOnly
 	req.LeanSystem = profile.LeanContext
 	req.DisallowedTools = profile.DisallowedTools
-	if len(callTools) == 0 {
+	// nil, not len 0: the call passing `tools: []` is an explicit "no tools"
+	// and must not fall back to the profile's list.
+	if callTools == nil {
 		req.Tools = profile.Tools
 	}
 	if callModel == "" {

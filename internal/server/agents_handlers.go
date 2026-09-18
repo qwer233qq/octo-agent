@@ -11,14 +11,38 @@ import (
 	"github.com/open-octo/octo-agent/internal/tools"
 )
 
+// toolsOut wraps a profile's tool list for the wire: a nil list stays absent
+// (inherit every tool), a present one — empty included — goes out as-is.
+func toolsOut(tools []string) *[]string {
+	if tools == nil {
+		return nil
+	}
+	return &tools
+}
+
+// toolsIn unwraps a request's tool list. An absent key is inheritance; a
+// present [] is an explicit "no tools" and must survive as a non-nil empty
+// slice, which is what distinguishes the two downstream.
+func toolsIn(tools *[]string) []string {
+	if tools == nil {
+		return nil
+	}
+	return *tools
+}
+
 // ─── Request/Response types ─────────────────────────────────────────────────
 
 type agentRequest struct {
-	ID              string                        `json:"id,omitempty"`
-	Name            string                        `json:"name"`
-	Description     string                        `json:"description"`
-	Model           string                        `json:"model,omitempty"`
-	Tools           []string                      `json:"tools,omitempty"`
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Model       string `json:"model,omitempty"`
+	// Tools is a pointer for the same reason the frontmatter field is:
+	// omitting it means "inherit every tool", sending [] means "no tools".
+	// A plain slice with omitempty would drop an explicit [] on the way out
+	// and hand it back as inheritance on the next save — a silent widening
+	// of what the agent can do.
+	Tools           *[]string                     `json:"tools,omitempty"`
 	ToolSkills      []string                      `json:"tool_skills,omitempty"`
 	SystemPrompt    string                        `json:"system_prompt,omitempty"`
 	ChannelBindings []agentprofile.ChannelBinding `json:"channel_bindings,omitempty"`
@@ -48,11 +72,12 @@ type agentTransferRequest struct {
 // agentResponse is the wire shape for an agent profile. Stored files use the
 // same frontmatter shape via agentprofile.Profile.
 type agentResponse struct {
-	ID              string                        `json:"id"`
-	Name            string                        `json:"name"`
-	Description     string                        `json:"description"`
-	Model           string                        `json:"model,omitempty"`
-	Tools           []string                      `json:"tools,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Model       string `json:"model,omitempty"`
+	// Tools mirrors agentRequest.Tools: absent = inherit, [] = none.
+	Tools           *[]string                     `json:"tools,omitempty"`
 	ToolSkills      []string                      `json:"tool_skills,omitempty"`
 	SystemPrompt    string                        `json:"system_prompt,omitempty"`
 	ChannelBindings []agentprofile.ChannelBinding `json:"channel_bindings,omitempty"`
@@ -86,7 +111,7 @@ func agentToResp(p *agentprofile.Profile) agentResponse {
 		Name:             p.Name,
 		Description:      p.Description,
 		Model:            p.Model,
-		Tools:            p.Tools,
+		Tools:            toolsOut(p.Tools),
 		ToolSkills:       p.ToolSkills,
 		SystemPrompt:     p.SystemPrompt,
 		ChannelBindings:  p.ChannelBindings,
@@ -171,7 +196,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 
 	// Validate tool and skill names against the canonical registries so users
 	// get immediate feedback instead of silent filtering at runtime.
-	if unknown := unknownToolNames(req.Tools, s.skillReg); len(unknown) > 0 {
+	if unknown := unknownToolNames(toolsIn(req.Tools), s.skillReg); len(unknown) > 0 {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown tools: %s", strings.Join(unknown, ", ")))
 		return
 	}
@@ -182,7 +207,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description,
 		CapabilitySpec: agentprofile.CapabilitySpec{
 			Model:        req.Model,
-			Tools:        req.Tools,
+			Tools:        toolsIn(req.Tools),
 			ToolSkills:   req.ToolSkills,
 			SystemPrompt: req.SystemPrompt,
 		},
@@ -226,7 +251,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate tool and skill names against the canonical registries.
-	if unknown := unknownToolNames(req.Tools, s.skillReg); len(unknown) > 0 {
+	if unknown := unknownToolNames(toolsIn(req.Tools), s.skillReg); len(unknown) > 0 {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown tools: %s", strings.Join(unknown, ", ")))
 		return
 	}
@@ -234,6 +259,22 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	bindings := existing.ChannelBindings
 	if req.ChannelBindings != nil {
 		bindings = req.ChannelBindings
+	}
+
+	// Tools falls back like the fields below, but the stakes are inverted:
+	// every other omitted field falls back to preserve information, this one
+	// falls back to preserve a RESTRICTION. Taking the request verbatim would
+	// mean a caller that merely didn't mention tools — the conversational
+	// edit flow is told to send the smallest possible edit — hands a
+	// locked-down agent the entire toolbelt.
+	//
+	// The cost is that clearing tools back to "inherit everything" can't be
+	// expressed here: an absent key and a null are the same pointer on the
+	// wire. Widening a profile that way means editing its .md, which is the
+	// right amount of friction for the one direction that grants capability.
+	toolsList := existing.Tools
+	if req.Tools != nil {
+		toolsList = *req.Tools
 	}
 
 	// Gallery metadata falls back to the existing profile's values when the
@@ -281,7 +322,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description,
 		CapabilitySpec: agentprofile.CapabilitySpec{
 			Model:        req.Model,
-			Tools:        req.Tools,
+			Tools:        toolsList,
 			ToolSkills:   req.ToolSkills,
 			SystemPrompt: req.SystemPrompt,
 		},
