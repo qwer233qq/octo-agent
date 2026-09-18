@@ -916,6 +916,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// route every turn — and every tool-loop iteration — of this conversation
 	// to the same prompt cache.
 	a := agent.New(llmSender, resolvedModel)
+	a.SetModelDeployment(resolvedModel, entry.EffectiveContextWindow(), entry.EndpointID)
 	a.CWD = cwd
 	a.MaxTokens = *maxTokens
 	a.MaxTokensEscalate = resolveMaxTokensEscalate(*maxTokensEscalate, provName)
@@ -934,8 +935,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// in charge — never fail startup over the lite entry.
 	if liteEntry, ok := cfg.EntryByModel(cfg.Lite); ok && liteEntry.Model != "" {
 		if liteSender, lerr := buildSender(liteEntry.Provider, liteEntry, io.Discard, senderTuning{}); lerr == nil {
-			a.LiteSender = liteSender
-			a.LiteModel = liteEntry.Model
+			a.SetLiteModelDeployment(liteSender, liteEntry.Model, liteEntry.EffectiveContextWindow(), liteEntry.EndpointID)
 		}
 	}
 	// Images become text for a text-only model when a vision helper is
@@ -1154,7 +1154,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// (mcpBoot below), so this still evaluates to "" at first paint for TUI —
 	// cfg.recomposeMCPManifest (wired below) redoes this once mcpReadyMsg
 	// fires and the registry is actually live.
-	mcpManifest := tools.MCPManifestFor(resolvedModel, agentProfile)
+	mcpManifest := tools.MCPManifestFor(resolvedModel, agentProfile, a.ContextWindow())
 
 	// Inject the project's MEMORY.md (plus the manage-it-yourself instruction)
 	// into the system prompt. The agent reads/writes the rest of the memory
@@ -1296,7 +1296,8 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			// MCP manifest against a.Model (may differ from resolvedModel — a
 			// saved session can override it above) so the Tool Search
 			// activation gate matches the model actually in use.
-			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
+			a.SetModelDeployment(a.Model, entry.EffectiveContextWindow(), entry.EndpointID)
+			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile, a.ContextWindow()), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
 		} else {
 			sess = agent.NewSession(resolvedModel, *system)
 			sess.Bind(agent.EntryTUI, false)
@@ -1326,7 +1327,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 					// prompt (line ~946). Re-compose with the expert
 					// prompt and skip identity layers so the expert's
 					// persona isn't polluted by soul.md/user.md.
-					a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile), memInjection, coauthor, true)
+					a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile, a.ContextWindow()), memInjection, coauthor, true)
 				}
 			}
 		}
@@ -1397,7 +1398,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		// for both a fresh session (NewSession stores *system into it) and a
 		// resumed one (loaded from disk), so it's correct in either case.
 		cfg.recomposeMCPManifest = func() {
-			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
+			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile, a.ContextWindow()), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
 		}
 		// Backs /reload: re-renders every layer that can go stale mid-session
 		// (skills manifest, MCP manifest, memory injection) and re-composes,
@@ -1413,13 +1414,13 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			if g := tools.MemoryBackendGuidance(); g != "" {
 				memInjection = strings.TrimSpace(memInjection + "\n\n" + g)
 			}
-			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
+			a.System, a.LeanSystem = prompt.ComposePair(sess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile, a.ContextWindow()), memInjection, coauthor, agentProfile != nil && agentProfile.SystemPrompt != "")
 		}
 		if toolsOn {
 			// Built-ins only at first paint — the MCP registry is still nil
 			// (mcpBoot connects it in the background). mcpReadyMsg recomputes
 			// this list once the servers are live.
-			cfg.tools = tools.DefaultToolsFor(resolvedModel)
+			cfg.tools = tools.DefaultToolsFor(resolvedModel, a.ContextWindow())
 			cfg.executor = toolExecutor
 			cfg.subAgentMgr = subAgentMgr
 		}
@@ -1451,7 +1452,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			oneShotSess.System = agentProfile.SystemPrompt
 			// Re-compose a.System with the expert prompt and skip
 			// identity layers (soul.md/user.md don't belong here).
-			a.System, a.LeanSystem = prompt.ComposePair(oneShotSess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile), memInjection, coauthor, true)
+			a.System, a.LeanSystem = prompt.ComposePair(oneShotSess.System, cwd, env, skillsManifest, tools.MCPManifestFor(a.Model, agentProfile, a.ContextWindow()), memInjection, coauthor, true)
 		}
 		oneShotSess.AgentID = agentProfileID
 	}
@@ -1484,7 +1485,7 @@ func runChat(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			toolCtx = tools.WithSessionAgentID(toolCtx, agentProfileID)
 			toolCtx = tools.WithProfileStore(toolCtx, agentStore)
 		}
-		replCfg.tools = tools.DefaultToolsForProfile(toolCtx, resolvedModel)
+		replCfg.tools = tools.DefaultToolsForProfile(toolCtx, resolvedModel, a.ContextWindow())
 		replCfg.executor = toolExecutor
 		replCfg.subAgentMgr = subAgentMgr
 	}

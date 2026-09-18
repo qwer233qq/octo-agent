@@ -147,12 +147,18 @@ type Reply struct {
 // Agent owns one conversation: the system prompt, the history of turns, the
 // model name, and the LLM transport (Sender).
 type Agent struct {
-	mu        sync.RWMutex // protects Sender (written by TUI event loop, read by turn goroutine)
-	Sender    Sender
-	System    string
-	Model     string
-	MaxTokens int
-	History   *History
+	mu     sync.RWMutex // protects Sender (written by TUI event loop, read by turn goroutine)
+	Sender Sender
+	System string
+	Model  string
+	// modelContextWindow is the selected endpoint model's deployed limit.
+	// Zero preserves the built-in lookup for callers without endpoint binding.
+	modelContextWindow int
+	// modelEndpointID keeps the deployment identity alongside Model so a
+	// sub-agent model override can resolve a sibling model on the same endpoint.
+	modelEndpointID string
+	MaxTokens       int
+	History         *History
 
 	// LeanSystem, when set, is a lighter variant of System (skills manifest and
 	// memory dropped) used to seed cheap read-only sub-agents. Empty falls back
@@ -167,6 +173,11 @@ type Agent struct {
 	// error to GenerateTitleOrSnippet's snippet fallback (no retry).
 	LiteSender Sender
 	LiteModel  string
+	// liteContextWindow stays separate because the same model name can be
+	// deployed with a different limit on the endpoint used for summarization.
+	liteContextWindow int
+	// liteEndpointID keeps sibling-model resolution on the lite deployment.
+	liteEndpointID string
 
 	// Describer, when non-nil, renders images as text for a primary model that
 	// can't accept image input. The pre-send transform consults it every turn
@@ -643,6 +654,99 @@ func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.Model = model
+	a.modelContextWindow = 0
+	a.modelEndpointID = ""
+}
+
+// SetModelDeployment atomically installs the model, its endpoint-resolved
+// context window, and the endpoint deployment that serves it. A zero window
+// intentionally falls back to the built-in model table; endpointID may be
+// empty for raw, unbound model overrides.
+func (a *Agent) SetModelDeployment(model string, contextWindow int, endpointID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Model = model
+	a.modelContextWindow = contextWindow
+	a.modelEndpointID = endpointID
+}
+
+// SetLiteModelDeployment installs the optional summarization sender together
+// with its own deployment window and endpoint, which may differ from the
+// primary model's.
+func (a *Agent) SetLiteModelDeployment(sender Sender, model string, contextWindow int, endpointID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LiteSender = sender
+	a.LiteModel = model
+	a.liteContextWindow = contextWindow
+	a.liteEndpointID = endpointID
+}
+
+// ModelEndpointID returns the endpoint currently bound to the primary model.
+func (a *Agent) ModelEndpointID() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.modelEndpointID
+}
+
+// ModelDeployment returns a consistent snapshot of the primary sender, model,
+// effective context window, and endpoint binding.
+func (a *Agent) ModelDeployment() (Sender, string, int, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	window := a.modelContextWindow
+	if window <= 0 {
+		window = contextWindow(a.Model)
+	}
+	return a.Sender, a.Model, window, a.modelEndpointID
+}
+
+// LiteModelConfig returns a consistent snapshot of the optional lite model.
+func (a *Agent) LiteModelConfig() (Sender, string, int, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	window := a.liteContextWindow
+	if window <= 0 {
+		window = contextWindow(a.LiteModel)
+	}
+	return a.LiteSender, a.LiteModel, window, a.liteEndpointID
+}
+
+// ContextWindow returns the primary model's configured deployment limit when
+// present, otherwise the built-in/fallback limit for its bare model name.
+func (a *Agent) ContextWindow() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.modelContextWindow > 0 {
+		return a.modelContextWindow
+	}
+	return contextWindow(a.Model)
+}
+
+// LiteContextWindow resolves the summarizer's limit independently from the
+// primary model so compaction does not size a lite request against the wrong
+// endpoint deployment.
+func (a *Agent) LiteContextWindow() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.liteContextWindow > 0 {
+		return a.liteContextWindow
+	}
+	return contextWindow(a.LiteModel)
+}
+
+// ContextWindowFor returns an instance-specific window for the primary or lite
+// model, falling back to the bare-model lookup for every other model.
+func (a *Agent) ContextWindowFor(model string) int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if model == a.Model && a.modelContextWindow > 0 {
+		return a.modelContextWindow
+	}
+	if model == a.LiteModel && a.liteContextWindow > 0 {
+		return a.liteContextWindow
+	}
+	return contextWindow(model)
 }
 
 // SetImageDescriber installs (or clears, with nil) the image describer under a
@@ -2431,7 +2535,7 @@ func (a *Agent) ContextUsage() (used, window int) {
 	overhead := a.toolDefTokens
 	a.usageMu.Unlock()
 	if real > 0 {
-		return real, contextWindow(a.Model)
+		return real, a.ContextWindow()
 	}
 	// Only pay for the History snapshot + heuristic estimate when there's no
 	// real count yet (cold start) — this is called at TUI render-tick rate,
@@ -2445,10 +2549,10 @@ func (a *Agent) ContextUsage() (used, window int) {
 		// gauge at all — the system/tools overhead is real but reporting it
 		// here would put a misleading "ctx N%" on an empty transcript (the
 		// TUI status bar keys on used > 0).
-		return 0, contextWindow(a.Model)
+		return 0, a.ContextWindow()
 	}
 	est := estimateMessages(msgs) + estimateText(a.System) + overhead
-	return est, contextWindow(a.Model)
+	return est, a.ContextWindow()
 }
 
 // setToolDefOverhead stashes the estimated wire size of the tool schemas sent
