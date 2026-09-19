@@ -22,6 +22,8 @@ type fakeNative struct {
 	notifyCalls        int
 	gotSessionID       string
 	notifySessionCalls int
+	dismissCalls       int
+	gotDismissID       string
 	autostart          bool
 	toggleMaxCalls     int
 	minimiseCalls      int
@@ -60,6 +62,10 @@ func (f *fakeNative) NotifySession(title, body, sessionID string) {
 	f.notifySessionCalls++
 	f.gotTitle, f.gotBody = title, body
 	f.gotSessionID = sessionID
+}
+func (f *fakeNative) DismissSessionNotification(sessionID string) {
+	f.dismissCalls++
+	f.gotDismissID = sessionID
 }
 func (f *fakeNative) AutostartEnabled() (bool, error) { return f.autostart, nil }
 func (f *fakeNative) SetAutostart(enable bool) error  { f.autostart = enable; return nil }
@@ -213,6 +219,64 @@ func TestNativeNotifyNotRegisteredWithoutBridge(t *testing.T) {
 	serveLoopback(srv.mux, w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("without a bridge the route must not exist: got %d, want 404", w.Code)
+	}
+}
+
+func TestNativeNotifyDismissRoutesToBridge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{"session_id":"sess-123"}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.dismissCalls != 1 || fake.gotDismissID != "sess-123" {
+		t.Errorf("bridge.DismissSessionNotification got calls=%d sessionID=%q, want 1/sess-123",
+			fake.dismissCalls, fake.gotDismissID)
+	}
+}
+
+func TestNativeNotifyDismissWithoutSessionIDNoOps(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	fake := &fakeNative{}
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if fake.dismissCalls != 0 {
+		t.Errorf("bridge.DismissSessionNotification calls = %d, want 0 for a missing session_id", fake.dismissCalls)
+	}
+}
+
+func TestNativeNotifyDismissRejectsNonLoopback(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Native: &fakeNative{}})
+	req := httptest.NewRequest(http.MethodPost, "/api/native/notify/dismiss", strings.NewReader(`{"session_id":"sess-123"}`))
+	req.RemoteAddr = "203.0.113.5:1000" // non-loopback
+	req.Host = "127.0.0.1:8080"
+	// Valid key clears requireAuth (which would otherwise 401 a non-loopback
+	// peer), so the request reaches the handler's own same-machine guard.
+	req.Header.Set("Authorization", "Bearer "+srv.AccessKey())
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback peer: got %d, want 403", w.Code)
 	}
 }
 
