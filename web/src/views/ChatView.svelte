@@ -73,6 +73,7 @@
   import { applyToolToggle, buildExportConversation, exportConversationStyles, hasRenderableTurn, TOOL_RESULT_CHARS } from '../lib/exportTranscript'
   import { t, tr, pickLocalized } from '../lib/i18n'
   import { insertPendingSend, takeConfirmedSend } from '../lib/pendingSendOrder'
+  import { isReplayedUserEcho } from '../lib/userEchoDedup'
   import { inlineSlashCommand } from '../lib/inlineSlash'
   import { exportModeStore, selectedMessagesStore } from '../lib/exportStore'
   import { filenameStem } from '../lib/filename'
@@ -900,6 +901,17 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
       const content = (ev as any).content ?? ''
       const createdAt = (ev as any).created_at ?? Date.now()
       const images = (ev as any).images ?? []
+      // Replay guard, before anything below touches the FIFO: a mid-turn
+      // (re)subscribe replays the turn's buffered events — including echoes
+      // this tab already confirmed (pending long cleared, queue entry
+      // retired). The replay carries the original broadcast verbatim, so
+      // (content, createdAt) identifies it (see userEchoDedup). Letting a
+      // replay fall through would misread it against whatever NEWER send sits
+      // in the queue (retiring the wrong entry, and the steer branch would
+      // append the duplicate bubble this guard exists to prevent). Safe to
+      // run first: the check ignores pending bubbles, so a genuine first
+      // confirmation never false-positives.
+      if (isReplayedUserEcho(get(chatMessages)[sid] ?? [], content, createdAt)) return
       const queue = pendingSends.get(sid)
       // Entries ahead of the confirmed one never got a confirmation of their
       // own. Retiring them here — instead of letting the queue stay short —
@@ -931,7 +943,9 @@ import QuestionModal from '../components/overlays/QuestionModal.svelte'
           }
         } else {
           // If the last user bubble is a pending optimistic echo of the same
-          // text, replace it in place (de-dup). Otherwise append a fresh one.
+          // text, replace it in place (de-dup). Otherwise append a fresh one —
+          // a replayed echo never reaches here (the guard at the top of this
+          // handler returns first).
           const lastPending = msgs.findLastIndex((x: any) => x.type === 'user' && x.pending)
           if (lastPending >= 0 && msgs[lastPending].content === content) {
             confirmedPendingId = msgs[lastPending].id
