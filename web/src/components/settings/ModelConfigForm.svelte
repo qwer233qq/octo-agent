@@ -130,7 +130,10 @@
     if (preset) {
       model = preset.default_model || ''
       baseUrl = preset.base_url || ''
-      applyPresetVision()
+      // A Custom model has no catalogue entry, so don't carry over the last
+      // vendor's value; start from the same default as the add-endpoint form.
+      if (isCustom) vision = true
+      else applyPresetVision()
     }
   }
 
@@ -160,13 +163,14 @@
     }
     const win = isCustom ? parseContextWindow(ctxWin) : 0
     if (win) req.context_window = win
+    // Vision is a property of the model, not a preference, so it is sent even
+    // when prefs are hidden: saveModel stores an omitted value as false.
+    req.vision = vision
     // Onboard hides prefs; leave them to server defaults + the /onboard ceremony.
-    // (Vision, when omitted, is resolved server-side from the catalogue/heuristic.)
     if (showPrefs) {
       req.permission_mode = permMode
       req.reasoning_effort = reasoning
       req.show_reasoning = showReason
-      req.vision = vision
     }
     return req
   }
@@ -285,6 +289,16 @@
         disabled={saving}
       />
     </label>
+    <!-- With prefs hidden (onboard) a named vendor's vision comes from its
+         catalogue, but a Custom model has no entry, so the user answers. -->
+    {#if !showPrefs}
+      <div class="toggles">
+        <div class="toggle-row">
+          <span class="toggle-label">{$t('models.vision')}</span>
+          <Switch bind:checked={vision} />
+        </div>
+      </div>
+    {/if}
   {/if}
 
   <!-- Base URL -->
