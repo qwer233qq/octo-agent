@@ -33,6 +33,8 @@ type taskRequest struct {
 	Notify    scheduler.NotifyTargets `json:"notify,omitempty"`
 	// PermissionMode is required: "auto" or "strict".
 	PermissionMode string `json:"permission_mode"`
+	// Enabled defaults to true when omitted.
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type taskResponse struct {
@@ -591,7 +593,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req taskRequest
-	if err := readBodyJSON(r, &req); err != nil {
+	if err := readBodyJSONStrict(r, &req); err != nil {
 		writeInvalidJSONBody(w, err)
 		return
 	}
@@ -616,7 +618,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		AgentID:        req.AgentID,
 		Directory:      req.Directory,
 		Notify:         req.Notify,
-		Enabled:        true,
+		Enabled:        req.Enabled == nil || *req.Enabled,
 		PermissionMode: req.PermissionMode,
 	}
 	if err := s.scheduler.Add(&task); err != nil {
@@ -752,8 +754,10 @@ func (s *Server) handlePatchTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing task id")
 		return
 	}
+	// Strict: a field the task doesn't have would otherwise return 200 and
+	// read as applied (#2613).
 	var req patchTaskRequest
-	if err := readBodyJSON(r, &req); err != nil {
+	if err := readBodyJSONStrict(r, &req); err != nil {
 		writeInvalidJSONBody(w, err)
 		return
 	}

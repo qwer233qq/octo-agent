@@ -263,6 +263,76 @@ func TestTaskPermissionMode_CreatePatchValidate(t *testing.T) {
 	}
 }
 
+// TestPatchTask_RejectsUnknownField: a field the task doesn't have must be a
+// 400 naming it, not a 200 that silently drops it (#2613).
+func TestPatchTask_RejectsUnknownField(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	id := createTaskForTest(t, srv, `{"name":"keep","cron":"0 0 9 * * *","prompt":"go","permission_mode":"auto"}`)
+
+	body := `{"prompt":"changed","bogus_field":"x"}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/tasks/"+id, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("patch status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "bogus_field") {
+		t.Errorf("error should name the unknown field, got %s", w.Body.String())
+	}
+	// The known field in the same body is not half-applied.
+	if got := listTasksForTest(t, srv)[0].Prompt; got != "go" {
+		t.Errorf("task prompt = %q, want unchanged %q", got, "go")
+	}
+}
+
+// TestCreateTask_RejectsUnknownField: same as PATCH — an unknown field on
+// create is a 400 naming it, and no task is created.
+func TestCreateTask_RejectsUnknownField(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	body := `{"name":"t","cron":"0 0 9 * * *","prompt":"go","permission_mode":"auto","bogus_field":"x"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("create status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "bogus_field") {
+		t.Errorf("error should name the unknown field, got %s", w.Body.String())
+	}
+	if got := listTasksForTest(t, srv); len(got) != 0 {
+		t.Errorf("tasks = %d, want none created", len(got))
+	}
+}
+
+// TestCreateTask_Enabled: enabled is optional on create and defaults to true;
+// an explicit false creates the task paused instead of being ignored.
+func TestCreateTask_Enabled(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false})
+
+	createTaskForTest(t, srv, `{"name":"on","cron":"0 0 9 * * *","prompt":"go","permission_mode":"auto"}`)
+	createTaskForTest(t, srv, `{"name":"off","cron":"0 0 9 * * *","prompt":"go","permission_mode":"auto","enabled":false}`)
+
+	for _, task := range listTasksForTest(t, srv) {
+		want := task.Name == "on"
+		if task.Enabled != want {
+			t.Errorf("task %q enabled = %v, want %v", task.Name, task.Enabled, want)
+		}
+	}
+}
+
 // TestDeleteTask_DeletesGroupKeepsSessions: deleting a task deletes its group,
 // but the group's member sessions stay on disk (they fall back to ungrouped).
 func TestDeleteTask_DeletesGroupKeepsSessions(t *testing.T) {
