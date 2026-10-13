@@ -18,10 +18,12 @@ import (
 // Version-cache timings.
 //
 // versionRefreshInterval is how often a lookup may actually leave the machine.
-// It is deliberately far longer than how often the UI reads the answer: reads
-// are served from cache and cost nothing, so the tray and the web badge can
-// both re-read every minute (which is what keeps them showing the same thing)
-// while the network is touched four times a day.
+// It is deliberately longer than how often the UI reads the answer: reads are
+// served from cache and cost nothing, so the tray and the web badge can both
+// re-read every minute (which is what keeps them showing the same thing) while
+// the network is touched at most every ten minutes. It must stay above that
+// one-minute read cadence, or every read would find the cache stale and look
+// up. Ten minutes rather than hours so a new release shows up the same session.
 //
 // versionCheckBackoff holds off retrying after a failure.
 //
@@ -35,7 +37,7 @@ import (
 // project's own mirror; the remaining public proxies are best-effort and not
 // budgeted for. Nothing waits on this: the lookup runs on its own goroutine.
 const (
-	versionRefreshInterval = 6 * time.Hour
+	versionRefreshInterval = 10 * time.Minute
 	versionCheckBackoff    = 10 * time.Minute
 	versionCheckTimeout    = 10 * time.Second
 )
@@ -154,9 +156,12 @@ func (s *Server) updateCheckAllowed() bool {
 // RefreshLatestVersion performs the lookup on THIS goroutine, ignoring the
 // refresh interval and the failure backoff, and seeds the shared cache with
 // the result so every other surface agrees on its next read. The desktop
-// tray's explicit "Check for updates…" calls this: the user asking is not a
-// request to be served a cached answer, and the tray can afford to block
-// where an HTTP handler cannot.
+// tray's explicit "Check for updates…" and the Settings button (POST
+// /api/version/check) call this: the user asking is not a request to be
+// served a cached answer.
+//
+// The lookup carries its own versionCheckTimeout; ctx only cancels. Waiting
+// for an in-flight refresh is bounded by that refresh's own timeout.
 //
 // Config.UpdateCheck still gates it — a build that never looks (the test
 // suite, every non-serve constructor) must not be talked into looking.
@@ -218,7 +223,7 @@ func (s *Server) startVersionRefresh() {
 	// Without this, every reader polling while a refresh is in flight had a
 	// window in which it started a redundant second lookup — one extra
 	// request to GitHub for an answer already cached, on the one path that
-	// promises to leave the machine four times a day.
+	// promises to leave the machine at most once per refresh interval.
 	if _, _, stale := s.versionSnapshot(current); !stale {
 		s.versionChecking.Store(false)
 		return
@@ -251,9 +256,13 @@ func (s *Server) awaitVersionRefresh(ctx context.Context) {
 	}
 }
 
-// runVersionCheck is the forced path: it waits for an in-flight background
-// refresh rather than racing it, then performs its own lookup.
+// runVersionCheck is the forced path: it waits for an in-flight refresh
+// rather than racing it. If a lookup succeeded after this check was asked for,
+// its answer is the one a new lookup would find, so it is returned as is —
+// which also collapses repeated clicks into one request. Otherwise it performs
+// its own lookup on a fresh budget, so time spent waiting can't starve it.
 func (s *Server) runVersionCheck(ctx context.Context, current string) (string, bool, error) {
+	asked := time.Now()
 	for !s.versionChecking.CompareAndSwap(false, true) {
 		select {
 		case <-ctx.Done():
@@ -263,7 +272,17 @@ func (s *Server) runVersionCheck(ctx context.Context, current string) (string, b
 		}
 	}
 	defer s.versionChecking.Store(false)
-	return s.checkAndStore(ctx, current)
+
+	s.versionCacheMu.RLock()
+	landed, known := s.versionCheckedAt.After(asked), s.versionLatest
+	s.versionCacheMu.RUnlock()
+	if landed {
+		return known, upgrade.NeedsUpdate(current, known), nil
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, versionCheckTimeout)
+	defer cancel()
+	return s.checkAndStore(lookupCtx, current)
 }
 
 // checkAndStore performs the lookup and records the outcome. The network call
@@ -290,6 +309,33 @@ func (s *Server) checkAndStore(ctx context.Context, current string) (string, boo
 		return known, upgrade.NeedsUpdate(current, known), err
 	}
 	return latest, upgrade.NeedsUpdate(current, latest), nil
+}
+
+// ─── POST /api/version/check ────────────────────────────────────────────────
+
+// handleVersionCheck is the Settings "Check for updates" button: a forced
+// lookup, like the desktop tray's. GET /api/version answers from a cache that
+// refreshes every versionRefreshInterval, so a release published since the
+// last refresh stayed invisible to a user who explicitly asked. The result
+// seeds that cache, so the button's follow-up GET and the badge agree.
+//
+// It deliberately ignores the `update_check` preference, as the tray's manual
+// check does: that switch promises no request octo makes unasked, and a click
+// is asking.
+func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
+	// Detached from the request for the reason startVersionRefresh gives: a
+	// client leaving mid-check would record a failure and back off every other
+	// reader's refresh.
+	latest, needs, err := s.RefreshLatestVersion(context.WithoutCancel(r.Context()))
+	if errors.Is(err, errUpdateCheckDisabled) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"latest": latest, "needs_update": needs})
 }
 
 // ─── POST /api/version/upgrade ──────────────────────────────────────────────

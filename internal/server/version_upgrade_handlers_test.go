@@ -408,6 +408,64 @@ func TestStartVersionRefresh_SkipsALookupThatAlreadyLanded(t *testing.T) {
 	}
 }
 
+// TestRefreshLatestVersion_TakesARefreshThatLandedWhileWaiting: a forced check
+// that queued behind an in-flight refresh returns that refresh's answer rather
+// than spending a second request (and the remains of its budget) on the same
+// question — which is also what collapses repeated clicks into one lookup.
+func TestRefreshLatestVersion_TakesARefreshThatLandedWhileWaiting(t *testing.T) {
+	var hits int32
+	mux := http.NewServeMux()
+	var fake *httptest.Server
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Redirect(w, r, fake.URL+"/releases/tag/v9.9.9", http.StatusFound)
+	})
+	fake = httptest.NewServer(mux)
+	t.Cleanup(fake.Close)
+
+	origURL, origMirrors := upgrade.BaseURL, upgrade.MirrorBaseURLs
+	upgrade.BaseURL, upgrade.MirrorBaseURLs = fake.URL, nil
+	t.Cleanup(func() { upgrade.BaseURL, upgrade.MirrorBaseURLs = origURL, origMirrors })
+
+	origV, origC := version.Version, version.Commit
+	version.Version, version.Commit = "0.18.0", "abc1234"
+	t.Cleanup(func() { version.Version, version.Commit = origV, origC })
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: true})
+	srv.versionChecking.Store(true) // a refresh is in flight
+
+	type result struct {
+		latest string
+		needs  bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		latest, needs, err := srv.RefreshLatestVersion(context.Background())
+		done <- result{latest, needs, err}
+	}()
+	time.Sleep(20 * time.Millisecond) // let the check queue behind it
+
+	// The in-flight refresh lands, then releases the token.
+	if _, _, err := srv.checkAndStore(context.Background(), "0.18.0"); err != nil {
+		t.Fatalf("in-flight refresh: %v", err)
+	}
+	baseline := atomic.LoadInt32(&hits)
+	srv.versionChecking.Store(false)
+
+	select {
+	case r := <-done:
+		if r.err != nil || r.latest != "9.9.9" || !r.needs {
+			t.Fatalf("queued check = (%q, %v, %v), want (9.9.9, true, nil)", r.latest, r.needs, r.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("queued check never returned")
+	}
+	if got := atomic.LoadInt32(&hits); got != baseline {
+		t.Errorf("queued check cost %d upstream request(s), want 0", got-baseline)
+	}
+}
+
 // TestRefreshLatestVersion_DisabledReportsError: a server that performs no
 // lookups hands back an error rather than a confident "you're up to date" the
 // tray would happily toast.
@@ -415,6 +473,126 @@ func TestRefreshLatestVersion_DisabledReportsError(t *testing.T) {
 	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: false})
 	if _, _, err := srv.RefreshLatestVersion(context.Background()); err == nil {
 		t.Error("RefreshLatestVersion on a no-lookup build returned no error")
+	}
+}
+
+// TestVersionCheckEndpoint_BypassesCache: the Settings button's POST
+// /api/version/check must find a release the cached GET would still hide, and
+// leave the cache holding it so the follow-up GET agrees.
+func TestVersionCheckEndpoint_BypassesCache(t *testing.T) {
+	tag := "9.9.9"
+	mux := http.NewServeMux()
+	var fake *httptest.Server
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fake.URL+"/releases/tag/v"+tag, http.StatusFound)
+	})
+	fake = httptest.NewServer(mux)
+	t.Cleanup(fake.Close)
+
+	origURL, origMirrors := upgrade.BaseURL, upgrade.MirrorBaseURLs
+	upgrade.BaseURL, upgrade.MirrorBaseURLs = fake.URL, nil
+	t.Cleanup(func() { upgrade.BaseURL, upgrade.MirrorBaseURLs = origURL, origMirrors })
+
+	origV, origC := version.Version, version.Commit
+	version.Version, version.Commit = "0.18.0", "abc1234"
+	t.Cleanup(func() { version.Version, version.Commit = origV, origC })
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: true})
+	srv.LatestVersion()
+	if latest, _ := awaitVersion(t, srv, "9.9.9"); latest != "9.9.9" {
+		t.Fatalf("priming read = %q, want 9.9.9", latest)
+	}
+	settleVersionRefresh(t, srv)
+
+	tag = "10.0.0"
+	req := httptest.NewRequest(http.MethodPost, "/api/version/check", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /api/version/check: got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var body struct {
+		Latest      string `json:"latest"`
+		NeedsUpdate bool   `json:"needs_update"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Latest != "10.0.0" || !body.NeedsUpdate {
+		t.Errorf("check = (%q, %v), want (10.0.0, true)", body.Latest, body.NeedsUpdate)
+	}
+	if latest, _ := srv.LatestVersion(); latest != "10.0.0" {
+		t.Errorf("cached read after check = %q, want 10.0.0", latest)
+	}
+}
+
+// TestVersionCheckEndpoint_ClientGoneStillCompletes: a client that leaves
+// mid-check must not turn the lookup into a recorded failure, which would back
+// off every other reader's refresh.
+func TestVersionCheckEndpoint_ClientGoneStillCompletes(t *testing.T) {
+	mux := http.NewServeMux()
+	var fake *httptest.Server
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fake.URL+"/releases/tag/v9.9.9", http.StatusFound)
+	})
+	fake = httptest.NewServer(mux)
+	t.Cleanup(fake.Close)
+
+	origURL, origMirrors := upgrade.BaseURL, upgrade.MirrorBaseURLs
+	upgrade.BaseURL, upgrade.MirrorBaseURLs = fake.URL, nil
+	t.Cleanup(func() { upgrade.BaseURL, upgrade.MirrorBaseURLs = origURL, origMirrors })
+
+	origV, origC := version.Version, version.Commit
+	version.Version, version.Commit = "0.18.0", "abc1234"
+	t.Cleanup(func() { version.Version, version.Commit = origV, origC })
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/version/check", nil).WithContext(ctx)
+	serveLoopback(srv.mux, httptest.NewRecorder(), req)
+
+	srv.versionCacheMu.RLock()
+	failedAt, latest := srv.versionFailedAt, srv.versionLatest
+	srv.versionCacheMu.RUnlock()
+	if !failedAt.IsZero() {
+		t.Error("a cancelled request recorded a lookup failure")
+	}
+	if latest != "9.9.9" {
+		t.Errorf("cache after cancelled request = %q, want 9.9.9", latest)
+	}
+}
+
+// TestVersionCheckEndpoint_LookupFailureIsBadGateway: a failed lookup is an
+// error, never a 200 the button would read as "up to date".
+func TestVersionCheckEndpoint_LookupFailureIsBadGateway(t *testing.T) {
+	fakeFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(fakeFail.Close)
+
+	origURL, origMirrors := upgrade.BaseURL, upgrade.MirrorBaseURLs
+	upgrade.BaseURL, upgrade.MirrorBaseURLs = fakeFail.URL, nil
+	t.Cleanup(func() { upgrade.BaseURL, upgrade.MirrorBaseURLs = origURL, origMirrors })
+
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: true})
+	req := httptest.NewRequest(http.MethodPost, "/api/version/check", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("failed lookup: got %d, want 502", w.Code)
+	}
+}
+
+// TestVersionCheckEndpoint_DisabledIsConflict: a no-lookup server must not
+// answer the button with a confident "up to date".
+func TestVersionCheckEndpoint_DisabledIsConflict(t *testing.T) {
+	srv := mustServer(t, Config{Addr: "127.0.0.1:0", Tools: false, UpdateCheck: false})
+	req := httptest.NewRequest(http.MethodPost, "/api/version/check", nil)
+	w := httptest.NewRecorder()
+	serveLoopback(srv.mux, w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("disabled check: got %d, want 409", w.Code)
 	}
 }
 
