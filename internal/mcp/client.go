@@ -262,6 +262,15 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 
 	if err := c.sendRecoveringSession(ctx, msg); err != nil {
+		// Given up on mid-send — e.g. a streamed response cut off by an
+		// interrupt or timeout — the server may well have the request and be
+		// working on it. Failures known to precede the write are notSentError;
+		// for the rest a cancellation of an id the server never saw is
+		// harmless, as the spec has receivers ignore unknown ids.
+		var ns notSentError
+		if ctx.Err() != nil && !errors.As(err, &ns) {
+			c.cancelRequest(ctx, method, idBytes)
+		}
 		return err
 	}
 
@@ -280,8 +289,39 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		}
 		return nil
 	case <-ctx.Done():
+		c.cancelRequest(ctx, method, idBytes)
 		return ctx.Err()
 	}
+}
+
+// cancelNotifyTimeout bounds sending the notifications/cancelled for an
+// abandoned request. A var (not const) so tests can shrink it.
+var cancelNotifyTimeout = 5 * time.Second
+
+// cancelRequest tells the server to stop a request this client has given up
+// on — the user interrupted, or a timeout fired. The transport spec is
+// explicit that a dropped connection is not a cancellation, so without this
+// the server runs an abandoned tool call to completion, which with progress
+// reports keeping calls alive can be many minutes of work nobody will read.
+//
+// ctx is the request's own, already done; its cause becomes the reason. The
+// notification goes out in the background on a fresh deadline: the caller is
+// returning its error now and shouldn't wait on the server to do so. It is a
+// best-effort send (see withBestEffort) — a user who just interrupted an
+// authorization prompt must not get another one for this. Any response that
+// still arrives finds no pending entry and is dropped, as the spec asks.
+func (c *Client) cancelRequest(ctx context.Context, method string, id json.RawMessage) {
+	if method == MethodInitialize {
+		return // the spec forbids cancelling initialize
+	}
+	params := CancelledParams{RequestID: id, Reason: context.Cause(ctx).Error()}
+	go func() {
+		// Detached, with nothing above it to recover a panic.
+		defer func() { _ = panics.Error(recover(), "mcp cancel notification", "method", method) }()
+		nctx, cancel := context.WithTimeout(withBestEffort(context.Background()), cancelNotifyTimeout)
+		defer cancel()
+		_ = c.Notify(nctx, MethodCancelled, params)
+	}()
 }
 
 // Notify sends a one-way notification — no id, no response. params may be
@@ -353,6 +393,13 @@ func (c *Client) sendRecoveringSession(ctx context.Context, msg *Message) error 
 	return finish()
 }
 
+// notSentError marks a send given up while still waiting for the slot: the
+// server never saw the request, so there is nothing to cancel.
+type notSentError struct{ err error }
+
+func (e notSentError) Error() string { return e.err.Error() }
+func (e notSentError) Unwrap() error { return e.err }
+
 // startSend runs the slot-held phase of a send: write msg and handle the
 // response headers, re-handshaking and replaying once if they report the
 // session expired.
@@ -371,9 +418,9 @@ func (c *Client) startSend(ctx context.Context, msg *Message, expired error) (fu
 	select {
 	case c.sendSem <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, notSentError{ctx.Err()}
 	case <-c.rxDone:
-		return nil, fmt.Errorf("mcp: connection is no longer readable while waiting to send")
+		return nil, notSentError{fmt.Errorf("mcp: connection is no longer readable while waiting to send")}
 	}
 	defer func() { <-c.sendSem }()
 
