@@ -46,8 +46,6 @@ import (
 //   - A standing GET listener for server-initiated messages outside of a
 //     request/response cycle. The GET above is only used to resume a broken
 //     response stream.
-//   - Bidirectional concurrent sends. The client serialises one request at
-//     a time anyway.
 //
 // Receive is wired through an in-memory channel: each Send queues the
 // frame(s) decoded from its response, Receive pops the next one. This
@@ -109,9 +107,9 @@ func NewHTTPTransport(cfg HTTPConfig) (*HTTPTransport, error) {
 		headers: cfg.Headers,
 		oauth:   cfg.OAuth,
 		hc:      &http.Client{},
-		// 16 is generous — the synchronous Send/Receive pattern only ever
-		// has one outstanding response, but headroom protects against any
-		// pipelining we might add later.
+		// Several response streams can be open at once (one per in-flight
+		// request); the receive loop drains this continuously, so 16 is
+		// only smoothing, not a bound anything depends on.
 		inbox: make(chan *Message, 16),
 		done:  make(chan struct{}),
 	}, nil
@@ -126,39 +124,54 @@ func NewHTTPTransport(cfg HTTPConfig) (*HTTPTransport, error) {
 // access token; a 401 response invalidates the cache and triggers exactly
 // one retry (so the user doesn't see two authorization prompts in a row).
 func (t *HTTPTransport) Send(ctx context.Context, msg *Message) error {
+	finish, err := t.StartSend(ctx, msg)
+	if err != nil || finish == nil {
+		return err
+	}
+	return finish()
+}
+
+// StartSend is Send split at the response headers: it returns once those are
+// handled, with a plain-JSON response already queued. For an SSE response it
+// returns finish, which reads the stream (and resumes it if it breaks) and
+// must be called exactly once — it also closes the body. ctx keeps governing
+// the stream after StartSend returns.
+func (t *HTTPTransport) StartSend(ctx context.Context, msg *Message) (finish func() error, err error) {
 	if t.closed.Load() {
-		return errors.New("mcp: http transport: closed")
+		return nil, errors.New("mcp: http transport: closed")
 	}
 
 	// At most one retry on 401 — the retry uses a freshly-acquired token.
 	for attempt := 0; attempt < 2; attempt++ {
-		retry, err := t.doRequest(ctx, msg, attempt > 0)
+		retry, finish, err := t.doRequest(ctx, msg, attempt > 0)
 		if !retry {
-			return err
+			return finish, err
 		}
 		// retry==true means 401 was observed; loop to retry once.
 	}
-	return errors.New("mcp: http: still unauthorized after retry")
+	return nil, errors.New("mcp: http: still unauthorized after retry")
 }
 
-// doRequest performs one HTTP round-trip. Returns (retry, err):
+// doRequest performs one HTTP round-trip up to the response body. Returns
+// (retry, finish, err):
 //
 //   - retry=true means "401 observed, OAuth was invalidated, caller should
 //     loop one more time with a freshly-acquired token". err is non-nil
 //     here but only as breadcrumb context.
 //   - retry=false means "this attempt is terminal — either the response
-//     was queued for Receive or err describes a hard failure".
+//     was queued for Receive, finish will read it, or err describes a hard
+//     failure".
 //
 // forceFreshToken=true on the retry attempt forces a token refresh path
 // even if the cached token still looks unexpired.
-func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshToken bool) (retry bool, err error) {
+func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshToken bool) (retry bool, finish func() error, err error) {
 	body, err := json.Marshal(msg)
 	if err != nil {
-		return false, fmt.Errorf("mcp: marshal: %w", err)
+		return false, nil, fmt.Errorf("mcp: marshal: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
 	if err != nil {
-		return false, fmt.Errorf("mcp: request: %w", err)
+		return false, nil, fmt.Errorf("mcp: request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// MCP spec: clients MUST include Accept with both JSON and SSE so the
@@ -175,10 +188,11 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 		req.Header.Set("Mcp-Session-Id", sentSession)
 	}
 	t.protoMu.Lock()
-	if t.protocolVersion != "" {
-		req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
-	}
+	sentVersion := t.protocolVersion
 	t.protoMu.Unlock()
+	if sentVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", sentVersion)
+	}
 
 	// Bearer-token injection from OAuth provider, if configured.
 	if t.oauth != nil {
@@ -187,7 +201,7 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 		}
 		tok, terr := t.oauth.Token(ctx)
 		if terr != nil {
-			return false, fmt.Errorf("mcp: oauth token: %w", terr)
+			return false, nil, fmt.Errorf("mcp: oauth token: %w", terr)
 		}
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
@@ -196,13 +210,24 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 
 	resp, err := t.hc.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("mcp: do: %w", err)
+		return false, nil, fmt.Errorf("mcp: do: %w", err)
 	}
-	defer resp.Body.Close()
+	// Closed on return, except when the body is handed to finish.
+	keepBody := false
+	defer func() {
+		if !keepBody {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	// The session this response belongs to: what we sent, unless the server
+	// rotated it just now.
+	stream := streamSession{id: sentSession, version: sentVersion}
 
 	// Capture session id on first response (and tolerate the server
 	// rotating it on subsequent calls — spec lets them).
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+		stream.id = sid
 		t.sessionMu.Lock()
 		t.sessionID = sid
 		t.sessionMu.Unlock()
@@ -216,19 +241,19 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 		// would queue nothing, leaving the caller to wait out its whole
 		// timeout for a response that is never coming. Name it instead.
 		if !msg.IsNotification() {
-			return false, fmt.Errorf("mcp: http 204 to a %s request: server must answer with JSON or an SSE stream", msg.Method)
+			return false, nil, fmt.Errorf("mcp: http 204 to a %s request: server must answer with JSON or an SSE stream", msg.Method)
 		}
-		return false, nil
+		return false, nil, nil
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		// If we have OAuth and this isn't already our second attempt, ask
 		// the caller to retry with a fresh token. The provider's
 		// Invalidate is what makes the next Token() do real work.
 		if t.oauth != nil && !forceFreshToken {
-			return true, errors.New("mcp: http 401, will retry")
+			return true, nil, errors.New("mcp: http 401, will retry")
 		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, fmt.Errorf("mcp: http 401: %s", bytes.TrimSpace(b))
+		return false, nil, fmt.Errorf("mcp: http 401: %s", bytes.TrimSpace(b))
 	}
 	if resp.StatusCode == http.StatusNotFound && sentSession != "" {
 		// A 404 answering a request that carried a session id is how the spec
@@ -239,11 +264,11 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 		// through below.
 		t.forgetSession(sentSession)
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, fmt.Errorf("%w: %s", ErrSessionExpired, bytes.TrimSpace(b))
+		return false, nil, fmt.Errorf("%w: %s", ErrSessionExpired, bytes.TrimSpace(b))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, fmt.Errorf("mcp: http %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+		return false, nil, fmt.Errorf("mcp: http %d: %s", resp.StatusCode, bytes.TrimSpace(b))
 	}
 
 	if msg.IsNotification() {
@@ -253,7 +278,7 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 		// response, so there's nothing to decode or queue either way —
 		// drain the small ack body so the connection can be reused.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return false, nil
+		return false, nil, nil
 	}
 
 	ct := resp.Header.Get("Content-Type")
@@ -261,13 +286,17 @@ func (t *HTTPTransport) doRequest(ctx context.Context, msg *Message, forceFreshT
 	case ct == "" || isJSONContentType(ct):
 		var m Message
 		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-			return false, fmt.Errorf("mcp: decode response: %w", err)
+			return false, nil, fmt.Errorf("mcp: decode response: %w", err)
 		}
-		return false, t.queue(ctx, &m)
+		return false, nil, t.queue(ctx, &m)
 	case isEventStreamContentType(ct):
-		return false, t.readSSE(ctx, resp.Body, msg.ID)
+		keepBody = true
+		return false, func() error {
+			defer resp.Body.Close()
+			return t.readSSE(ctx, resp.Body, msg.ID, stream)
+		}, nil
 	default:
-		return false, fmt.Errorf("mcp: http: unsupported response Content-Type %q (expected application/json or text/event-stream)", ct)
+		return false, nil, fmt.Errorf("mcp: http: unsupported response Content-Type %q (expected application/json or text/event-stream)", ct)
 	}
 }
 
@@ -306,10 +335,48 @@ const maxSSEResumeAttempts = 3
 // ErrSessionExpired reports that the server no longer recognises the session
 // id we were using — it answered 404 to a request that carried one, which is
 // how the spec has a server say a session is gone (idle timeout, restart).
-// The transport has already dropped the dead id by the time this surfaces.
-// Client.Call watches for it and recovers by re-running the handshake and
-// replaying the request once; callers of Call therefore never normally see it.
+// Answering a request, the transport has already dropped the dead id by the
+// time this surfaces; found on a response stream it is a *streamExpiredError
+// instead, dropped later under the client's send slot. Client.Call watches
+// for it and recovers by re-running the handshake and replaying the request
+// once; callers of Call therefore never normally see it.
 var ErrSessionExpired = errors.New("mcp: session expired")
+
+// streamSession is the session a response stream belongs to. A resume
+// request carries it, not whatever is current: by then another sender may
+// have replaced the session, and the stream cannot continue on a different
+// one.
+type streamSession struct {
+	id, version string
+}
+
+// streamExpiredError is ErrSessionExpired found while reading a response
+// stream — after the client released its send slot, so the transport does
+// not clear the session itself: another sender would then go out with no
+// session id, which a server rejects outright rather than with the 404 that
+// lets it recover. It names the dead session for ForgetExpired instead.
+type streamExpiredError struct {
+	session string
+	detail  string
+}
+
+func (e *streamExpiredError) Error() string { return ErrSessionExpired.Error() + ": " + e.detail }
+func (e *streamExpiredError) Unwrap() error { return ErrSessionExpired }
+
+// ForgetExpired drops the session a *streamExpiredError names if it is still
+// the current one, and reports whether a recovery handshake is needed: false
+// when another sender has already replaced it. The client calls it holding
+// its send slot, so no request can go out between the forgetting and the
+// handshake that follows.
+func (t *HTTPTransport) ForgetExpired(err error) bool {
+	var se *streamExpiredError
+	if errors.As(err, &se) {
+		t.forgetSession(se.session)
+	}
+	t.sessionMu.Lock()
+	defer t.sessionMu.Unlock()
+	return t.sessionID == ""
+}
 
 // sessionDeleteTimeout bounds the best-effort session-termination DELETE that
 // Close fires. Short on purpose: Close runs on teardown paths (process exit,
@@ -347,12 +414,12 @@ var maxSSEEventBytes = 16 * 1024 * 1024
 // A stream that dies before delivering the response is resumed rather than
 // failed, provided the server opted into resumability by tagging events with
 // id: — see resumeSSE.
-func (t *HTTPTransport) readSSE(ctx context.Context, body io.Reader, wantID []byte) error {
+func (t *HTTPTransport) readSSE(ctx context.Context, body io.Reader, wantID []byte, stream streamSession) error {
 	lastID, err := t.scanSSE(ctx, body, wantID)
 	if !errors.Is(err, errSSEIncomplete) {
 		return err
 	}
-	return t.resumeSSE(ctx, wantID, lastID, err)
+	return t.resumeSSE(ctx, wantID, lastID, err, stream)
 }
 
 // resumeSSE picks up a response stream that broke before answering. The spec's
@@ -363,12 +430,12 @@ func (t *HTTPTransport) readSSE(ctx context.Context, body io.Reader, wantID []by
 // events hasn't opted in and has no way to know where to restart, so there the
 // original failure stands. Attempts are capped — a server that keeps dropping
 // the stream is broken, and retrying forever would just hide that.
-func (t *HTTPTransport) resumeSSE(ctx context.Context, wantID []byte, lastID string, cause error) error {
+func (t *HTTPTransport) resumeSSE(ctx context.Context, wantID []byte, lastID string, cause error, stream streamSession) error {
 	for attempt := 0; attempt < maxSSEResumeAttempts; attempt++ {
 		if lastID == "" {
 			break
 		}
-		body, err := t.openResumeStream(ctx, lastID)
+		body, err := t.openResumeStream(ctx, lastID, stream)
 		if err != nil {
 			// An expiry discovered here must stay recognisable: it's the one
 			// failure the Client can repair, and burying it under the
@@ -395,7 +462,7 @@ func (t *HTTPTransport) resumeSSE(ctx context.Context, wantID []byte, lastID str
 
 // openResumeStream issues the spec's replay request: a GET on the endpoint
 // with Last-Event-ID set, asking the server to continue an interrupted stream.
-func (t *HTTPTransport) openResumeStream(ctx context.Context, lastID string) (io.ReadCloser, error) {
+func (t *HTTPTransport) openResumeStream(ctx context.Context, lastID string, stream streamSession) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
 	if err != nil {
 		return nil, err
@@ -405,17 +472,13 @@ func (t *HTTPTransport) openResumeStream(ctx context.Context, lastID string) (io
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
-	t.sessionMu.Lock()
-	sid := t.sessionID
-	t.sessionMu.Unlock()
+	sid := stream.id
 	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}
-	t.protoMu.Lock()
-	if t.protocolVersion != "" {
-		req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
+	if stream.version != "" {
+		req.Header.Set("MCP-Protocol-Version", stream.version)
 	}
-	t.protoMu.Unlock()
 	if t.oauth != nil {
 		tok, terr := t.oauth.Token(ctx)
 		if terr != nil {
@@ -435,12 +498,11 @@ func (t *HTTPTransport) openResumeStream(ctx context.Context, lastID string) (io
 		// server to close a response stream early, so this is a likely way for
 		// a resume to fail rather than an exotic one. Report it as the expiry
 		// it is — the caller propagates it so the Client re-handshakes — and
-		// not as "the stream broke", which would leave the dead session id in
-		// place and fail the call with an unrelated message.
-		t.forgetSession(sid)
+		// not as "the stream broke", which would fail the call with an
+		// unrelated message and never replace the dead session.
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s", ErrSessionExpired, bytes.TrimSpace(b))
+		return nil, &streamExpiredError{session: sid, detail: string(bytes.TrimSpace(b))}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

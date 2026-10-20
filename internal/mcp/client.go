@@ -23,6 +23,18 @@ import (
 // A var (not const) so tests can shrink it.
 var defaultCallTimeout = 60 * time.Second
 
+// maxProgressCallTimeout caps a CallToolProgress call no matter how steadily
+// the server keeps reporting progress. Each report restarts the
+// defaultCallTimeout idle window, as the spec allows, but the spec also asks
+// for an absolute ceiling so a server that reports forever can't hold a turn
+// forever. A var (not const) so tests can shrink it.
+var maxProgressCallTimeout = 30 * time.Minute
+
+// progressBuffer is how many reports a single call can have queued before
+// the receive loop starts dropping them. The receive loop must never block on
+// a slow consumer — it is also what delivers every response.
+const progressBuffer = 64
+
 // Client is a single MCP server connection: one transport, one initialize
 // handshake, request/response dispatch by ID. It's safe for concurrent
 // callers — Call serialises writes through a one-slot send semaphore, and the
@@ -64,14 +76,14 @@ type Client struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan *Message
 
-	// sendSem is the transport's write lock, held for a whole send attempt so a
-	// session recovery can't have another request interleaved onto the dead
-	// session. A 1-buffered channel rather than a Mutex because acquisition has
-	// to be abandonable: an SSE response keeps the lock for as long as the
-	// server streams (plus resume attempts), and sync.Mutex.Lock ignores
-	// context — so queued callers could not be released by their own deadline
-	// or by an interrupt, only by the holder finishing. Waiting on a channel
-	// lets them select on ctx instead.
+	// sendSem is the transport's write lock, held while a request is written
+	// and its response headers read (not for a streamed body — see
+	// sendRecoveringSession) so a session recovery can't have another request
+	// interleaved onto the dead session. A 1-buffered channel rather than a
+	// Mutex because acquisition has to be abandonable: a recovery handshake
+	// holds it for a full round-trip, and sync.Mutex.Lock ignores context — so
+	// queued callers could not be released by their own deadline or by an
+	// interrupt. Waiting on a channel lets them select on ctx instead.
 	sendSem chan struct{}
 
 	// onNotification, when set, receives server-initiated notifications by
@@ -79,6 +91,11 @@ type Client struct {
 	// from whoever owns the client.
 	notifyMu       sync.Mutex
 	onNotification func(method string)
+
+	// progress maps the progressToken of each in-flight CallToolProgress to
+	// the channel its caller drains.
+	progressMu sync.Mutex
+	progress   map[string]chan ProgressParams
 
 	rxDone chan struct{} // closed when the receive loop exits
 	closed atomic.Bool
@@ -97,6 +114,7 @@ func NewClient(t Transport, info Implementation) *Client {
 		transport: t,
 		info:      info,
 		pending:   make(map[string]chan *Message),
+		progress:  make(map[string]chan ProgressParams),
 		rxDone:    make(chan struct{}),
 		sendSem:   make(chan struct{}, 1),
 	}
@@ -283,40 +301,113 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 	return c.sendRecoveringSession(ctx, msg)
 }
 
-// sendRecoveringSession is the single write path to the transport. It holds the
-// send slot for the whole attempt, so if the server reports our session gone it
-// can run the recovery handshake and replay msg with no other sender able to
-// slip a request onto the dead session in between.
+// streamStarter is implemented by a transport whose response can outlive the
+// write: Streamable HTTP answering with an SSE stream. StartSend returns once
+// the request is written and the response headers are handled; finish, when
+// non-nil, reads the rest of the response. Splitting the two is what lets
+// the send slot be released while a long tool call streams.
+type streamStarter interface {
+	StartSend(ctx context.Context, msg *Message) (finish func() error, err error)
+}
+
+// expiryForgetter is implemented by a transport whose finish can report a
+// session expiry. ForgetExpired is called with that error while the send slot
+// is held: it drops the dead session if it is still the current one, and
+// reports whether a recovery handshake is needed — false when another sender
+// has already replaced the session.
+type expiryForgetter interface {
+	ForgetExpired(err error) (needHandshake bool)
+}
+
+// sendRecoveringSession is the single write path to the transport. The send
+// slot is held while msg is written and the response headers are read, so if
+// the server reports our session gone the recovery handshake and replay run
+// with no other sender able to slip a request onto the dead session in
+// between.
+//
+// The rest of a streamed response is read after the slot is released.
+// Holding it for the stream would serialise every other request to the
+// server — a list_changed refresh, a concurrent sub-agent's call — behind a
+// tool call that may run for many minutes while it reports progress. A
+// session that expires mid-stream (the resume request answers 404) is only
+// forgotten once the slot is taken back, and recovered right there: clearing
+// it any earlier would let other senders go out with no session at all,
+// which a server rejects outright instead of with the 404 that triggers
+// recovery.
+//
+// Each phase recovers at most once; a second expiry in a row is a server we
+// can't keep a session with, and returning the error beats looping.
+func (c *Client) sendRecoveringSession(ctx context.Context, msg *Message) error {
+	finish, err := c.startSend(ctx, msg, nil)
+	if err != nil || finish == nil {
+		return err
+	}
+	err = finish()
+	if !errors.Is(err, ErrSessionExpired) {
+		return err
+	}
+	finish, err = c.startSend(ctx, msg, err)
+	if err != nil || finish == nil {
+		return err
+	}
+	return finish()
+}
+
+// startSend runs the slot-held phase of a send: write msg and handle the
+// response headers, re-handshaking and replaying once if they report the
+// session expired.
+//
+// expired, when non-nil, is the expiry msg's own stream died with. The dead
+// session is forgotten and replaced first — unless another sender already
+// replaced it, in which case msg is simply replayed on the new one.
 //
 // The handshake deliberately does NOT go back through Call/Notify: those
 // acquire the same slot, which isn't reentrant, so reusing them here would
 // deadlock. It talks to the transport directly instead — safe precisely because
-// we already hold the slot. Only one recovery is attempted; a second expiry in
-// a row is a server we can't keep a session with, and returning the error beats
-// looping.
-func (c *Client) sendRecoveringSession(ctx context.Context, msg *Message) error {
-	// An SSE response can hold this slot for the length of the stream, so a
-	// waiting caller must be able to give up on its own deadline rather than
-	// only when the holder finishes.
+// we already hold the slot.
+func (c *Client) startSend(ctx context.Context, msg *Message, expired error) (func() error, error) {
+	// Another sender may be mid-recovery, so a waiting caller must be able to
+	// give up on its own deadline rather than only when the holder finishes.
 	select {
 	case c.sendSem <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-c.rxDone:
-		return fmt.Errorf("mcp: connection is no longer readable while waiting to send")
+		return nil, fmt.Errorf("mcp: connection is no longer readable while waiting to send")
 	}
 	defer func() { <-c.sendSem }()
 
-	err := c.transport.Send(ctx, msg)
+	if expired != nil {
+		need := true
+		if f, ok := c.transport.(expiryForgetter); ok {
+			need = f.ForgetExpired(expired)
+		}
+		if need {
+			if rerr := c.rehandshakeLocked(ctx); rerr != nil {
+				return nil, fmt.Errorf("%w (recovery handshake failed: %v)", expired, rerr)
+			}
+		}
+		return c.writeLocked(ctx, msg)
+	}
+	finish, err := c.writeLocked(ctx, msg)
 	if !errors.Is(err, ErrSessionExpired) {
-		return err
+		return finish, err
 	}
 	if rerr := c.rehandshakeLocked(ctx); rerr != nil {
 		// Report the original expiry as the cause — that's what the caller
 		// needs to understand — with the recovery failure as context.
-		return fmt.Errorf("%w (recovery handshake failed: %v)", err, rerr)
+		return nil, fmt.Errorf("%w (recovery handshake failed: %v)", err, rerr)
 	}
-	return c.transport.Send(ctx, msg)
+	return c.writeLocked(ctx, msg)
+}
+
+// writeLocked sends msg, splitting off the read of a streamed response when
+// the transport supports it. Caller holds the send slot.
+func (c *Client) writeLocked(ctx context.Context, msg *Message) (func() error, error) {
+	if s, ok := c.transport.(streamStarter); ok {
+		return s.StartSend(ctx, msg)
+	}
+	return nil, c.transport.Send(ctx, msg)
 }
 
 // rehandshakeLocked re-runs initialize + initialized on a transport whose
@@ -397,7 +488,8 @@ func (c *Client) SetNotificationHandler(fn func(method string)) {
 
 // receiveLoop runs for the life of the Client, pulling frames off the
 // transport and dispatching responses to the matching pending channel.
-// Notifications are handed to the registered handler, if any; server-initiated
+// Progress reports go to the call that asked for them; other notifications
+// are handed to the registered handler, if any; server-initiated
 // requests are still ignored (nothing here implements a server-callable
 // surface, and answering with an error would be noise).
 func (c *Client) receiveLoop() {
@@ -414,6 +506,10 @@ func (c *Client) receiveLoop() {
 		}
 		if msg.IsResponse() {
 			c.deliverResponse(msg)
+			continue
+		}
+		if msg.IsNotification() && msg.Method == MethodProgress {
+			c.deliverProgress(msg)
 			continue
 		}
 		if msg.IsNotification() {
@@ -433,6 +529,38 @@ func (c *Client) receiveLoop() {
 		}
 		// Server-initiated request: ignored — see the doc comment above.
 	}
+}
+
+// deliverProgress hands a progress report to the call that asked for it.
+// Reports for unknown tokens — a call that already returned, or a server
+// inventing tokens — are dropped, as is any report that would block: the
+// receive loop delivers responses too, and progress is only advisory.
+func (c *Client) deliverProgress(m *Message) {
+	var p ProgressParams
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		return
+	}
+	c.progressMu.Lock()
+	ch, ok := c.progress[progressKey(p.ProgressToken)]
+	c.progressMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- p:
+	default:
+	}
+}
+
+// progressKey decodes a token as it came back on the wire. The spec allows an
+// integer too, but ours are always "progress-N" strings, so anything that
+// isn't a string can't be one of them and maps to no key.
+func progressKey(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 func (c *Client) deliverResponse(m *Message) {
@@ -564,6 +692,97 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 		return nil, err
 	}
 	return &r, nil
+}
+
+// errProgressIdle is the cancellation cause when a CallToolProgress call
+// goes a full idle window with neither a response nor a progress report.
+var errProgressIdle = errors.New("no response or progress report")
+
+// errProgressCap is the cause when a call that kept reporting progress still
+// hit maxProgressCallTimeout.
+var errProgressCap = errors.New("still running at the overall limit")
+
+// CallToolProgress is CallTool for a caller that wants the server's progress
+// reports: it sends a progressToken and passes each notifications/progress
+// for it to onProgress, in arrival order, on the calling goroutine. A nil
+// onProgress is plain CallTool.
+//
+// Reports also keep the call alive. Without a caller deadline, the call fails
+// after defaultCallTimeout of silence rather than defaultCallTimeout in total,
+// up to maxProgressCallTimeout overall — what lets a long-running tool that
+// says it is still working outlive the usual one-minute bound. A caller that
+// set its own deadline keeps it.
+func (c *Client) CallToolProgress(ctx context.Context, name string, args map[string]any, onProgress func(ProgressParams)) (*CallToolResult, error) {
+	if onProgress == nil {
+		return c.CallTool(ctx, name, args)
+	}
+	// Drawn from the request-id counter, so no two in-flight calls share one.
+	token := "progress-" + strconv.FormatUint(c.nextID.Add(1), 10)
+	ch := make(chan ProgressParams, progressBuffer)
+	c.progressMu.Lock()
+	c.progress[token] = ch
+	c.progressMu.Unlock()
+	defer func() {
+		c.progressMu.Lock()
+		delete(c.progress, token)
+		c.progressMu.Unlock()
+	}()
+
+	idle := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancelMax context.CancelFunc
+		ctx, cancelMax = context.WithTimeoutCause(ctx, maxProgressCallTimeout, errProgressCap)
+		defer cancelMax()
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		defer cancel(nil)
+		timer := time.AfterFunc(defaultCallTimeout, func() { cancel(errProgressIdle) })
+		defer timer.Stop()
+		idle = func() { timer.Reset(defaultCallTimeout) }
+	}
+
+	type outcome struct {
+		res *CallToolResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var r CallToolResult
+		err := c.Call(ctx, MethodToolsCall, CallToolParams{
+			Name: name, Arguments: args, Meta: &RequestMeta{ProgressToken: token},
+		}, &r)
+		done <- outcome{&r, err}
+	}()
+
+	for {
+		select {
+		case p := <-ch:
+			idle()
+			onProgress(p)
+		case o := <-done:
+			// Reports that arrived just ahead of the response are still
+			// queued; hand them over before the result so none are lost.
+		drain:
+			for {
+				select {
+				case p := <-ch:
+					onProgress(p)
+				default:
+					break drain
+				}
+			}
+			if o.err != nil {
+				if errors.Is(context.Cause(ctx), errProgressIdle) {
+					return nil, fmt.Errorf("mcp: tools/call %s: %w within %s", name, errProgressIdle, defaultCallTimeout)
+				}
+				if errors.Is(context.Cause(ctx), errProgressCap) {
+					return nil, fmt.Errorf("mcp: tools/call %s: %w of %s", name, errProgressCap, maxProgressCallTimeout)
+				}
+				return nil, o.err
+			}
+			return o.res, nil
+		}
+	}
 }
 
 func (c *Client) ListResources(ctx context.Context) ([]Resource, error) {
