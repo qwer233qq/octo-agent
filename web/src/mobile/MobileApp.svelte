@@ -118,7 +118,7 @@
         onAgentSession={(id, prompt) => { tab = 'chat'; openSession(id, 'running'); initial = { id, prompt, files: [] } }}
       />
     {:else}
-      <ConfigTab />
+      <ConfigTab onAgentSession={(id, prompt) => { tab = 'chat'; openSession(id, 'running'); initial = { id, prompt, files: [] } }} />
     {/if}
   </main>
 
