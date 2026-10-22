@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -80,69 +79,33 @@ func Connect(ctx context.Context, wsURL string) (*Browser, error) {
 // ConnectByPort attaches to a Chrome already running with
 // --remote-debugging-port=<port>, resolving the browser-level CDP endpoint from
 // the debug HTTP server. This is how a user's existing, logged-in Chrome is
-// reused.
-func ConnectByPort(ctx context.Context, port int) (*Browser, error) {
-	return ConnectByAddr(ctx, fmt.Sprintf("127.0.0.1:%d", port))
-}
-
-// ConnectByAddr attaches to a Chrome whose debug server answers at hostPort
-// ("host:port"), resolving the browser-level CDP endpoint the same way
-// ConnectByPort does — via /json/version, with the fixed /devtools/browser
-// socket as fallback. This is how a Chrome behind a reverse proxy or tunnel
-// (frp/socat/nginx websocket forwarding) on another machine is reached.
-func ConnectByAddr(ctx context.Context, hostPort string) (*Browser, error) {
-	wsURL, err := browserWebSocketURL(ctx, "http", hostPort, "ws")
+// reused. host may be empty for the local default; set it when the debug
+// endpoint is not on 127.0.0.1 (a bridged or genuinely remote Chrome).
+func ConnectByPort(ctx context.Context, host string, port int) (*Browser, error) {
+	wsURL, err := browserWebSocketURL(ctx, host, port)
 	if err != nil {
 		return nil, err
 	}
 	return Connect(ctx, wsURL)
 }
 
-// ConnectByURL attaches to a Chrome whose debug endpoint is reachable at url —
-// the remote/tunnel counterpart of ConnectByPort. Accepted forms:
-//
-//	ws://host:port[/path] · wss://…      dialed directly as the browser socket
-//	http://host:port · https://…         debug HTTP server; /json/version resolved
-//	bare "host" or "host:port"           like http, with port 9222 defaulted
-//
-// When /json/version answers, the webSocketDebuggerUrl it reports is forced onto
-// the requested authority: that URL echoes Chrome's (or the proxy's) point of
-// view, which does not match the tunnel address when forwarding.
-func ConnectByURL(ctx context.Context, urlText string) (*Browser, error) {
-	lower := strings.ToLower(strings.TrimSpace(urlText))
-	switch {
-	case strings.HasPrefix(lower, "ws://"), strings.HasPrefix(lower, "wss://"):
-		return Connect(ctx, urlText)
-	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
-		u, err := url.Parse(urlText)
-		if err != nil {
-			return nil, fmt.Errorf("parse connect url %q: %w", urlText, err)
-		}
-		wsScheme := "ws"
-		if u.Scheme == "https" {
-			wsScheme = "wss"
-		}
-		port := u.Port()
-		if port == "" {
-			port = "80"
-			if u.Scheme == "https" {
-				port = "443"
-			}
-		}
-		hostPort := net.JoinHostPort(u.Hostname(), port)
-		wsURL, err := browserWebSocketURL(ctx, u.Scheme, hostPort, wsScheme)
-		if err != nil {
-			return nil, err
-		}
-		return Connect(ctx, wsURL)
-	default:
-		// No scheme → bare host, optionally host:port.
-		trimmed := strings.TrimSuffix(strings.TrimSpace(urlText), "/")
-		if _, _, splitErr := net.SplitHostPort(trimmed); splitErr != nil {
-			trimmed = net.JoinHostPort(strings.Trim(trimmed, "[]"), "9222")
-		}
-		return ConnectByAddr(ctx, trimmed)
+// ConnectByHost attaches to a debug endpoint already resolved to a host[:port]
+// authority — the form cdpDialHost produces from a config's connect_host and
+// port. It is what a caller that has already done the resolution (the settings
+// status and verify probes) uses, so both dial the same address they report on.
+func ConnectByHost(ctx context.Context, dialHost string) (*Browser, error) {
+	host, portStr, err := net.SplitHostPort(dialHost)
+	if err != nil {
+		return nil, fmt.Errorf("invalid debug endpoint %q: %w", dialHost, err)
 	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid debug endpoint port in %q: %w", dialHost, err)
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid debug endpoint port %d in %q", port, dialHost)
+	}
+	return ConnectByPort(ctx, host, port)
 }
 
 // ConnectViaProfile attaches to a Chrome already running with remote debugging
