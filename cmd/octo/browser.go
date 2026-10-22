@@ -152,6 +152,6 @@ browser.connect_port so the tool reuses your logged-in session every run.
 
 For a Chrome on another machine (behind a websocket tunnel/reverse proxy),
 set browser.connect_url in config.yml instead — ws://host:port…,
-http://host:port, or a bare host:port. It takes precedence over
-connect_port.`)
+http://host:port, or a bare host:port; or browser.connect_host with
+connect_port. connect_url takes precedence.`)
 }

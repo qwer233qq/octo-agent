@@ -369,7 +369,15 @@ func cdpEndpointURL(dialHost, path string) string {
 func browserWebSocketURL(ctx context.Context, host string, port int) (string, error) {
 	dialHost := cdpDialHost(host, port)
 	url := cdpEndpointURL(dialHost, "/json/version")
-	fallback := fmt.Sprintf("ws://%s/devtools/browser", dialHost)
+	// The fallback socket must match the discovery transport — TLS discovery
+	// cannot fall back to a plain ws socket — and must always be a bare
+	// scheme://authority (a scheme-bearing dialHost spliced into "ws://%s"
+	// would compose garbage like ws://https://host:port/...).
+	fallbackScheme := "ws"
+	if isTLSDialHost(dialHost) {
+		fallbackScheme = "wss"
+	}
+	fallback := fallbackScheme + "://" + dialHostAuthority(dialHost) + "/devtools/browser"
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

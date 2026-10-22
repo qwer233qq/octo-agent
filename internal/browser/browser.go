@@ -108,6 +108,40 @@ func ConnectByHost(ctx context.Context, dialHost string) (*Browser, error) {
 	return ConnectByPort(ctx, host, port)
 }
 
+// ConnectByURL attaches to a Chrome whose debug endpoint is reachable at url —
+// the single-string counterpart of ConnectByPort. Accepted forms:
+//
+//	ws://host:port[/path] · wss://…      dialed directly as the browser socket
+//	http://host[:port] · https://…       complete endpoint for /json/version
+//	bare "host" or "host:port"           like http, port 9222 defaulted
+//
+// It rides the same resolution pipeline as ConnectByPort (cdpDialHost +
+// browserWebSocketURL), so the loopback rebase and the chrome://inspect
+// /devtools/browser fallback apply identically.
+func ConnectByURL(ctx context.Context, urlText string) (*Browser, error) {
+	lower := strings.ToLower(strings.TrimSpace(urlText))
+	switch {
+	case strings.HasPrefix(lower, "ws://"), strings.HasPrefix(lower, "wss://"):
+		return Connect(ctx, urlText)
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		// A scheme-bearing value is a complete endpoint: cdpDialHost keeps it
+		// verbatim and the port argument is unused.
+		return ConnectByPort(ctx, strings.TrimSuffix(strings.TrimSpace(urlText), "/"), 0)
+	default:
+		trimmed := strings.TrimSuffix(strings.TrimSpace(urlText), "/")
+		host, portStr, splitErr := net.SplitHostPort(trimmed)
+		if splitErr != nil {
+			host = strings.Trim(trimmed, "[]")
+			portStr = "9222"
+		}
+		port, atoiErr := strconv.Atoi(portStr)
+		if atoiErr != nil {
+			return nil, fmt.Errorf("invalid connect url %q: bad port %q", urlText, portStr)
+		}
+		return ConnectByPort(ctx, host, port)
+	}
+}
+
 // ConnectViaProfile attaches to a Chrome already running with remote debugging
 // by reading its profile's DevToolsActivePort — reusing the user's logged-in
 // session without relaunching, and without the /json HTTP endpoint.

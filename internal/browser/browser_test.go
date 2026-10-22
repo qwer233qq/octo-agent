@@ -901,3 +901,83 @@ func TestBrowserWebSocketURL_RebaseKeepsReachableAuthority(t *testing.T) {
 		t.Fatalf("ws = %q, want the reported path preserved", got)
 	}
 }
+
+// TestConnectByURL_BareAndDefaultPort covers the no-scheme branch of
+// ConnectByURL: a bare host (with or without a trailing slash) defaults to port
+// 9222, an explicit host:port is kept, and every probe is parked on the
+// /json/version endpoint so the error carries the resolved authority.
+// (Nothing real answers on nowhere.invalid, which is exactly what these asserts
+// inspect.)
+func TestConnectByURL_BareAndDefaultPort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	for _, in := range []string{
+		"nowhere.invalid",
+		"nowhere.invalid/",
+		"nowhere.invalid:1",
+	} {
+		_, err := ConnectByURL(ctx, in)
+		if err == nil {
+			t.Fatalf("ConnectByURL(%q): expected error", in)
+		}
+		var de *DialError
+		if !errors.As(err, &de) {
+			t.Fatalf("ConnectByURL(%q): expected *DialError, got %T: %v", in, err, err)
+		}
+		wantPort := ":9222"
+		if strings.HasSuffix(in, ":1") {
+			wantPort = ":1"
+		}
+		if !strings.Contains(de.URL, "//nowhere.invalid"+wantPort+"/json/version") {
+			t.Fatalf("ConnectByURL(%q): probed %q, want an endpoint on nowhere.invalid%s", in, de.URL, wantPort)
+		}
+	}
+}
+
+// TestConnectByURL_WSPassthrough: a ws:// url is dialed directly — the dial
+// error carries that exact endpoint rather than a /json/version lookup.
+func TestConnectByURL_WSPassthrough(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	_, err := ConnectByURL(ctx, "ws://127.0.0.1:1/devtools/browser/xyz")
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	var de *DialError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *DialError, got %T: %v", err, err)
+	}
+	if de.URL != "ws://127.0.0.1:1/devtools/browser/xyz" {
+		t.Fatalf("dialed %q, want the given ws endpoint as-is", de.URL)
+	}
+}
+
+// TestConnectByURL_HTTPResolve: an http:// url is a complete endpoint — the
+// resolution never touches the local default; whatever the dial lands on (the
+// reported socket, or its fallback) stays on the requested authority.
+func TestConnectByURL_HTTPResolve(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r) // /json 404s → the fixed fallback socket is used
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	// Nowhere to point but the fake server itself (scheme-bearing form).
+	_, err := ConnectByURL(ctx, srv.URL)
+	cancel()
+	if err == nil {
+		t.Fatal("expected error (fake serves no CDP socket)")
+	}
+	var de *DialError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *DialError, got %T: %v", err, err)
+	}
+	authority := strings.TrimPrefix(srv.URL, "http://")
+	// The 404 drove the /devtools/browser fallback, anchored on our scheme-url.
+	if want := "ws://" + authority + "/devtools/browser"; de.URL != want {
+		t.Fatalf("dialed %q, want fallback anchored on the requested authority %q", de.URL, want)
+	}
+}

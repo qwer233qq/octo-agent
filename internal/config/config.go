@@ -454,6 +454,12 @@ type BrowserConfig struct {
 	// is used for the /json HTTP discovery request and to build the websocket
 	// URL, so it must be reachable from wherever octo runs.
 	ConnectHost string `yaml:"connect_host,omitempty"`
+	// ConnectURL attaches to a Chrome whose debug endpoint is reachable at url —
+	// for one behind a websocket tunnel that terminates before the HTTP debug
+	// server forms it can express. Accepted: ws://…, wss://…, http(s)://… or bare
+	// "host[:port]" (port 9222 defaulted). Takes precedence over connect_host /
+	// connect_port.
+	ConnectURL string `yaml:"connect_url,omitempty"`
 	// UserDataDir is the Chrome profile dir to attach to when AttachRunning is
 	// set — its DevToolsActivePort is read to reach the logged-in session.
 	UserDataDir string `yaml:"user_data_dir,omitempty"`

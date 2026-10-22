@@ -100,25 +100,59 @@ type browserStatusResponse struct {
 	// Connected reflects a popup-free TCP liveness check — whether the debug
 	// port is reachable right now. Only probed when Configured (an un-set-up
 	// browser is "not set up", not "down").
-	Connected       bool `json:"connected"`
-	Port            int  `json:"port"`
-	AttachRunning   bool `json:"attach_running"`
-	ChromeAvailable bool `json:"chrome_available"`
+	Connected       bool   `json:"connected"`
+	Port            int    `json:"port"`
+	URL             string `json:"url,omitempty"`
+	AttachRunning   bool   `json:"attach_running"`
+	ChromeAvailable bool   `json:"chrome_available"`
 }
 
 func (s *Server) handleBrowserStatus(w http.ResponseWriter, r *http.Request) {
 	cfg, _ := config.Load()
-	configured := cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning
+	configured := cfg.Browser.ConnectURL != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning
 	resp := browserStatusResponse{
 		Configured:      configured,
 		Port:            browserEffectivePort(cfg),
+		URL:             cfg.Browser.ConnectURL,
 		AttachRunning:   cfg.Browser.AttachRunning,
 		ChromeAvailable: browserChromeAvailable(cfg),
 	}
 	if configured {
-		resp.Connected = browserPortReachable(browserDialHost(cfg), browserStatusProbeTimeout)
+		dialHost := browserDialHost(cfg)
+		if cfg.Browser.ConnectURL != "" {
+			dialHost = browserAddrHostPort(cfg.Browser.ConnectURL)
+		}
+		resp.Connected = browserPortReachable(dialHost, browserStatusProbeTimeout)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// browserAddrHostPort extracts host:port from a connect_url-ish value ("ws://…",
+// "http(s)://…", "host:port", "host") for the TCP liveness probe. Defaults to
+// 9222; the default dial host when unparseable.
+func browserAddrHostPort(urlSpec string) string {
+	lower := strings.ToLower(urlSpec)
+	switch {
+	case strings.HasPrefix(lower, "ws://"):
+		urlSpec = urlSpec[len("ws://"):]
+	case strings.HasPrefix(lower, "wss://"):
+		urlSpec = urlSpec[len("wss://"):]
+	case strings.HasPrefix(lower, "http://"):
+		urlSpec = urlSpec[len("http://"):]
+	case strings.HasPrefix(lower, "https://"):
+		urlSpec = urlSpec[len("https://"):]
+	}
+	urlSpec = strings.TrimSuffix(urlSpec, "/")
+	if i := strings.Index(urlSpec, "/"); i >= 0 {
+		urlSpec = urlSpec[:i]
+	}
+	if urlSpec == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(urlSpec); err != nil {
+		urlSpec = net.JoinHostPort(strings.Trim(urlSpec, "[]"), "9222")
+	}
+	return urlSpec
 }
 
 // browserDialHost is the host[:port] the tool attaches to, resolved from the
@@ -187,7 +221,7 @@ func browserDialHostname(cfg config.Config) string {
 // browser runs elsewhere and is reached over the network, so a local executable
 // is neither required nor looked for. Only the local-launch case needs one.
 func browserChromeAvailable(cfg config.Config) bool {
-	if cfg.Browser.ConnectHost != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning {
+	if cfg.Browser.ConnectURL != "" || cfg.Browser.ConnectHost != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning {
 		return true
 	}
 	return browser.ChromeAvailable(cfg.Browser.ExecPath)
@@ -195,19 +229,45 @@ func browserChromeAvailable(cfg config.Config) bool {
 
 // ─── POST /api/browser/verify ────────────────────────────────────────────────
 
-// browserVerifyRequest carries the port to probe. Omit (or 0) to use the
-// configured/default port.
+// browserVerifyRequest carries what to probe. URL (a connect_url form — ws://…,
+// http(s)://…, host[:port]) takes precedence; otherwise Port, with 0 meaning
+// "use the configured/default port".
 type browserVerifyRequest struct {
-	Port int `json:"port"`
+	Port int    `json:"port"`
+	URL  string `json:"url,omitempty"`
 }
 
 type browserVerifyResponse struct {
 	OK     bool   `json:"ok"`
 	Port   int    `json:"port"`
+	URL    string `json:"url,omitempty"`
 	Detail string `json:"detail"`
-	// Saved is true when a successful probe wired connect_port into the config
-	// (the web equivalent of `octo browser setup`).
+	// Saved is true when a successful probe wired connect_port/connect_url into
+	// the config (the web equivalent of `octo browser setup`).
 	Saved bool `json:"saved"`
+}
+
+// browserAttachProbeURL probes a connect_url endpoint (remote/tunnel). No
+// default-profile fallback: that discovery only ever finds local Chrome, which
+// would mask a genuinely unreachable remote address. Package var so tests can
+// substitute a fake, mirroring browserAttachProbe.
+var browserAttachProbeURL = realBrowserAttachProbeURL
+
+func realBrowserAttachProbeURL(url string, timeout time.Duration) (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	b, err := browser.ConnectByURL(ctx, url)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer b.Close()
+
+	pages, err := b.Pages(ctx)
+	if err != nil {
+		return false, fmt.Sprintf("connected, but a CDP call failed: %v", err)
+	}
+	return true, fmt.Sprintf("%d open tab(s)", len(pages))
 }
 
 func (s *Server) handleBrowserVerify(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +280,29 @@ func (s *Server) handleBrowserVerify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load config: %v", err))
 		return
 	}
+
+	if url := strings.TrimSpace(req.URL); url != "" {
+		// The long timeout gives the user time to approve Chrome's
+		// first-connection authorization prompt — the single dial blocks until
+		// they click allow.
+		ok, detail := browserAttachProbeURL(url, browserVerifyProbeTimeout)
+		resp := browserVerifyResponse{OK: ok, URL: url, Detail: detail}
+		if ok && cfg.Browser.ConnectURL != url {
+			// One attach path wins: an old local port/host pair must not
+			// linger once the tool will always prefer connect_url.
+			cfg.Browser.ConnectURL = url
+			cfg.Browser.ConnectPort = 0
+			cfg.Browser.ConnectHost = ""
+			if err := cfg.Save(); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
+				return
+			}
+			resp.Saved = true
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
 	port := req.Port
 	if port <= 0 || port > 65535 {
 		port = browserEffectivePort(cfg)

@@ -268,11 +268,11 @@ func closeSession(b *browser.Browser, p *browser.Page) {
 }
 
 // browserEnabled gates the tool: advertised only when a Chrome can be located
-// or an explicit attach target is configured (a local debug port or a remote
-// connect_url — the latter needs no local Chrome at all).
+// or an explicit attach target is configured (a remote connect_url/connect_host
+// needs no local Chrome at all — the browser runs elsewhere).
 func browserEnabled() bool {
 	cfg, _ := config.Load()
-	return cfg.Browser.ConnectURL != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning || browser.ChromeAvailable(cfg.Browser.ExecPath)
+	return cfg.Browser.ConnectURL != "" || cfg.Browser.ConnectHost != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning || browser.ChromeAvailable(cfg.Browser.ExecPath)
 }
 
 // browserConnectGuide is the user-facing instruction shown when the browser tool
