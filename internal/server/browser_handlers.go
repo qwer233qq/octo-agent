@@ -128,19 +128,26 @@ func (s *Server) handleBrowserStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // browserAddrHostPort extracts host:port from a connect_url-ish value ("ws://…",
-// "http(s)://…", "host:port", "host") for the TCP liveness probe. Defaults to
-// 9222; the default dial host when unparseable.
+// "http(s)://…", "host:port", "host") for the TCP liveness probe. A scheme URL
+// without a port means its scheme's default (80/443/ws→80/wss→443) — NOT 9222;
+// the 9222 default applies only to scheme-less bare hosts. Empty when
+// unparseable.
 func browserAddrHostPort(urlSpec string) string {
 	lower := strings.ToLower(urlSpec)
+	schemeDefaultPort := ""
 	switch {
 	case strings.HasPrefix(lower, "ws://"):
 		urlSpec = urlSpec[len("ws://"):]
+		schemeDefaultPort = "80"
 	case strings.HasPrefix(lower, "wss://"):
 		urlSpec = urlSpec[len("wss://"):]
+		schemeDefaultPort = "443"
 	case strings.HasPrefix(lower, "http://"):
 		urlSpec = urlSpec[len("http://"):]
+		schemeDefaultPort = "80"
 	case strings.HasPrefix(lower, "https://"):
 		urlSpec = urlSpec[len("https://"):]
+		schemeDefaultPort = "443"
 	}
 	urlSpec = strings.TrimSuffix(urlSpec, "/")
 	if i := strings.Index(urlSpec, "/"); i >= 0 {
@@ -150,7 +157,11 @@ func browserAddrHostPort(urlSpec string) string {
 		return ""
 	}
 	if _, _, err := net.SplitHostPort(urlSpec); err != nil {
-		urlSpec = net.JoinHostPort(strings.Trim(urlSpec, "[]"), "9222")
+		port := schemeDefaultPort
+		if port == "" {
+			port = "9222"
+		}
+		urlSpec = net.JoinHostPort(strings.Trim(urlSpec, "[]"), port)
 	}
 	return urlSpec
 }
