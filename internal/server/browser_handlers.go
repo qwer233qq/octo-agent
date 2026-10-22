@@ -156,6 +156,11 @@ func browserAddrHostPort(urlSpec string) string {
 	if urlSpec == "" {
 		return ""
 	}
+	// An unsupported scheme has nothing sensible to probe — treat it as "no
+	// endpoint configured" rather than dialing nonsense like [ftp://host]:9222.
+	if strings.Contains(urlSpec, "://") {
+		return ""
+	}
 	if _, _, err := net.SplitHostPort(urlSpec); err != nil {
 		port := schemeDefaultPort
 		if port == "" {

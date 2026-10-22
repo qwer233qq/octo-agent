@@ -129,6 +129,12 @@ func ConnectByURL(ctx context.Context, urlText string) (*Browser, error) {
 		return ConnectByPort(ctx, strings.TrimSuffix(strings.TrimSpace(urlText), "/"), 0)
 	default:
 		trimmed := strings.TrimSuffix(strings.TrimSpace(urlText), "/")
+		// An unsupported scheme has no agreed transport or default port —
+		// fail fast instead of letting it fall through and dial nonsense like
+		// [ftp://host]:9222.
+		if i := strings.Index(trimmed, "://"); i > 0 {
+			return nil, fmt.Errorf("invalid connect url %q: unsupported scheme %q (use ws://, wss://, http://, https:// or a scheme-free host[:port])", urlText, trimmed[:i])
+		}
 		host, portStr, splitErr := net.SplitHostPort(trimmed)
 		if splitErr != nil {
 			host = strings.Trim(trimmed, "[]")

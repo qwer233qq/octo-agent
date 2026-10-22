@@ -44,3 +44,9 @@ __pycache__/
 /internal/server/webdist/*
 !/internal/server/webdist/.gitkeep
 .octo/implement-state.json
+
+# local cross-build artifacts
+/octo-android-*
+/octo-linux-*
+/octo-termux-*
+/octo-eval

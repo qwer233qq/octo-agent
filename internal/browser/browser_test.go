@@ -981,3 +981,19 @@ func TestConnectByURL_HTTPResolve(t *testing.T) {
 		t.Fatalf("dialed %q, want fallback anchored on the requested authority %q", de.URL, want)
 	}
 }
+
+// TestConnectByURL_UnsupportedScheme: a scheme outside the supported set is
+// rejected with an actionable error instead of falling into the scheme-free
+// branch and dialing garbage like [ftp://host]:9222.
+func TestConnectByURL_UnsupportedScheme(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	_, err := ConnectByURL(ctx, "ftp://nowhere.invalid")
+	if err == nil {
+		t.Fatal("expected error for unsupported scheme")
+	}
+	if !strings.Contains(err.Error(), "unsupported scheme") {
+		t.Fatalf("err = %v, want an unsupported-scheme error", err)
+	}
+}
