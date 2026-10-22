@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,7 +208,7 @@ func launchChrome(ctx context.Context, opts LaunchOptions) (*exec.Cmd, string, s
 			return nil, "", "", err
 		}
 	}
-	wsURL, err := browserWebSocketURL(ctx, port)
+	wsURL, err := browserWebSocketURL(ctx, "http", fmt.Sprintf("127.0.0.1:%d", port), "ws")
 	if err != nil {
 		killProcessGroup(cmd)
 		if tempDir != "" {
@@ -242,7 +243,7 @@ func readDevToolsPort(ctx context.Context, dataDir string) (int, error) {
 }
 
 // browserWebSocketURL resolves the browser-level CDP WebSocket endpoint for a
-// Chrome on the given debug port.
+// Chrome debug server answering on proto://hostPort.
 //
 // Classic `--remote-debugging-port` launches serve /json/version, whose
 // webSocketDebuggerUrl carries a per-launch UUID path. The chrome://inspect
@@ -252,12 +253,18 @@ func readDevToolsPort(ctx context.Context, dataDir string) (int, error) {
 // So once the HTTP server answers without a debugger URL, fall back to that
 // fixed path rather than failing. (Matches the web-access skill's CDP proxy.)
 //
+// When the request goes through a tunnel or reverse proxy, the authority echo
+// in the returned webSocketDebuggerUrl does NOT match the address the dialer
+// needs (it reports Chrome's own binding), so the returned URL is forced onto
+// the requested hostPort — keeping only the path (including the per-launch
+// UUID). For a plain local 127.0.0.1 connection the rewrite is a no-op.
+//
 // A connection error (port not up yet) keeps retrying to tolerate a
 // just-launched Chrome; only a live-but-/json-less responder triggers the
 // fallback.
-func browserWebSocketURL(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/json/version", port)
-	fallback := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser", port)
+func browserWebSocketURL(ctx context.Context, proto, hostPort, wsScheme string) (string, error) {
+	url := proto + "://" + hostPort + "/json/version"
+	fallback := wsScheme + "://" + hostPort + "/devtools/browser"
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -270,7 +277,12 @@ func browserWebSocketURL(ctx context.Context, port int) (string, error) {
 			derr := dec.Decode(&v)
 			resp.Body.Close()
 			if derr == nil && v.WebSocketDebuggerURL != "" {
-				return v.WebSocketDebuggerURL, nil
+				ws := v.WebSocketDebuggerURL
+				if u, perr := neturl.Parse(ws); perr == nil && u.Host != hostPort {
+					u.Host = hostPort
+					ws = u.String()
+				}
+				return ws, nil
 			}
 			// HTTP server answered but gave no debugger URL → /json is disabled
 			// (chrome://inspect toggle path). Use the fixed browser socket.
@@ -280,7 +292,7 @@ func browserWebSocketURL(ctx context.Context, port int) (string, error) {
 			return "", &DialError{
 				URL:        url,
 				StatusCode: 0,
-				Err:        fmt.Errorf("timed out fetching CDP endpoint on port %d", port),
+				Err:        fmt.Errorf("timed out fetching CDP endpoint at %s", hostPort),
 			}
 		}
 		select {
@@ -289,7 +301,7 @@ func browserWebSocketURL(ctx context.Context, port int) (string, error) {
 				return "", &DialError{
 					URL:        url,
 					StatusCode: 0,
-					Err:        fmt.Errorf("timed out fetching CDP endpoint on port %d", port),
+					Err:        fmt.Errorf("timed out fetching CDP endpoint at %s", hostPort),
 				}
 			}
 			return "", ctx.Err()

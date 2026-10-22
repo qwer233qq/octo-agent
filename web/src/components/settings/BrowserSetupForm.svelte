@@ -23,6 +23,9 @@
   // 127.0.0.1:9222, so the port is fixed — letting users type one just invites a
   // typo that can't connect. Advanced custom-port setups use config.yml.
   const port = 9222
+  // Remote address for a Chrome behind a tunnel/reverse proxy (connect_url).
+  // Empty means probe the local chrome://inspect path like before.
+  let remoteURL = $state('')
   let chromeAvailable = $state(true)
   let verifying = $state(false)
   let error = $state('')
@@ -32,6 +35,7 @@
     try {
       const st = await api.getBrowserStatus()
       chromeAvailable = st.chrome_available
+      if (st.url) remoteURL = st.url
     } catch { /* defaults are fine */ }
   })
 
@@ -40,7 +44,7 @@
     error = ''
     errorDetail = ''
     try {
-      const res = await api.verifyBrowser(port)
+      const res = await api.verifyBrowser(remoteURL.trim() || port)
       if (res.ok) {
         await onVerified(res)
       } else {
@@ -63,7 +67,7 @@
   <li>{$t('settings.browser.step_verify')}</li>
   <li>{$t('settings.browser.step_approve')}</li>
 </ol>
-{#if !chromeAvailable}
+{#if !chromeAvailable && !remoteURL.trim()}
   <div class="bs-note">
     <iconify-icon icon="ant-design:warning-outlined" width="14"></iconify-icon>
     {$t('settings.browser.no_chrome')}
@@ -75,6 +79,19 @@
     {$t('settings.browser.verify_hint')}
   </div>
 {/if}
+<div class="bs-remote">
+  <label class="bs-remote-label" for="bs-remote-url">{$t('settings.browser.address_label')}</label>
+  <input
+    id="bs-remote-url"
+    class="bs-remote-input"
+    type="text"
+    bind:value={remoteURL}
+    placeholder="ws://proxy.example.com:9222"
+    spellcheck="false"
+    autocomplete="off"
+  />
+  <div class="bs-remote-hint">{$t('settings.browser.address_hint')}</div>
+</div>
 {#if error}
   <div class="bs-error">
     <div>{error}</div>
@@ -97,6 +114,14 @@
 .bs-note { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; padding: 10px 12px; border-radius: 8px; font-size: 12px; color: var(--warning); background: var(--warning-bg); }
 .bs-step-highlight { display: inline-block; font-weight: 600; color: var(--blue-6); background: var(--blue-1); padding: 2px 6px; border-radius: 4px; }
 .bs-hint { margin-top: 12px; font-size: 12px; color: var(--blue-6); display: flex; align-items: center; gap: 6px; }
+.bs-remote { margin: 14px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.bs-remote-label { font-size: 12px; font-weight: 600; color: var(--text); }
+.bs-remote-input {
+  height: 32px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 13px; font-family: var(--font-mono); color: var(--text); background: var(--bg-container);
+}
+.bs-remote-input:focus { outline: none; border-color: var(--blue-5); }
+.bs-remote-hint { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
 .bs-error { margin-top: 12px; font-size: 12px; color: var(--error); }
 .bs-error-detail { margin-top: 2px; font-size: 11px; color: var(--text-secondary); }
 .bs-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }

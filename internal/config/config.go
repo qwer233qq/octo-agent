@@ -444,9 +444,17 @@ type BrowserConfig struct {
 	// debugging enabled.
 	AttachRunning bool `yaml:"attach_running,omitempty"`
 	// ConnectPort attaches to a Chrome already running with
-	// --remote-debugging-port=<port> via the /json HTTP endpoint. Use when the
-	// port is known and that endpoint is served.
+	// --remote-debugging-port=<port> on this machine via the /json HTTP
+	// endpoint. Use when the port is known and that endpoint is served.
 	ConnectPort int `yaml:"connect_port,omitempty"`
+	// ConnectURL attaches to a Chrome whose debug endpoint is reachable at url —
+	// for a Chrome on another machine behind a tunnel or reverse proxy
+	// (websocket-forwarding). Accepted: ws://…, wss://…, http://…, https://… or
+	// bare "host[:port]" (defaults to port 9222). Takes precedence over
+	// connect_port. Chrome's own --remote-debugging-port only binds 127.0.0.1,
+	// so reaching a host over the network requires such a forward on the
+	// Chrome's side.
+	ConnectURL string `yaml:"connect_url,omitempty"`
 	// UserDataDir is the Chrome profile dir to attach to when AttachRunning is
 	// set — its DevToolsActivePort is read to reach the logged-in session.
 	UserDataDir string `yaml:"user_data_dir,omitempty"`

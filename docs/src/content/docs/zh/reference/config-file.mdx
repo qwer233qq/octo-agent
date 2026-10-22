@@ -157,10 +157,17 @@ tools:
 browser:
   attach_running: true   # 复用你已登录的 Chrome，而不是用一个临时 profile
   connect_port: 9222      # 或者通过 --remote-debugging-port 接入
+  connect_url: ""      # ws://…、http://… 或 host[:port] —— 经隧道接入的 Chrome
   user_data_dir: ""
   exec_path: ""
   download_dir: ""
 ```
+
+`connect_url` 用于接入调试端口暴露在网上的 Chrome —— 比如用 `socat
+tcp-listen:9222,fork,reuseaddr tcp:127.0.0.1:9222` 转发，或一个支持 WebSocket
+升级的反向代理。设置后优先于 `connect_port` 生效。Chrome 的调试端口默认只绑定
+127.0.0.1，隧道必须跑在 Chrome 所在的那台机器上；把这条地址给出去等于把浏览器
+会话交给对方，请控制在局域网内。
 
 详见[浏览器自动化](/docs/zh/guides/browser-automation/)。
 

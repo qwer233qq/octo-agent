@@ -115,7 +115,7 @@
             <StatusTag status="default">{$t('settings.browser.not_setup')}</StatusTag>
           {/if}
           {#if browser.configured}
-            <span class="muted mono">{$t('settings.browser.port')} {browser.port}</span>
+            <span class="muted mono">{browser.url || `${$t('settings.browser.port')} ${browser.port}`}</span>
           {/if}
           <button class="ghost-btn" onclick={() => (setupOpen = true)}>
             <iconify-icon icon="ant-design:setting-outlined" width="13"></iconify-icon>
@@ -124,7 +124,7 @@
         {/if}
       </div>
     </div>
-    {#if browser && !browser.chrome_available}
+    {#if browser && !browser.chrome_available && !browser.url}
       <div class="conn-note">
         <iconify-icon icon="ant-design:warning-outlined" width="14"></iconify-icon>
         {$t('settings.browser.no_chrome')}

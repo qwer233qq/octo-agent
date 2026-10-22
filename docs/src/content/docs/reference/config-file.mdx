@@ -174,10 +174,18 @@ See [Connect MCP servers](/docs/guides/connect-mcp-servers/) for what `tool_sear
 browser:
   attach_running: true   # reuse your logged-in Chrome instead of a throwaway profile
   connect_port: 9222      # attach via --remote-debugging-port instead
+  connect_url: ""         # ws://…, http://… or host[:port] — a Chrome behind a tunnel
   user_data_dir: ""
   exec_path: ""
   download_dir: ""
 ```
+
+`connect_url` attaches to a Chrome whose debug endpoint is reachable over the
+network — for example one forwarded with `socat tcp-listen:9222,fork,reuseaddr
+tcp:127.0.0.1:9222` or a reverse proxy that upgrades WebSocket. When set it
+takes precedence over `connect_port`. Chrome only binds its debug port to
+127.0.0.1, so the tunnel must run on the machine running Chrome, and giving
+anyone the address hands them your browser session — keep it inside the LAN.
 
 See [Automate with browser control](/docs/guides/browser-automation/).
 

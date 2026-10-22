@@ -268,10 +268,11 @@ func closeSession(b *browser.Browser, p *browser.Page) {
 }
 
 // browserEnabled gates the tool: advertised only when a Chrome can be located
-// or an explicit debug port is configured.
+// or an explicit attach target is configured (a local debug port or a remote
+// connect_url — the latter needs no local Chrome at all).
 func browserEnabled() bool {
 	cfg, _ := config.Load()
-	return cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning || browser.ChromeAvailable(cfg.Browser.ExecPath)
+	return cfg.Browser.ConnectURL != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning || browser.ChromeAvailable(cfg.Browser.ExecPath)
 }
 
 // browserConnectGuide is the user-facing instruction shown when the browser tool
@@ -364,6 +365,11 @@ func browserPage(ctx context.Context) (*browser.Page, *browser.Browser, error) {
 	var b *browser.Browser
 	var err error
 	switch {
+	case bc.ConnectURL != "":
+		// Remote/tunnel address takes precedence over local ports.
+		if b, err = browser.ConnectByURL(ctx, bc.ConnectURL); err != nil {
+			return nil, nil, fmt.Errorf("connect to Chrome at %s: %w", bc.ConnectURL, wrapBrowserConnectError(err))
+		}
 	case bc.ConnectPort != 0:
 		if b, err = browser.ConnectByPort(ctx, bc.ConnectPort); err != nil {
 			return nil, nil, fmt.Errorf("connect to Chrome on port %d: %w", bc.ConnectPort, wrapBrowserConnectError(err))

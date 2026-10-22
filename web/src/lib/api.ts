@@ -1352,6 +1352,7 @@ export interface BrowserStatus {
   configured: boolean
   connected: boolean
   port: number
+  url?: string
   attach_running: boolean
   chrome_available: boolean
 }
@@ -1359,6 +1360,7 @@ export interface BrowserStatus {
 export interface BrowserVerifyResult {
   ok: boolean
   port: number
+  url?: string
   detail: string
   saved: boolean
 }
@@ -1367,12 +1369,18 @@ export async function getBrowserStatus(): Promise<BrowserStatus> {
   return request<BrowserStatus>('/api/browser/status', { cache: 'no-store' })
 }
 
-// verifyBrowser probes the CDP endpoint (the chrome://inspect path) and, on
-// success, persists connect_port — the web equivalent of `octo browser setup`.
-export async function verifyBrowser(port?: number): Promise<BrowserVerifyResult> {
+// verifyBrowser probes the CDP endpoint and, on success, persists
+// connect_url / connect_port — the web equivalent of `octo browser setup`.
+// A url (ws://…, http://…, host[:port]) targets a remote/tunnel Chrome and
+// takes precedence; a port probes the local chrome://inspect endpoint.
+export async function verifyBrowser(urlOrPort?: string | number): Promise<BrowserVerifyResult> {
+  const body =
+    typeof urlOrPort === 'string' ? { url: urlOrPort }
+    : typeof urlOrPort === 'number' ? { port: urlOrPort }
+    : {}
   return request<BrowserVerifyResult>('/api/browser/verify', {
     method: 'POST',
-    ...json(port ? { port } : {}),
+    ...json(body),
   })
 }
 

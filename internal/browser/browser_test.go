@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -393,23 +392,20 @@ func TestDevToolsWS(t *testing.T) {
 	}
 }
 
-// hostPort extracts the numeric port from an httptest server URL (always
-// 127.0.0.1:N), so browserWebSocketURL's hard-coded 127.0.0.1 host reaches it.
-func hostPort(t *testing.T, raw string) int {
+// authority extracts "host:port" from an httptest server URL.
+func authority(t *testing.T, raw string) string {
 	t.Helper()
 	u, err := url.Parse(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := strconv.Atoi(u.Port())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
+	return u.Host
 }
 
 // TestBrowserWebSocketURL_JSONVersion uses the webSocketDebuggerUrl from
 // /json/version when the classic --remote-debugging-port endpoint serves it.
+// The authority is forced onto the requested host:port (only the path — with
+// its per-launch UUID — survives), which matters for tunnel/proxy setups.
 func TestBrowserWebSocketURL_JSONVersion(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/json/version" {
@@ -422,12 +418,38 @@ func TestBrowserWebSocketURL_JSONVersion(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := browserWebSocketURL(ctx, hostPort(t, srv.URL))
+	got, err := browserWebSocketURL(ctx, "http", authority(t, srv.URL), "ws")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "ws://127.0.0.1:9999/devtools/browser/uuid-77" {
-		t.Fatalf("ws = %q, want the /json/version URL", got)
+	want := fmt.Sprintf("ws://%s/devtools/browser/uuid-77", authority(t, srv.URL))
+	if got != want {
+		t.Fatalf("ws = %q, want authority-rewritten %q", got, want)
+	}
+}
+
+// TestBrowserWebSocketURL_JSONVersionNoopRewrite: when the reported authority
+// already matches the requested one, the URL passes through unchanged. The
+// fake echoes r.Host — the requested authority — so the two always agree.
+func TestBrowserWebSocketURL_JSONVersionNoopRewrite(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/json/version" {
+			w.Write([]byte(fmt.Sprintf(`{"webSocketDebuggerUrl":"ws://%s/devtools/browser/uuid-77"}`, r.Host)))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := browserWebSocketURL(ctx, "http", authority(t, srv.URL), "ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("ws://%s/devtools/browser/uuid-77", authority(t, srv.URL))
+	if got != want {
+		t.Fatalf("ws = %q, want unchanged %q", got, want)
 	}
 }
 
@@ -440,14 +462,14 @@ func TestBrowserWebSocketURL_Fallback(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	port := hostPort(t, srv.URL)
+	hostPort := authority(t, srv.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := browserWebSocketURL(ctx, port)
+	got, err := browserWebSocketURL(ctx, "http", hostPort, "ws")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser", port); got != want {
+	if want := fmt.Sprintf("ws://%s/devtools/browser", hostPort); got != want {
 		t.Fatalf("ws = %q, want fallback %q", got, want)
 	}
 }
@@ -459,7 +481,7 @@ func TestBrowserWebSocketURL_TimeoutDialError(t *testing.T) {
 	// Port 1 is reserved/unreachable on every platform.
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	_, err := browserWebSocketURL(ctx, 1)
+	_, err := browserWebSocketURL(ctx, "http", "127.0.0.1:1", "ws")
 	if err == nil {
 		t.Fatal("expected error for unreachable port")
 	}
@@ -469,6 +491,90 @@ func TestBrowserWebSocketURL_TimeoutDialError(t *testing.T) {
 	}
 	if de.StatusCode != 0 {
 		t.Fatalf("expected status code 0, got %d", de.StatusCode)
+	}
+}
+
+// TestConnectByURL_BareAndDefaultPort covers the no-scheme branch: a bare host
+// (with or without a trailing slash) defaults to port 9222, an explicit host:port
+// is kept, and every probe is parked on the /json/version endpoint so the error
+// carries the resolved address. (Nothing real answers on nowhere.invalid, which
+// is exactly what these asserts inspect.)
+func TestConnectByURL_BareAndDefaultPort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	for _, in := range []string{
+		"nowhere.invalid",
+		"nowhere.invalid/",
+		"nowhere.invalid:1",
+	} {
+		_, err := ConnectByURL(ctx, in)
+		if err == nil {
+			t.Fatalf("ConnectByURL(%q): expected error", in)
+		}
+		var de *DialError
+		if !errors.As(err, &de) {
+			t.Fatalf("ConnectByURL(%q): expected *DialError, got %T: %v", in, err, err)
+		}
+		wantPort := ":9222"
+		if strings.HasSuffix(in, ":1") {
+			wantPort = ":1"
+		}
+		if !strings.Contains(de.URL, "//nowhere.invalid"+wantPort+"/json/version") {
+			t.Fatalf("ConnectByURL(%q): probed %q, want an endpoint on nowhere.invalid%s", in, de.URL, wantPort)
+		}
+	}
+}
+
+// TestConnectByURL_WSPassthrough: a ws:// url is dialed directly — the dial
+// error carries that exact endpoint rather than a /json/version lookup.
+func TestConnectByURL_WSPassthrough(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	_, err := ConnectByURL(ctx, "ws://127.0.0.1:1/devtools/browser/xyz")
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	var de *DialError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *DialError, got %T: %v", err, err)
+	}
+	if de.URL != "ws://127.0.0.1:1/devtools/browser/xyz" {
+		t.Fatalf("dialed %q, want the given ws endpoint as-is", de.URL)
+	}
+}
+
+// TestConnectByURL_HTTPResolve path: an http:// url resolves through
+// /json/version like a local ConnectByPort would, with the reported authority
+// forced onto the requested host — a reverse proxy must be reachable at the
+// address the caller asked for, not the one Chrome echoes.
+func TestConnectByURL_HTTPResolve(t *testing.T) {
+	// An httptest /json/version that reports an inner, different authority,
+	// mimicking Chrome's point of view behind a proxy.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/json/version" {
+			w.Write([]byte(`{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/uuid-77"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Nothing serves the CDP websocket on the httptest server, so reasoning
+	// end-to-end would need a CDP fake; instead verify the resolution step
+	// through browserWebSocketURL — ConnectByURL delegates to it — using an
+	// authority that differs from what /json/version reports.
+	ws, err := browserWebSocketURL(ctx, "http", authority(t, srv.URL), "ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("ws://%s/devtools/browser/uuid-77", authority(t, srv.URL))
+	if ws != want {
+		t.Fatalf("resolved %q, want the authority forced onto the requested host (%s)", ws, want)
 	}
 }
 
