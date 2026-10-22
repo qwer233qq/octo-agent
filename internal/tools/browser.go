@@ -365,7 +365,7 @@ func browserPage(ctx context.Context) (*browser.Page, *browser.Browser, error) {
 	var err error
 	switch {
 	case bc.ConnectPort != 0:
-		if b, err = browser.ConnectByPort(ctx, bc.ConnectPort); err != nil {
+		if b, err = browser.ConnectByPort(ctx, bc.ConnectHost, bc.ConnectPort); err != nil {
 			return nil, nil, fmt.Errorf("connect to Chrome on port %d: %w", bc.ConnectPort, wrapBrowserConnectError(err))
 		}
 	case bc.AttachRunning && bc.UserDataDir != "":

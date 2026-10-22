@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -207,7 +210,7 @@ func launchChrome(ctx context.Context, opts LaunchOptions) (*exec.Cmd, string, s
 			return nil, "", "", err
 		}
 	}
-	wsURL, err := browserWebSocketURL(ctx, port)
+	wsURL, err := browserWebSocketURL(ctx, "", port)
 	if err != nil {
 		killProcessGroup(cmd)
 		if tempDir != "" {
@@ -241,6 +244,109 @@ func readDevToolsPort(ctx context.Context, dataDir string) (int, error) {
 	}
 }
 
+// cdpDialHost builds the host[:port] to dial for the CDP debug endpoint. An
+// empty host means the local default. A host that already carries a port is
+// used as-is (the caller's port is ignored, since the endpoint it names is the
+// authority — a reverse proxy, say); otherwise the port is appended.
+func cdpDialHost(host string, port int) string {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	// An explicit scheme is kept verbatim; the caller named a full endpoint.
+	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+		return strings.TrimSuffix(host, "/")
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// rebaseWebSocketURL rewrites a CDP socket URL's authority onto dialHost,
+// keeping the path (which may carry a per-launch UUID). Used when the endpoint
+// reports its socket on a host we cannot reach — its own loopback, typically,
+// when it sits behind a reverse proxy or in a container.
+func rebaseWebSocketURL(wsURL, dialHost string) string {
+	u, err := url.Parse(wsURL)
+	if err != nil || u.Host == "" {
+		return wsURL
+	}
+	// Rebase only when the endpoint reports its own loopback while we reached it
+	// through a non-loopback authority: that reported address belongs to the
+	// endpoint's machine and is unreachable from here. Everything else — a
+	// socket on a public host, or on a loopback port of a local endpoint — is
+	// left exactly as reported.
+	if !isLoopbackHost(u.Hostname()) || isLoopbackHost(dialHostAuthority(dialHost)) {
+		return wsURL
+	}
+	u.Host = dialHostAuthority(dialHost)
+	// Match the transport we used for discovery: TLS discovery needs a secure
+	// socket, plain HTTP needs a plain one.
+	if u.Scheme == "ws" || u.Scheme == "wss" {
+		if isTLSDialHost(dialHost) {
+			u.Scheme = "wss"
+		} else {
+			u.Scheme = "ws"
+		}
+	}
+	return u.String()
+}
+
+// isLoopbackHost reports whether h is the local loopback, the case where a
+// reported socket address belongs to the endpoint's machine rather than ours.
+// h may be a bare host or a host[:port] authority.
+func isLoopbackHost(h string) bool {
+	if h == "" {
+		return false
+	}
+	if h == "localhost" {
+		return true
+	}
+	// Strip a port when present so host[:port] authorities are accepted.
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// dialHostAuthority strips any scheme from a dial host, leaving host[:port].
+func dialHostAuthority(dialHost string) string {
+	s := dialHost
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	return strings.TrimSuffix(s, "/")
+}
+
+// isTLSDialHost reports whether the dial authority is a TLS endpoint. An
+// explicit https:// scheme is; a bare authority is TLS only on the default
+// https port.
+func isTLSDialHost(dialHost string) bool {
+	if strings.HasPrefix(dialHost, "https://") {
+		return true
+	}
+	return portOf(dialHost) == "443"
+}
+
+// portOf returns the port part of a host[:port] authority, or "" when absent.
+func portOf(hostPort string) string {
+	if _, p, err := net.SplitHostPort(hostPort); err == nil {
+		return p
+	}
+	return ""
+}
+
+// cdpEndpointURL builds the URL for a path on the debug endpoint. An authority
+// already carrying an http:// or https:// scheme keeps it (a TLS endpoint needs
+// https); a bare authority gets http.
+func cdpEndpointURL(dialHost, path string) string {
+	if strings.HasPrefix(dialHost, "http://") || strings.HasPrefix(dialHost, "https://") {
+		return dialHost + path
+	}
+	return "http://" + dialHost + path
+}
+
 // browserWebSocketURL resolves the browser-level CDP WebSocket endpoint for a
 // Chrome on the given debug port.
 //
@@ -255,9 +361,15 @@ func readDevToolsPort(ctx context.Context, dataDir string) (int, error) {
 // A connection error (port not up yet) keeps retrying to tolerate a
 // just-launched Chrome; only a live-but-/json-less responder triggers the
 // fallback.
-func browserWebSocketURL(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/json/version", port)
-	fallback := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser", port)
+//
+// host may be empty for the local default. Set it when the debug endpoint is
+// not on 127.0.0.1: a bridged port (an SSH tunnel to a Chrome on another
+// machine) or a reverse proxy that fronts the endpoint. A host already carrying
+// a port is dialed as-is and port is ignored.
+func browserWebSocketURL(ctx context.Context, host string, port int) (string, error) {
+	dialHost := cdpDialHost(host, port)
+	url := cdpEndpointURL(dialHost, "/json/version")
+	fallback := fmt.Sprintf("ws://%s/devtools/browser", dialHost)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -270,7 +382,12 @@ func browserWebSocketURL(ctx context.Context, port int) (string, error) {
 			derr := dec.Decode(&v)
 			resp.Body.Close()
 			if derr == nil && v.WebSocketDebuggerURL != "" {
-				return v.WebSocketDebuggerURL, nil
+				// The endpoint may report a socket on its own loopback (a
+				// headless cluster behind a proxy does exactly this), which is
+				// unreachable from here. When the reported host is not the one we
+				// dialed, rebase the socket onto the endpoint we know works —
+				// same path, dialable authority.
+				return rebaseWebSocketURL(v.WebSocketDebuggerURL, dialHost), nil
 			}
 			// HTTP server answered but gave no debugger URL → /json is disabled
 			// (chrome://inspect toggle path). Use the fixed browser socket.

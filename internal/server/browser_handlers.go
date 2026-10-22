@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/open-octo/octo-agent/internal/browser"
@@ -25,15 +27,26 @@ const (
 	browserVerifyProbeTimeout = 60 * time.Second
 )
 
-// browserPortReachable reports whether something is listening on the debug port,
-// using a plain TCP connect. We deliberately do NOT open a CDP WebSocket here:
-// a real debug connection makes Chrome pop an authorization dialog, and the
-// status check runs on every Settings page load. TCP liveness is the same
-// popup-free signal the web-access skill uses. Package var so tests can fake it.
+// browserPortReachable reports whether something is listening on the debug
+// endpoint, using a plain TCP connect. We deliberately do NOT open a CDP
+// WebSocket here: a real debug connection makes Chrome pop an authorization
+// dialog, and the status check runs on every Settings page load. TCP liveness is
+// the same popup-free signal the web-access skill uses. Package var so tests can
+// fake it.
+//
+// dialHost is host[:port] as resolved from the config. Passing it through matters:
+// with browser.connect_host set, the debug endpoint is remote (a bridged or
+// genuinely remote Chrome), and probing 127.0.0.1 would report whatever local
+// service happens to hold that port.
 var browserPortReachable = realBrowserPortReachable
 
-func realBrowserPortReachable(port int, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), timeout)
+func realBrowserPortReachable(dialHost string, timeout time.Duration) bool {
+	// An empty host means no endpoint was configured at all — nothing to dial, and
+	// defaulting to the conventional port would probe a browser nobody set up.
+	if dialHost == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", dialHost, timeout)
 	if err != nil {
 		return false
 	}
@@ -48,11 +61,11 @@ func realBrowserPortReachable(port int, timeout time.Duration) bool {
 // can substitute a fake (the real one needs a live browser).
 var browserAttachProbe = realBrowserAttachProbe
 
-func realBrowserAttachProbe(port int, timeout time.Duration) (bool, string) {
+func realBrowserAttachProbe(dialHost string, timeout time.Duration) (bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	b, err := browser.ConnectByPort(ctx, port)
+	b, err := browser.ConnectByHost(ctx, dialHost)
 	if err != nil {
 		var derr error
 		if b, derr = browser.DiscoverRunningChrome(ctx); derr != nil {
@@ -100,12 +113,84 @@ func (s *Server) handleBrowserStatus(w http.ResponseWriter, r *http.Request) {
 		Configured:      configured,
 		Port:            browserEffectivePort(cfg),
 		AttachRunning:   cfg.Browser.AttachRunning,
-		ChromeAvailable: browser.ChromeAvailable(cfg.Browser.ExecPath),
+		ChromeAvailable: browserChromeAvailable(cfg),
 	}
 	if configured {
-		resp.Connected = browserPortReachable(resp.Port, browserStatusProbeTimeout)
+		resp.Connected = browserPortReachable(browserDialHost(cfg), browserStatusProbeTimeout)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// browserDialHost is the host[:port] the tool attaches to, resolved from the
+// config. This is the authority both the TCP liveness probe and the CDP dial use,
+// so they must agree — probing a different address than the one the tool dials
+// reports liveness that does not exist.
+//
+// The resolution mirrors browser.cdpDialHost: an explicit scheme is kept
+// verbatim, a host already carrying a port is used as-is, otherwise the port is
+// appended. The browser package keeps its own copy because the dial itself needs
+// it; duplicating the few lines here avoids exporting an internal helper just
+// for the status probe.
+func browserDialHost(cfg config.Config) string {
+	return browserDialHostWithPort(cfg, browserEffectivePort(cfg))
+}
+
+// browserDialHostWithPort resolves the dial authority using an explicit port,
+// which is what verify needs: the setup form submits the port under test, and the
+// probe has to reach that one rather than whatever the config already holds.
+func browserDialHostWithPort(cfg config.Config, port int) string {
+	host := cfg.Browser.ConnectHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	// An explicit scheme is kept verbatim; the caller named a full endpoint.
+	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+		return strings.TrimSuffix(host, "/")
+	}
+	// A host already carrying its own port keeps it: the endpoint it names is the
+	// authority, and a request port would otherwise silently replace it.
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// browserDialHostname is the value to persist as browser.connect_host so a later
+// connect_port resolves against the same endpoint verify just proved. Empty when
+// the host is local, which is the config's zero value and means "this machine".
+//
+// A scheme the caller spelled out is kept: cdpDialHost treats a scheme-bearing
+// host as a complete endpoint, so dropping it would silently downgrade an https
+// endpoint to plain http on the next load.
+func browserDialHostname(cfg config.Config) string {
+	host := cfg.Browser.ConnectHost
+	if host == "" {
+		return ""
+	}
+	if i := strings.Index(host, "://"); i >= 0 {
+		scheme := host[:i+3]
+		rest := host[i+3:]
+		if h, _, err := net.SplitHostPort(rest); err == nil {
+			return scheme + h
+		}
+		return host
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+// browserChromeAvailable reports whether the tool could attach to a browser, so
+// the panel can warn when setup is missing. A configured debug endpoint counts
+// as available even when no local Chrome exists: with connect_host set the
+// browser runs elsewhere and is reached over the network, so a local executable
+// is neither required nor looked for. Only the local-launch case needs one.
+func browserChromeAvailable(cfg config.Config) bool {
+	if cfg.Browser.ConnectHost != "" || cfg.Browser.ConnectPort != 0 || cfg.Browser.AttachRunning {
+		return true
+	}
+	return browser.ChromeAvailable(cfg.Browser.ExecPath)
 }
 
 // ─── POST /api/browser/verify ────────────────────────────────────────────────
@@ -140,14 +225,24 @@ func (s *Server) handleBrowserVerify(w http.ResponseWriter, r *http.Request) {
 		port = browserEffectivePort(cfg)
 	}
 
+	// The dial authority is the setup form's host with the port under test. An
+	// explicit request port wins over the configured one: the form lets the user
+	// point at a Chrome on a different port than the saved config, and verify has
+	// to check the one they typed or it vouches for the wrong browser.
+	dialHost := browserDialHostWithPort(cfg, port)
+
 	// The long timeout gives the user time to approve Chrome's first-connection
 	// authorization prompt — the single dial blocks until they click allow.
-	ok, detail := browserAttachProbe(port, browserVerifyProbeTimeout)
+	ok, detail := browserAttachProbe(dialHost, browserVerifyProbeTimeout)
 	resp := browserVerifyResponse{OK: ok, Port: port, Detail: detail}
 	// On success, persist connect_port so the tool reuses this Chrome on every
-	// future session — same wiring `octo browser setup` does on connect.
+	// future session — same wiring `octo browser setup` does on connect. The host
+	// is saved alongside it: verify dialed the configured host, so a later
+	// connect_port without the matching connect_host would reach a different
+	// endpoint than the one just proven to work.
 	if ok && cfg.Browser.ConnectPort != port {
 		cfg.Browser.ConnectPort = port
+		cfg.Browser.ConnectHost = browserDialHostname(cfg)
 		if err := cfg.Save(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("save config: %v", err))
 			return

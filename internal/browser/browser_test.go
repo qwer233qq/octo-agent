@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -422,7 +423,7 @@ func TestBrowserWebSocketURL_JSONVersion(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := browserWebSocketURL(ctx, hostPort(t, srv.URL))
+	got, err := browserWebSocketURL(ctx, "", hostPort(t, srv.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +444,7 @@ func TestBrowserWebSocketURL_Fallback(t *testing.T) {
 	port := hostPort(t, srv.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := browserWebSocketURL(ctx, port)
+	got, err := browserWebSocketURL(ctx, "", port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +460,7 @@ func TestBrowserWebSocketURL_TimeoutDialError(t *testing.T) {
 	// Port 1 is reserved/unreachable on every platform.
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	_, err := browserWebSocketURL(ctx, 1)
+	_, err := browserWebSocketURL(ctx, "", 1)
 	if err == nil {
 		t.Fatal("expected error for unreachable port")
 	}
@@ -802,5 +803,101 @@ func TestClickFollowCandidates_DelaysFallbackUntilLastPoll(t *testing.T) {
 
 	if got := clickFollowCandidates(nil, "me", false); got != nil {
 		t.Errorf("no new targets at all should yield no candidates, got %+v", got)
+	}
+}
+
+// TestBrowserWebSocketURL_RebasesLoopbackSocket covers a headless cluster behind
+// a reverse proxy: /json/version reports the socket on the endpoint's own
+// loopback (unreachable from here), so the resolver must rebase it onto the
+// non-loopback authority we actually dialed, keeping the path.
+func TestBrowserWebSocketURL_RebasesLoopbackSocket(t *testing.T) {
+	ip := nonLoopbackIPv4()
+	if ip == "" {
+		t.Skip("no non-loopback IPv4 on this host")
+	}
+
+	// Listen on the non-loopback address so the dial authority is genuinely not
+	// loopback, matching a remote endpoint reached by address.
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Skipf("cannot listen on %s: %v", ip, err)
+	}
+	defer ln.Close()
+	srv := &httptest.Server{
+		Listener: ln,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/json/version" {
+				w.Write([]byte(`{"webSocketDebuggerUrl":"ws://127.0.0.1:3004/devtools/browser"}`))
+				return
+			}
+			http.NotFound(w, r)
+		})},
+	}
+	srv.Start()
+	defer srv.Close()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := net.JoinHostPort(ip, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := browserWebSocketURL(ctx, dial, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The path is preserved; the authority becomes the one we dialed. A proxy
+	// fronts the socket on the same port as the HTTP endpoint, so the dial port
+	// is the right one — 3004 was the endpoint's own, unreachable from here.
+	want := "ws://" + dialHostAuthority(dial) + "/devtools/browser"
+	if got != want {
+		t.Fatalf("ws = %q, want rebased %q", got, want)
+	}
+}
+
+// nonLoopbackIPv4 returns the first non-loopback IPv4 address of this host, or
+// "" when there is none.
+func nonLoopbackIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() || ipnet.IP.To4() == nil {
+			continue
+		}
+		return ipnet.IP.String()
+	}
+	return ""
+}
+
+// already on a public hostname is not second-guessed into a loopback address.
+func TestBrowserWebSocketURL_RebaseKeepsReachableAuthority(t *testing.T) {
+	const reported = "ws://cdp.example.com:9999/devtools/browser/uuid-9"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/json/version" {
+			w.Write([]byte(`{"webSocketDebuggerUrl":"` + reported + `"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := browserWebSocketURL(ctx, "", hostPort(t, srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dialed 127.0.0.1:N; the reported socket is on a different, public host, so
+	// only the port is rebased — the hostname is left as the endpoint reported it.
+	if !strings.HasPrefix(got, "ws://cdp.example.com:") {
+		t.Fatalf("ws = %q, want the reported hostname preserved", got)
+	}
+	if !strings.HasSuffix(got, "/devtools/browser/uuid-9") {
+		t.Fatalf("ws = %q, want the reported path preserved", got)
 	}
 }

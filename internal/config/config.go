@@ -447,6 +447,13 @@ type BrowserConfig struct {
 	// --remote-debugging-port=<port> via the /json HTTP endpoint. Use when the
 	// port is known and that endpoint is served.
 	ConnectPort int `yaml:"connect_port,omitempty"`
+	// ConnectHost is the host (or host:port) holding the debug endpoint that
+	// ConnectPort reaches — "127.0.0.1" when empty. Set it when the Chrome with
+	// remote debugging runs on another machine and a local port is bridged to
+	// it (e.g. an SSH tunnel), or when the endpoint itself is remote. The value
+	// is used for the /json HTTP discovery request and to build the websocket
+	// URL, so it must be reachable from wherever octo runs.
+	ConnectHost string `yaml:"connect_host,omitempty"`
 	// UserDataDir is the Chrome profile dir to attach to when AttachRunning is
 	// set — its DevToolsActivePort is read to reach the logged-in session.
 	UserDataDir string `yaml:"user_data_dir,omitempty"`

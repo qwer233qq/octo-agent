@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -78,13 +79,33 @@ func Connect(ctx context.Context, wsURL string) (*Browser, error) {
 // ConnectByPort attaches to a Chrome already running with
 // --remote-debugging-port=<port>, resolving the browser-level CDP endpoint from
 // the debug HTTP server. This is how a user's existing, logged-in Chrome is
-// reused.
-func ConnectByPort(ctx context.Context, port int) (*Browser, error) {
-	wsURL, err := browserWebSocketURL(ctx, port)
+// reused. host may be empty for the local default; set it when the debug
+// endpoint is not on 127.0.0.1 (a bridged or genuinely remote Chrome).
+func ConnectByPort(ctx context.Context, host string, port int) (*Browser, error) {
+	wsURL, err := browserWebSocketURL(ctx, host, port)
 	if err != nil {
 		return nil, err
 	}
 	return Connect(ctx, wsURL)
+}
+
+// ConnectByHost attaches to a debug endpoint already resolved to a host[:port]
+// authority — the form cdpDialHost produces from a config's connect_host and
+// port. It is what a caller that has already done the resolution (the settings
+// status and verify probes) uses, so both dial the same address they report on.
+func ConnectByHost(ctx context.Context, dialHost string) (*Browser, error) {
+	host, portStr, err := net.SplitHostPort(dialHost)
+	if err != nil {
+		return nil, fmt.Errorf("invalid debug endpoint %q: %w", dialHost, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid debug endpoint port in %q: %w", dialHost, err)
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid debug endpoint port %d in %q", port, dialHost)
+	}
+	return ConnectByPort(ctx, host, port)
 }
 
 // ConnectViaProfile attaches to a Chrome already running with remote debugging

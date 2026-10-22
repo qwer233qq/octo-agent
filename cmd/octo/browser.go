@@ -115,7 +115,7 @@ func realAttachProbe(port int) (bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
-	b, err := browser.ConnectByPort(ctx, port)
+	b, err := browser.ConnectByPort(ctx, "", port)
 	if err != nil {
 		var derr error
 		if b, derr = browser.DiscoverRunningChrome(ctx); derr != nil {
