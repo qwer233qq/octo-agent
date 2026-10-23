@@ -78,11 +78,25 @@ export function authHeaders(): Record<string, string> {
   return key ? { "X-Access-Key": key } : {};
 }
 
+// mergeAuthHeaders normalises the caller's headers into a Headers instance
+// before layering the fallback on top. A plain object spread drops a Headers
+// instance (its entries are internal slots, not own properties) and mangles
+// the array-of-pairs form, so builds that pass either would silently lose
+// their Content-Type or the key.
+export function mergeAuthHeaders(init?: HeadersInit): Headers {
+  const h = new Headers(init);
+  if (!h.has("X-Access-Key")) {
+    const key = storedKey();
+    if (key) h.set("X-Access-Key", key);
+  }
+  return h;
+}
+
 // authFetch is fetch plus the header fallback. Only flagged call sites use
 // it; cookie auth still handles the normal browser case, so unchanged
 // callers (non-gated or tokenized URLs) keep their original semantics.
 export function authFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(path, { ...init, headers: { ...authHeaders(), ...init?.headers } });
+  return fetch(path, { ...init, headers: mergeAuthHeaders(init?.headers) });
 }
 
 // wsQuery appends the key as ?access_key= for the WebSocket handshake — a

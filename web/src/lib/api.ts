@@ -1,5 +1,5 @@
 import type { Session, SessionGroup, Skill, Workflow, ScheduledTask, McpServer, McpServerDetail, Channel, Memory, RecallFile, TagStatus, GitDiffResponse, GitDiffSummaryResponse, GitDiffFile } from './types'
-import { authHeaders, authFetch } from './auth'
+import { mergeAuthHeaders, authFetch } from './auth'
 
 // TaskResponse matches the Go server task struct.
 export interface TaskResponse {
@@ -48,7 +48,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // Content-Type or overwrite it with an explicit X-Access-Key): the cookie
   // path stays primary, and the header only rescues pages where a wedged
   // Secure cookie never travels (see auth.ts).
-  const res = await fetch(path, { ...init, headers: { ...authHeaders(), ...init?.headers } })
+  const res = await fetch(path, { ...init, headers: mergeAuthHeaders(init?.headers) })
   if (!res.ok) {
     throw new Error(await readErrorMessage(res, `${res.status} ${res.statusText}`))
   }

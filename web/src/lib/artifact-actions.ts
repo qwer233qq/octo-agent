@@ -2,6 +2,7 @@ import { get } from 'svelte/store'
 import { nativeShell } from './stores'
 import { tr } from './i18n'
 import * as api from './api'
+import { authFetch } from './auth'
 import type { Artifact } from './types'
 
 // Shared by ArtifactsPanel and ArtifactModal — both render the same artifact
@@ -57,7 +58,7 @@ async function downloadImage(
 ) {
   const fname = name || 'artifact'
   try {
-    const res = await fetch(src)
+    const res = await authFetch(src)
     if (!res.ok) {
       throw new Error(await api.readErrorMessage(res, `${res.status} ${res.statusText}`))
     }
@@ -99,7 +100,7 @@ async function downloadImage(
 // down, or the bytes arrived but failed to decode as an image).
 export async function imagePreviewError(src: string): Promise<string> {
   try {
-    const res = await fetch(src)
+    const res = await authFetch(src)
     if (res.ok) return ''
     return await api.readErrorMessage(res, `${res.status} ${res.statusText}`)
   } catch {

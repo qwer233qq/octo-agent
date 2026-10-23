@@ -1,8 +1,10 @@
 <script lang="ts">
   // An image that may live on the server's API. data:/blob: sources render
-  // as-is; an /api path is fetched (the shim attaches the key) and shown from a
-  // blob — an <img src> would carry no key (same reason as PageViewer).
+  // as-is; an /api path is fetched with the key header and shown from a blob —
+  // an <img src> would carry neither the Secure cookie (over plain http) nor a
+  // header (a page shim only reaches iframe documents, not the app shell).
   import { onDestroy } from 'svelte'
+  import { authFetch } from '../lib/auth'
 
   let { src, alt = '' }: { src: string; alt?: string } = $props()
 
@@ -13,7 +15,7 @@
     const path = src
     if (!path.startsWith('/')) return
     let cancelled = false
-    fetch(path)
+    authFetch(path)
       .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(String(r.status)))))
       .then((b) => {
         if (cancelled) return

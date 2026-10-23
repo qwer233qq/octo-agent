@@ -36,6 +36,7 @@ import { artifacts, panelContent, panelExpanded, artifactSel } from './stores'
 import { renderMarkdown } from './markdown'
 import { renderMermaidBlocks } from './mermaid'
 import { grantArtifactOrigin } from './api'
+import { authFetch } from './auth'
 import type { Artifact } from './types'
 
 // The sandbox the Markdown preview frame runs with — the one srcdoc frame
@@ -203,7 +204,7 @@ async function inlineLocalRefs(
     if (count >= inlineRefMax || spent >= inlineRefBudget) return null
     let dataUrl: string | null = null
     try {
-      const res = await fetch(artifactURL(sessionId, abs))
+      const res = await authFetch(artifactURL(sessionId, abs))
       if (res.ok) {
         const blob = await res.blob()
         dataUrl = await blobToDataURL(blob)
@@ -516,7 +517,7 @@ type HydratedBody = {
 // not load.
 async function buildHTMLEntry(sessionId: string, path: string): Promise<HydratedBody | null> {
   const [res, grant] = await Promise.all([
-    fetch(artifactURL(sessionId, path)),
+    authFetch(artifactURL(sessionId, path)),
     grantArtifactOrigin(sessionId, path).catch(() => null),
   ])
   if (!res.ok) return null
@@ -565,7 +566,7 @@ async function buildTextBody(
   sessionId: string,
   path: string,
 ): Promise<HydratedBody | null> {
-  const res = await fetch(artifactURL(sessionId, path))
+  const res = await authFetch(artifactURL(sessionId, path))
   if (!res.ok) return null
   const code = await res.text()
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark'

@@ -247,6 +247,7 @@ describe('observeArtifact — markdown image references', () => {
     // Resolved relative to /tmp/report.md, not to the host page.
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/img/shot.png')}`,
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 
@@ -264,6 +265,7 @@ describe('observeArtifact — markdown image references', () => {
     expect(entry.preview).not.toContain('&lt;img')
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/chart.png')}`,
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 
@@ -274,6 +276,7 @@ describe('observeArtifact — markdown image references', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/sessions/${SID}/artifacts?path=${encodeURIComponent('/tmp/shots/a.png')}`,
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 

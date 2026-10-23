@@ -3,9 +3,11 @@
   // shapes, matching the desktop artifact frame:
   //   - src:    a page on the server (/_artifacts/<token>/), framed by URL;
   //   - srcdoc: a Markdown preview document, framed inline;
-  //   - image:  an image path on the server's API, fetched (the shim attaches
-  //             the key) and shown from a blob — an <img src> would carry no key.
+  //   - image:  an image path on the server's API, fetched with the key header
+  //             and shown from a blob — an <img src> would carry neither the
+  //             Secure cookie (over plain http) nor a header.
   import { onDestroy } from 'svelte'
+  import { authFetch } from '../lib/auth'
   import { ARTIFACT_SANDBOX, ARTIFACT_ORIGIN_SANDBOX } from '../lib/artifacts'
   import { t } from '../lib/i18n'
 
@@ -28,7 +30,7 @@
     if (!path) return
     let cancelled = false
     imageFailed = false
-    fetch(path)
+    authFetch(path)
       .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(String(r.status)))))
       .then((b) => {
         if (cancelled) return

@@ -108,15 +108,26 @@
         // those would produce an invalid headers object and break a call
         // that worked before, so they pass through unmodified.
         var stampable = !hdr || hdr === null;
-        if (typeof Headers === 'function' && hdr instanceof Headers) { stampable = true; hdr = new Headers(hdr); }
-        else if (hdr !== null && typeof hdr === 'object' && !Array.isArray(hdr)) { stampable = true; var merged = {}; for (var h in hdr) merged[h] = hdr[h]; hdr = merged; }
+        var isHeaders = typeof Headers === 'function' && hdr instanceof Headers;
+        if (isHeaders) { stampable = true; hdr = new Headers(hdr); }
+        else if (hdr !== null && typeof hdr === 'object' && !Array.isArray(hdr)) {
+          stampable = true;
+          var merged = {};
+          for (var h in hdr) { if (Object.prototype.hasOwnProperty.call(hdr, h)) merged[h] = hdr[h]; }
+          hdr = merged;
+        }
         if (!stampable) return origFetch(input, init);
         var existing = false;
         try {
-          if (typeof Headers === 'function' && hdr instanceof Headers) { existing = hdr.has('X-Access-Key'); }
+          if (isHeaders) { existing = hdr.has('X-Access-Key'); }
           else { for (var n in hdr) { if (String(n).toLowerCase() === 'x-access-key') existing = true; } }
         } catch (e2) { existing = false; }
-        if (!existing) hdr['X-Access-Key'] = KEY;
+        if (!existing) {
+          // A Headers instance stores headers behind internal slots, so a
+          // property assignment here would land on the object and never be
+          // sent — it has to go through set().
+          if (isHeaders) hdr.set('X-Access-Key', KEY); else hdr['X-Access-Key'] = KEY;
+        }
         var i2 = {};
         for (var k in src) { if (k !== 'url') i2[k] = src[k]; }
         i2.headers = hdr;
