@@ -203,7 +203,6 @@ func TestArtifactPage_ServesEntryWithShimAndFiles(t *testing.T) {
 	f := newPageFixture(t, `<!DOCTYPE html><html><head><script src="./app.js"></script><script src="https://example.com/lib.js"></script></head><body><h1>hi</h1></body></html>`)
 	tok := f.token(t)
 	base := "/_artifacts/" + tok + "/"
-	ns := artifactNamespace(f.sessionID, f.entry)
 
 	for _, target := range []string{base, base + "index.html"} {
 		w := f.get(t, target)
@@ -219,8 +218,9 @@ func TestArtifactPage_ServesEntryWithShimAndFiles(t *testing.T) {
 			t.Errorf("GET %s: page references were altered: %s", target, body)
 		}
 		// The shim sits right after <head>, ahead of the page's own scripts.
-		cfg := `window.__octoPage={"download":false,"ns":"` + ns + `"};`
-		if i, j := strings.Index(body, cfg), strings.Index(body, `<script src="./app.js">`); i < 0 || i > j || !strings.HasPrefix(body, "<!DOCTYPE html><html><head><script>") {
+		// The token page is an authenticated load, so the shim carries the
+		// key for the page's API calls — match without quoting its value.
+		if i, j := strings.Index(body, `window.__octoPage={"download":false,"key":`), strings.Index(body, `<script src="./app.js">`); i < 0 || i > j || !strings.HasPrefix(body, "<!DOCTYPE html><html><head><script>") {
 			t.Errorf("GET %s: shim missing or after the page scripts: %s", target, body)
 		}
 		if w.Header().Get("Content-Security-Policy") != "" {

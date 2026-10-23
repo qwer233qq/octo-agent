@@ -196,7 +196,9 @@ func (s *Server) handleArtifactPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := r.PathValue("path")
-	shim := s.pageShim(g.ns, false)
+	// The token was minted only by an authenticated caller, so it stamps
+	// everything it serves — including the fetch wrapper's key (pageShim).
+	shim := s.pageShim(g.ns, false, true)
 	// Only the entry's own name maps to it: a real index.html beside a
 	// report.html entry is a page of its own, reachable by its name.
 	if rel == "" || rel == filepath.Base(g.entry) {
@@ -302,12 +304,27 @@ var pageShimJS string
 // literal, then the embedded shim. json.Marshal escapes `<`, `>` and `&`, so
 // a namespace can never close the script element early. download turns on the
 // desktop download bridge (Light Apps in the desktop shell only).
-func (s *Server) pageShim(ns string, download bool) []byte {
-	cfg, _ := json.Marshal(map[string]any{
+//
+// injectKey plants the server's own access key in the page config so the
+// shim can add it as X-Access-Key on the page's API calls. A same-origin
+// page could already read the key off document.cookie (the accepted trade,
+// see the file header), but only when the cookie travels — over plain http a
+// Secure cookie left by an https visit is invisible to the page, and an
+// agent-written app (which never heard of any of this) then renders the
+// server's {"error":"unauthorized"} JSON. Injecting narrows to the paths
+// that already authenticated the load: a token page where the token was
+// minted by an authenticated caller, and a Light App page requireAuth just
+// let through. A published app's anonymous public path stays key-free.
+func (s *Server) pageShim(ns string, download bool, injectKey bool) []byte {
+	cfg := map[string]any{
 		"ns":       ns,
 		"download": download,
-	})
-	return []byte("<script>window.__octoPage=" + string(cfg) + ";</script><script>" + pageShimJS + "</script>")
+	}
+	if injectKey {
+		cfg["key"] = s.accessKey
+	}
+	b, _ := json.Marshal(cfg)
+	return []byte("<script>window.__octoPage=" + string(b) + ";</script><script>" + pageShimJS + "</script>")
 }
 
 var (

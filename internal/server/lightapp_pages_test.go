@@ -79,8 +79,9 @@ func TestLightAppPage_ServesEntryWithShimAndFiles(t *testing.T) {
 		if !strings.Contains(body, "<h1>demo</h1>") || !strings.Contains(body, `<script src="./app.js">`) {
 			t.Errorf("GET %s: page content or relative script lost: %s", target, body)
 		}
-		// The slug is the namespace; the download half is off under plain serve.
-		cfg := `window.__octoPage={"download":false,"ns":"demo"};`
+		// The slug is the namespace; the download half is off under plain
+		// serve, and the authed path plants the key (value not quoted here).
+		cfg := `window.__octoPage={"download":false,"key":`
 		if i := strings.Index(body, cfg); i < 0 || i > strings.Index(body, `<script src="./app.js">`) {
 			t.Errorf("GET %s: shim missing or after the page scripts: %s", target, body)
 		}
@@ -112,7 +113,7 @@ func TestLightAppPage_DesktopTurnsOnTheDownloadBridge(t *testing.T) {
 		t.Fatalf("status = %d", w.Code)
 	}
 	// No <head>, no doctype: the shim goes first.
-	if !strings.HasPrefix(w.Body.String(), `<script>window.__octoPage={"download":true,"ns":"demo"};</script>`) {
+	if !strings.HasPrefix(w.Body.String(), `<script>window.__octoPage={"download":true,"key":"`) {
 		t.Errorf("desktop must turn the download bridge on: %s", w.Body.String())
 	}
 }
@@ -217,6 +218,11 @@ func TestLightAppPage_PublicSkipsAuth(t *testing.T) {
 		if w := remoteGet(srv, target, false); w.Code != http.StatusOK {
 			t.Errorf("public %s, keyless remote: status = %d, want 200", target, w.Code)
 		}
+	}
+	// The anonymous public path must stay key-free: publishing an app must
+	// never hand the server's access key to its (unauthenticated) visitors.
+	if body := remoteGet(srv, "/_apps/demo/", false).Body.String(); strings.Contains(body, `"key"`) {
+		t.Errorf("public page leaked the key: %s", body)
 	}
 
 	// Every other key of the manifest survives the rewrite, unknown ones too.

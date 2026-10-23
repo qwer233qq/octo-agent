@@ -44,13 +44,18 @@ func lightAppIsPublic(slug string) bool {
 func (s *Server) handleLightAppPage(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if safeLightAppSlug(slug) && lightAppIsPublic(slug) {
-		s.serveLightAppPage(w, r)
+		s.serveLightAppPage(w, r, false)
 		return
 	}
-	s.requireAuth(s.serveLightAppPage)(w, r)
+	// The authenticated path is the one allowed to carry the key: the
+	// anonymous public path must stay key-free, or publishing an app would
+	// hand the server's access key to every visitor.
+	s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		s.serveLightAppPage(w, r, true)
+	})(w, r)
 }
 
-func (s *Server) serveLightAppPage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) serveLightAppPage(w http.ResponseWriter, r *http.Request, injectKey bool) {
 	slug := r.PathValue("slug")
 	if !safeLightAppSlug(slug) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -62,7 +67,7 @@ func (s *Server) serveLightAppPage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	shim := s.pageShim(slug, s.cfg.Native != nil)
+	shim := s.pageShim(slug, s.cfg.Native != nil, injectKey)
 	rel := r.PathValue("path")
 	if rel == "" || rel == "index.html" {
 		servePageEntry(w, r, entry, shim)

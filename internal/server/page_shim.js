@@ -69,6 +69,65 @@
     } catch (e) {}
   }
 
+  // ── API fetch wrapper ─────────────────────────────────────────────────────
+  //
+  // The server plants the access key in cfg.key when the page load was
+  // authenticated (token page, authed Light App; never the anonymous
+  // public path — server side). The page is same-origin with the octo UI,
+  // but that does not make its cookie and the UI's one agree: over plain
+  // http a Secure cookie an https visit left behind is neither sent nor
+  // readable, and an agent-written app (which knows nothing about any of
+  // this) then renders the server's {"error":"unauthorized"} JSON. The
+  // wrapper stamps X-Access-Key on same-origin calls the server already
+  // accepts, which the wrapper keeps transparent: caller-supplied headers
+  // win, cross-origin requests and non-API paths pass through untouched.
+  var KEY = String(cfg.key || '');
+  if (KEY && window.fetch) {
+    var origFetch = window.fetch.bind(window);
+    var needsKey = function (input) {
+      try {
+        var u = typeof input === 'string' ? input : (input && input.url) || '';
+        if (!u) return false;
+        var el = document.createElement('a');
+        el.href = u; // relative hrefs resolve against the page's base
+        if (el.protocol !== location.protocol || el.host !== location.host) return false;
+        var p = el.pathname;
+        return p === '/api' || p.indexOf('/api/') === 0 || p === '/ws' ||
+          p === '/_artifacts' || p.indexOf('/_artifacts/') === 0 ||
+          p === '/_apps' || p.indexOf('/_apps/') === 0;
+      } catch (e) { return false; }
+    };
+    window.fetch = function (input, init) {
+      if (!needsKey(input)) return origFetch(input, init);
+      try {
+        var src = init || (input && typeof input === 'object' ? input : {});
+        var i2 = {};
+        for (var k in src) { if (k !== 'url') i2[k] = src[k]; }
+        var hdr = i2.headers;
+        if (typeof Headers === 'function' && hdr instanceof Headers) {
+          if (!hdr.has('X-Access-Key')) {
+            // Clone: the caller may hand the same Headers instance to
+            // several fetches, and mutating it here would leak the key
+            // into a cross-origin request they reuse it for later.
+            var clean = new Headers(hdr);
+            clean.set('X-Access-Key', KEY);
+            i2.headers = clean;
+          }
+        } else {
+          var merged = {};
+          for (var h in (hdr || {})) merged[h] = hdr[h];
+          var existing = false;
+          for (var n in merged) { if (String(n).toLowerCase() === 'x-access-key') existing = true; }
+          if (!existing) merged['X-Access-Key'] = KEY;
+          i2.headers = merged;
+        }
+        return origFetch(input, i2);
+      } catch (e) {
+        return origFetch(input, init);
+      }
+    };
+  }
+
   // ── Download bridge (Light Apps in the desktop shell only) ────────────────
   //
   // The desktop webview has no download delegate, so an `<a download>` click
