@@ -6,6 +6,16 @@
 // network. A ?access_key= query parameter (from the URL the server prints on
 // startup) is adopted into storage and stripped from the address bar; the
 // cookie then rides every same-origin fetch and the WebSocket handshake.
+//
+// The cookie alone cannot be relied on, though: a Secure cookie saved on an
+// earlier https visit to the same host is neither sent over http nor
+// overwritable from an insecure page (the browser silently ignores the
+// re-set — and document.cookie hides it, so we cannot even tell). The key in
+// localStorage therefore rides as an X-Access-Key header on gated fetches
+// (see authFetch) and as ?access_key= on the WebSocket URL; the server
+// already accepts both forms, and the loopback exemption covers plaintext
+// visits anyway, so the header never widens what a mixed-scheme cookie leak
+// could reach.
 
 import { writable } from "svelte/store";
 
@@ -48,6 +58,45 @@ function clearCookie(): void {
   document.cookie = `${COOKIE_NAME}=; path=/; max-age=0; SameSite=Strict`;
 }
 
+// storedKey is the localStorage mirror of the last accepted key. The header
+// and query-parameter fallbacks read it instead of document.cookie, since
+// that is exactly the place a set-cookie attempt cannot reach (see the file
+// comment): a Secure cookie from an https visit shadows any http rewrite.
+export function storedKey(): string | null {
+  try {
+    return localStorage.getItem(STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+// authHeaders returns the fallback header for a stored key. Raw key bytes —
+// the server reads X-Access-Key verbatim while the cookie goes through
+// PathUnescape, so encoding here would corrupt keys containing % or +.
+export function authHeaders(): Record<string, string> {
+  const key = storedKey();
+  return key ? { "X-Access-Key": key } : {};
+}
+
+// authFetch is fetch plus the header fallback. Only flagged call sites use
+// it; cookie auth still handles the normal browser case, so unchanged
+// callers (non-gated or tokenized URLs) keep their original semantics.
+export function authFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(path, { ...init, headers: { ...authHeaders(), ...init?.headers } });
+}
+
+// wsQuery appends the key as ?access_key= for the WebSocket handshake — a
+// browser WebSocket can set neither headers nor cookies on demand, and the
+// Secure-cookie wedge above hits ws harder than any fetch. Appending is
+// safe even when the cookie already authenticates (the server treats the
+// query key as just another presented credential) and is skipped when
+// nothing is stored, which keeps the loopback exemption path byte-identical.
+export function wsQuery(path: string): string {
+  const key = storedKey();
+  if (!key) return path;
+  return `${path}?access_key=${encodeURIComponent(key)}`;
+}
+
 // Adopt a bootstrap-link key, then strip it so it doesn't linger in the address
 // bar or browser history.
 function adoptQueryKey(): void {
@@ -61,9 +110,16 @@ function adoptQueryKey(): void {
   history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
 }
 
-async function probe(): Promise<"ok" | "unauthorized" | "other"> {
+async function probe(presentedKey?: string): Promise<"ok" | "unauthorized" | "other"> {
   try {
-    const r = await fetch(PROBE_ENDPOINT);
+    // The header rides alongside the cookie: whichever one survives
+    // (cookie on a fresh page, header when a Secure cookie wedges it out)
+    // authenticates, so the probe mirrors every other gated call.
+    const r = await fetch(PROBE_ENDPOINT, {
+      headers: presentedKey
+        ? { "X-Access-Key": presentedKey }
+        : authHeaders(),
+    });
     if (r.ok) return "ok";
     if (r.status === 401) return "unauthorized";
     return "other";
@@ -89,7 +145,7 @@ async function promptAndVerify(): Promise<boolean> {
     const key = await askUserForKey(i > 0);
     if (!key) break; // user cancelled
     setCookie(key);
-    if ((await probe()) === "ok") {
+    if ((await probe(key)) === "ok") {
       localStorage.setItem(STORAGE_KEY, key);
       return true;
     }
@@ -105,7 +161,11 @@ async function doCheck(): Promise<boolean> {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) setCookie(stored);
 
-  const status = await probe();
+  // The probe presents the stored key as a header too: on a wedged page
+  // (Secure cookie from an https visit can neither be read nor overwritten
+  // over http) the cookie never reaches the server, and the header keeps
+  // boot from prompting for a key the storage already holds.
+  const status = await probe(stored ?? undefined);
   // ok — or a server/network error, which is not an auth failure and gets
   // surfaced by whichever real call hits it; don't block boot on it.
   if (status !== "unauthorized") return true;
@@ -118,8 +178,10 @@ async function doCheck(): Promise<boolean> {
 // key apart from an ordinary network drop: only a real 401 justifies giving
 // up on backoff and re-prompting; a fetch failure here just means the network
 // is down, which the caller should retry as usual.
+// Exported so a fresh boot burns exactly one prompt loop even with a
+// secure-cookie wedge; the header fallback keeps the verify honest.
 export async function isUnauthorized(): Promise<boolean> {
-  return (await probe()) === "unauthorized";
+  return (await probe(storedKey() ?? undefined)) === "unauthorized";
 }
 
 // Re-probes and, if still rejected, re-runs the same prompt-and-verify loop
@@ -127,7 +189,7 @@ export async function isUnauthorized(): Promise<boolean> {
 // check but later finds its key no longer works (e.g. the operator rotated
 // it). Not memoized: each call re-probes, so it reflects the current cookie.
 export async function reauth(): Promise<boolean> {
-  const status = await probe();
+  const status = await probe(storedKey() ?? undefined);
   if (status !== "unauthorized") return true;
   return promptAndVerify();
 }

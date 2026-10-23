@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import { isUnauthorized, reauth } from "./auth";
+import { isUnauthorized, reauth, wsQuery } from "./auth";
 import { showToast } from "./stores";
 import { tr } from "./i18n";
 import type { AskAnswerPayload, AskOutcome } from "./askStepper";
@@ -40,7 +40,12 @@ export class WsManager {
     }
     this.intentionalClose = false;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${protocol}//${location.host}/ws`;
+    // ?access_key= is the handshake fallback for non-loopback clients:
+    // a WebSocket cannot set headers, and a Secure cookie saved under https
+    // is neither sent over an http page nor re-settable from one (see
+    // auth.ts), so the query parameter is the only way the browser can
+    // reliably present the key at every protocol grade.
+    const url = `${protocol}//${location.host}${wsQuery("/ws")}`;
     wsState.set("connecting");
     this.ws = new WebSocket(url);
 

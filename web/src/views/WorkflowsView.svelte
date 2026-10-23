@@ -3,6 +3,7 @@
   import { get } from 'svelte/store'
   import { t, tr } from '../lib/i18n'
   import { confirmDialog } from '../lib/confirm'
+  import { authFetch } from '../lib/auth'
   import * as api from '../lib/api'
   import StatusTag from '../components/ui/StatusTag.svelte'
   import Switch from '../components/ui/Switch.svelte'
@@ -59,7 +60,7 @@
   // actual error instead of silently doing nothing (#1109, same fix as Skills).
   async function handleExport(name: string) {
     try {
-      const res = await fetch(`/api/workflows/${encodeURIComponent(name)}/export`)
+      const res = await authFetch(`/api/workflows/${encodeURIComponent(name)}/export`)
       if (!res.ok) {
         throw new Error(await api.readErrorMessage(res, `${res.status} ${res.statusText}`))
       }

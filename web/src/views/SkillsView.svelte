@@ -3,6 +3,7 @@
   import { get } from 'svelte/store'
   import { t, tr } from '../lib/i18n'
   import { confirmDialog } from '../lib/confirm'
+  import { authFetch } from '../lib/auth'
   import * as api from '../lib/api'
   import StatusTag from '../components/ui/StatusTag.svelte'
   import Switch from '../components/ui/Switch.svelte'
@@ -71,7 +72,7 @@
   // .rb export, just with an extra decoding hop for the binary payload.
   async function handleExport(name: string) {
     try {
-      const res = await fetch(`/api/skills/${encodeURIComponent(name)}/export`)
+      const res = await authFetch(`/api/skills/${encodeURIComponent(name)}/export`)
       if (!res.ok) {
         throw new Error(await api.readErrorMessage(res, `${res.status} ${res.statusText}`))
       }

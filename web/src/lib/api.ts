@@ -1,4 +1,5 @@
 import type { Session, SessionGroup, Skill, Workflow, ScheduledTask, McpServer, McpServerDetail, Channel, Memory, RecallFile, TagStatus, GitDiffResponse, GitDiffSummaryResponse, GitDiffFile } from './types'
+import { authFetch } from './auth'
 
 // TaskResponse matches the Go server task struct.
 export interface TaskResponse {
@@ -653,7 +654,7 @@ export interface ImportSkillResult {
 // JSON-only — it does NOT accept a multipart file directly; uploads go through
 // /api/upload first. Mirrors the old web import + `octo skills add`.
 export async function importSkill(source: string, force = false): Promise<ImportSkillResult> {
-  const res = await fetch('/api/skills/import', { method: 'POST', ...json({ source, force }) })
+  const res = await authFetch('/api/skills/import', { method: 'POST', ...json({ source, force }) })
   if (res.status === 409) return { ok: false, conflict: true }
   const d = await res.json().catch(() => ({} as any))
   if (!res.ok) return { ok: false, error: d.error ?? `${res.status} ${res.statusText}` }
@@ -664,7 +665,9 @@ export async function importSkill(source: string, force = false): Promise<Import
 export async function uploadFile(file: File): Promise<string> {
   const form = new FormData()
   form.append('files', file)
-  const res = await fetch('/api/upload', { method: 'POST', body: form })
+  // No Content-Type here on purpose: the browser must add the multipart
+  // boundary itself. authFetch injects only the X-Access-Key fallback header.
+  const res = await authFetch('/api/upload', { method: 'POST', body: form })
   const d = await res.json().catch(() => ({} as any))
   if (!res.ok) throw new Error(d.error ?? `${res.status} ${res.statusText}`)
   const url = d.files?.[0]?.url
@@ -1018,7 +1021,7 @@ export async function restoreTrash(id: string, onConflict?: 'backup' | 'rename')
   // The id ends in the original basename, which can contain URL-significant
   // characters (# ? % space) — encode it so the path segment survives.
   const q = onConflict ? `?on_conflict=${onConflict}` : ''
-  const res = await fetch(`/api/trash/${encodeURIComponent(id)}/restore${q}`, { method: 'POST' })
+  const res = await authFetch(`/api/trash/${encodeURIComponent(id)}/restore${q}`, { method: 'POST' })
   if (res.status === 409) return { ok: false, conflict: true }
   if (!res.ok) throw new Error(await readErrorMessage(res, `${res.status} ${res.statusText}`))
   const d = await res.json()

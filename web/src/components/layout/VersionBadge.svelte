@@ -16,6 +16,7 @@
   import { t } from '../../lib/i18n'
   import { nativeShell, localAccess, isDesktopShell, macosMajor, versionUpdate } from '../../lib/stores'
   import { applyTitlebarLift } from '../../lib/nativeWindow'
+  import { authFetch } from '../../lib/auth'
 
   type Phase = 'idle' | 'upgrading' | 'needs_restart' | 'reconnecting' | 'restart_failed' | 'done'
 
@@ -143,7 +144,7 @@
     logLines = []
     open = true
     try {
-      const res = await fetch('/api/version/upgrade', { method: 'POST' })
+      const res = await authFetch('/api/version/upgrade', { method: 'POST' })
       // 409 = another upgrade already in flight; its broadcasts drive the UI.
       // Any other non-ok sends no completion event, so unwind here.
       if (!res.ok && res.status !== 409) phase = 'idle'
@@ -153,7 +154,7 @@
   function startRestart() {
     phase = 'reconnecting'
     open = true
-    fetch('/api/restart', { method: 'POST' }).catch(() => {})
+    authFetch('/api/restart', { method: 'POST' }).catch(() => {})
     waitForReconnect()
   }
 

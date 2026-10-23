@@ -8,6 +8,7 @@
   import FileRecallView from '../../views/FileRecallView.svelte'
   import ProfileView from '../../views/ProfileView.svelte'
   import { get } from 'svelte/store'
+  import { authFetch } from '../../lib/auth'
   import { showToast, nativeShell, settingsModalOpen, versionUpdate, settingsTarget, onboardPhase, sessions, sessionGroups, collapsedSessions, activeSessionId, view, clearPendingSessionOpts } from '../../lib/stores'
   import type { Session, SessionGroup } from '../../lib/types'
   import { setLocale, t, tr } from '../../lib/i18n'
@@ -345,7 +346,7 @@
         // 409 = an upgrade is already in flight; its broadcasts drive the
         // badge, so treat it as started. Any other failure sends no
         // broadcasts — keep the modal open instead of claiming success.
-        const res = await fetch('/api/version/upgrade', { method: 'POST' })
+        const res = await authFetch('/api/version/upgrade', { method: 'POST' })
         if (res.ok || res.status === 409) {
           showToast($t('settings.update.started'), 'success')
           settingsModalOpen.set(false)
