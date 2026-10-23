@@ -101,26 +101,25 @@
       if (!needsKey(input)) return origFetch(input, init);
       try {
         var src = init || (input && typeof input === 'object' ? input : {});
+        var hdr = src.headers;
+        // Stamp only the header shapes we can merge safely: absent ({}),
+        // a Headers instance, or a plain object. fetch also accepts an
+        // array of [name, value] pairs and a sequence string — converting
+        // those would produce an invalid headers object and break a call
+        // that worked before, so they pass through unmodified.
+        var stampable = !hdr || hdr === null;
+        if (typeof Headers === 'function' && hdr instanceof Headers) { stampable = true; hdr = new Headers(hdr); }
+        else if (hdr !== null && typeof hdr === 'object' && !Array.isArray(hdr)) { stampable = true; var merged = {}; for (var h in hdr) merged[h] = hdr[h]; hdr = merged; }
+        if (!stampable) return origFetch(input, init);
+        var existing = false;
+        try {
+          if (typeof Headers === 'function' && hdr instanceof Headers) { existing = hdr.has('X-Access-Key'); }
+          else { for (var n in hdr) { if (String(n).toLowerCase() === 'x-access-key') existing = true; } }
+        } catch (e2) { existing = false; }
+        if (!existing) hdr['X-Access-Key'] = KEY;
         var i2 = {};
         for (var k in src) { if (k !== 'url') i2[k] = src[k]; }
-        var hdr = i2.headers;
-        if (typeof Headers === 'function' && hdr instanceof Headers) {
-          if (!hdr.has('X-Access-Key')) {
-            // Clone: the caller may hand the same Headers instance to
-            // several fetches, and mutating it here would leak the key
-            // into a cross-origin request they reuse it for later.
-            var clean = new Headers(hdr);
-            clean.set('X-Access-Key', KEY);
-            i2.headers = clean;
-          }
-        } else {
-          var merged = {};
-          for (var h in (hdr || {})) merged[h] = hdr[h];
-          var existing = false;
-          for (var n in merged) { if (String(n).toLowerCase() === 'x-access-key') existing = true; }
-          if (!existing) merged['X-Access-Key'] = KEY;
-          i2.headers = merged;
-        }
+        i2.headers = hdr;
         return origFetch(input, i2);
       } catch (e) {
         return origFetch(input, init);
